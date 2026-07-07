@@ -13,7 +13,6 @@ use tokio::net::TcpStream;
 use shh::crypto::ed25519::PublicKey;
 use shh::crypto::keyfile;
 use shh::transport::{ClientConfig, Transport};
-use shh::wire::disconnect;
 use shh::{auth, connect, Error};
 
 #[derive(Parser)]
@@ -55,7 +54,7 @@ struct Args {
     no_tty: bool,
 
     /// Local port forward: `[bind:]localport:host:hostport` (repeatable).
-    /// Currently requires -N (a forwarding-only connection).
+    /// Works alongside a session, or with -N for a forwarding-only session.
     #[arg(short = 'L', long = "local-forward", value_name = "spec")]
     local_forward: Vec<String>,
 
@@ -213,9 +212,6 @@ async fn run(args: Args) -> Result<i32, String> {
         .iter()
         .map(|s| connect::forward::LocalForward::parse(s))
         .collect::<Result<_, _>>()?;
-    if !forwards.is_empty() && !args.no_command {
-        return Err("port forwarding currently requires -N (a forwarding-only connection)".into());
-    }
     if args.no_command && !args.command.is_empty() {
         return Err("-N does not take a remote command".into());
     }
@@ -245,26 +241,28 @@ async fn run(args: Args) -> Result<i32, String> {
         .await
         .map_err(|e| e.to_string())?;
 
-    // Forwarding / no-command mode: multiplex direct-tcpip channels instead
-    // of running a session.
+    // One multiplexed connection carries the session (unless -N) and every
+    // -L forward, concurrently.
+    let conn = connect::mux::Connection::new(t, connect::forward::Policy::DenyAll);
+    let handle = conn.handle();
+    for spec in &forwards {
+        let listener = tokio::net::TcpListener::bind(&spec.bind)
+            .await
+            .map_err(|e| format!("bind {}: {e}", spec.bind))?;
+        eprintln!(
+            "shh: forwarding {} -> {}:{}",
+            spec.bind, spec.target_host, spec.target_port
+        );
+        tokio::spawn(connect::forward::serve_local_forward(
+            listener,
+            spec.target_host.clone(),
+            spec.target_port,
+            handle.clone(),
+        ));
+    }
+
+    // -N: no session — hold the connection open for the forwards until Ctrl-C.
     if args.no_command {
-        let conn = connect::mux::Connection::new(t, connect::forward::Policy::DenyAll);
-        let handle = conn.handle();
-        for spec in &forwards {
-            let listener = tokio::net::TcpListener::bind(&spec.bind)
-                .await
-                .map_err(|e| format!("bind {}: {e}", spec.bind))?;
-            eprintln!(
-                "shh: forwarding {} -> {}:{}",
-                spec.bind, spec.target_host, spec.target_port
-            );
-            tokio::spawn(connect::forward::serve_local_forward(
-                listener,
-                spec.target_host.clone(),
-                spec.target_port,
-                handle.clone(),
-            ));
-        }
         if forwards.is_empty() {
             eprintln!("shh: connected to {user}@{host}; holding open (Ctrl-C to exit)");
         }
@@ -282,8 +280,8 @@ async fn run(args: Args) -> Result<i32, String> {
     };
 
     // A pty when forced with -t, or by default for an interactive shell.
-    let want_tty = !args.no_tty
-        && (args.tty || (command.is_none() && std::io::stdin().is_terminal()));
+    let want_tty =
+        !args.no_tty && (args.tty || (command.is_none() && std::io::stdin().is_terminal()));
     let (pty_req, resize_rx, _raw) = if want_tty {
         let (cols, rows, xpix, ypix) = shh::tty::winsize().unwrap_or((80, 24, 0, 0));
         let req = connect::PtyRequest {
@@ -317,19 +315,23 @@ async fn run(args: Args) -> Result<i32, String> {
         (None, None, None)
     };
 
-    let status = connect::client_session(
-        &mut t,
-        command.as_deref(),
-        pty_req.as_ref(),
-        resize_rx,
-        tokio::io::stdin(),
-        tokio::io::stdout(),
-        tokio::io::stderr(),
-    )
-    .await
-    .map_err(|e| e.to_string())?;
-
-    t.disconnect(disconnect::BY_APPLICATION, "done").await.ok();
+    // Open the session; its close ends the whole connection (tearing down
+    // any forwards, like foreground ssh).
+    let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
+    handle.open_session(connect::session::SessionSpec {
+        command,
+        pty: pty_req,
+        resize: resize_rx,
+        stdin: Box::new(tokio::io::stdin()),
+        stdout: Box::new(tokio::io::stdout()),
+        stderr: Box::new(tokio::io::stderr()),
+        exit: exit_tx,
+        end_connection_on_close: true,
+    });
+    conn.run(None).await.map_err(|e| e.to_string())?;
+    let status = exit_rx
+        .await
+        .map_err(|_| "session ended without an exit status".to_string())?;
 
     match (status.code, status.signal) {
         (Some(code), _) => Ok(code as i32),

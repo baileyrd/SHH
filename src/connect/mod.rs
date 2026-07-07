@@ -2,13 +2,14 @@
 //! pty, with window flow control and exit status) and `direct-tcpip`
 //! port forwarding.
 //!
-//! Forwarding uses an explicit allowlist model rather than RFC 4254's
-//! open-by-default posture — see [`forward::Policy`]. To keep the
-//! well-exercised session path free of regression risk, direct-tcpip
-//! forwarding lives in a separate multiplexer ([`mux::Connection`]) and a
-//! given connection runs *either* a session *or* forwarding, decided by
-//! the first channel opened. Mixing both on one connection is a later
-//! milestone.
+//! Both channel kinds are driven by one multiplexer, [`mux::Connection`],
+//! so a session and any number of forwards ride a single connection.
+//! Sessions ([`session`]) and forwards ([`forward`]) each run as per-channel
+//! tasks; the loop routes wire messages between them and the transport.
+//! Forwarding uses an explicit allowlist ([`forward::Policy`]) rather than
+//! RFC 4254's open-by-default posture. The [`client_session`] /
+//! [`server_session`] wrappers below drive a connection carrying a lone
+//! session, for callers that don't forward.
 //!
 //! Not present yet: reverse (`-R`) forwarding, X11, agent forwarding.
 
@@ -17,9 +18,9 @@ pub mod pty;
 
 pub mod forward;
 pub mod mux;
+pub mod session;
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::process::Command;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::sync::mpsc;
 
 use crate::transport::Transport;
@@ -32,7 +33,7 @@ pub(crate) const MAX_CHUNK: u32 = 32 * 1024;
 /// Re-grant the window when the peer has consumed half of it.
 pub(crate) const WINDOW_REFILL: u32 = LOCAL_WINDOW / 2;
 
-const STDERR: u32 = 1; // SSH_EXTENDED_DATA_STDERR
+pub(crate) const STDERR: u32 = 1; // SSH_EXTENDED_DATA_STDERR
 
 /// CHANNEL_OPEN_FAILURE reason codes (RFC 4254 §5.1).
 pub(crate) mod open_failure {
@@ -47,6 +48,7 @@ pub struct ExitStatus {
 }
 
 /// Ask the server for a pseudo-terminal with these dimensions.
+#[derive(Clone)]
 pub struct PtyRequest {
     pub term: String,
     pub cols: u32,
@@ -59,7 +61,7 @@ pub struct PtyRequest {
 pub type WindowChange = (u32, u32, u32, u32);
 
 /// Read from a reader that may not exist; absent readers never produce.
-async fn maybe_read<R: AsyncRead + Unpin>(
+pub(crate) async fn maybe_read<R: AsyncRead + Unpin>(
     r: Option<&mut R>,
     buf: &mut [u8],
 ) -> std::io::Result<usize> {
@@ -70,7 +72,7 @@ async fn maybe_read<R: AsyncRead + Unpin>(
 }
 
 /// Receive from a channel that may not exist.
-async fn maybe_recv<T>(rx: Option<&mut mpsc::Receiver<T>>) -> Option<T> {
+pub(crate) async fn maybe_recv<T>(rx: Option<&mut mpsc::Receiver<T>>) -> Option<T> {
     match rx {
         Some(rx) => rx.recv().await,
         None => std::future::pending().await,
@@ -92,7 +94,7 @@ pub(crate) fn data_packet(peer: u32, data: &[u8]) -> Vec<u8> {
     w.into_bytes()
 }
 
-fn ext_data_packet(peer: u32, kind: u32, data: &[u8]) -> Vec<u8> {
+pub(crate) fn ext_data_packet(peer: u32, kind: u32, data: &[u8]) -> Vec<u8> {
     let mut w = chan(msg::CHANNEL_EXTENDED_DATA, peer);
     w.u32(kind);
     w.string(data);
@@ -107,73 +109,6 @@ pub(crate) fn window_adjust(peer: u32, add: u32) -> Vec<u8> {
 
 pub(crate) fn simple(byte: u8, peer: u32) -> Vec<u8> {
     chan(byte, peer).into_bytes()
-}
-
-/// Track the window we granted the peer; returns Some(refill) when it is
-/// time to top it up.
-fn consume_local_window(window: &mut u32, len: usize) -> Result<Option<u32>> {
-    let len = u32::try_from(len).map_err(|_| Error::proto("data larger than any window"))?;
-    *window = window
-        .checked_sub(len)
-        .ok_or_else(|| Error::proto("peer overflowed the data window"))?;
-    if *window < LOCAL_WINDOW - WINDOW_REFILL {
-        let add = LOCAL_WINDOW - *window;
-        *window = LOCAL_WINDOW;
-        Ok(Some(add))
-    } else {
-        Ok(None)
-    }
-}
-
-/// Send as much of `pending` as the peer's window allows.
-async fn flush_pending<S>(
-    t: &mut Transport<S>,
-    peer: u32,
-    kind: Option<u32>,
-    pending: &mut Vec<u8>,
-    remote_window: &mut u32,
-    remote_max: u32,
-) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send,
-{
-    while *remote_window > 0 && !pending.is_empty() {
-        let n = pending
-            .len()
-            .min(*remote_window as usize)
-            .min(remote_max as usize)
-            .min(MAX_CHUNK as usize);
-        let chunk: Vec<u8> = pending.drain(..n).collect();
-        let pkt = match kind {
-            None => data_packet(peer, &chunk),
-            Some(k) => ext_data_packet(peer, k, &chunk),
-        };
-        t.send(&pkt).await?;
-        *remote_window -= n as u32;
-    }
-    Ok(())
-}
-
-/// Wait for CHANNEL_SUCCESS/FAILURE to a request we sent, absorbing the
-/// traffic that may legitimately arrive first.
-async fn await_request_reply<S>(t: &mut Transport<S>, remote_window: &mut u32) -> Result<bool>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send,
-{
-    loop {
-        let p = t.recv().await?;
-        let mut r = Reader::new(&p);
-        match r.byte()? {
-            msg::CHANNEL_SUCCESS => return Ok(true),
-            msg::CHANNEL_FAILURE => return Ok(false),
-            msg::CHANNEL_WINDOW_ADJUST => {
-                r.u32()?;
-                *remote_window = remote_window.saturating_add(r.u32()?);
-            }
-            msg::GLOBAL_REQUEST => refuse_global_request(t, &p).await?,
-            other => return Err(Error::proto(format!("unexpected message {other}"))),
-        }
-    }
 }
 
 /// Reply to a GLOBAL_REQUEST we don't serve (they're all optional
@@ -191,630 +126,60 @@ where
     Ok(())
 }
 
-// -------------------------------------------------------------- client --
+// ---------------------------------------------------- session convenience --
+//
+// Sessions now run as channels inside [`mux::Connection`]; these wrappers
+// drive a connection that carries exactly one session, for callers that
+// don't also forward ports. The unified client/server paths in the
+// binaries use [`mux::Connection`] directly.
+
+use tokio::sync::oneshot;
 
 /// Open a session, run `command` (or a shell when `None`), shuttle stdio,
-/// and return the remote exit status. With `pty`, a pseudo-terminal is
-/// requested first; `resize` events become window-change requests.
+/// and return the remote exit status. Consumes the transport: the
+/// connection ends when the session closes.
 pub async fn client_session<S, I, O, E>(
-    t: &mut Transport<S>,
+    t: Transport<S>,
     command: Option<&str>,
     pty: Option<&PtyRequest>,
-    mut resize: Option<mpsc::Receiver<WindowChange>>,
-    mut stdin: I,
-    mut stdout: O,
-    mut stderr: E,
+    resize: Option<mpsc::Receiver<WindowChange>>,
+    stdin: I,
+    stdout: O,
+    stderr: E,
 ) -> Result<ExitStatus>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
-    I: AsyncRead + Unpin,
-    O: AsyncWrite + Unpin,
-    E: AsyncWrite + Unpin,
+    I: AsyncRead + Unpin + Send + 'static,
+    O: AsyncWrite + Unpin + Send + 'static,
+    E: AsyncWrite + Unpin + Send + 'static,
 {
-    // --- open the channel
-    let mut w = Writer::new();
-    w.byte(msg::CHANNEL_OPEN);
-    w.utf8("session");
-    w.u32(0); // our channel id
-    w.u32(LOCAL_WINDOW);
-    w.u32(MAX_CHUNK);
-    t.send(&w.into_bytes()).await?;
-
-    let (peer, mut remote_window, remote_max) = loop {
-        let p = t.recv().await?;
-        let mut r = Reader::new(&p);
-        match r.byte()? {
-            msg::CHANNEL_OPEN_CONFIRMATION => {
-                let _ours = r.u32()?;
-                let peer = r.u32()?;
-                let window = r.u32()?;
-                let max = r.u32()?;
-                break (peer, window, max);
-            }
-            msg::CHANNEL_OPEN_FAILURE => {
-                let _ours = r.u32()?;
-                let _reason = r.u32()?;
-                let desc = r.utf8().unwrap_or("no reason given");
-                return Err(Error::Channel(format!("server refused session: {desc}")));
-            }
-            msg::GLOBAL_REQUEST => refuse_global_request(t, &p).await?,
-            other => return Err(Error::proto(format!("unexpected message {other}"))),
-        }
-    };
-
-    // --- optional pty, then exec or shell (each waits for its reply)
-    if let Some(req) = pty {
-        let mut w = chan(msg::CHANNEL_REQUEST, peer);
-        w.utf8("pty-req");
-        w.boolean(true);
-        w.utf8(&req.term);
-        w.u32(req.cols);
-        w.u32(req.rows);
-        w.u32(req.xpix);
-        w.u32(req.ypix);
-        w.string(b""); // terminal modes: server-side defaults
-        t.send(&w.into_bytes()).await?;
-        if !await_request_reply(t, &mut remote_window).await? {
-            return Err(Error::Channel("server refused to allocate a pty".into()));
-        }
-    }
-
-    let mut w = chan(msg::CHANNEL_REQUEST, peer);
-    match command {
-        Some(cmd) => {
-            w.utf8("exec");
-            w.boolean(true);
-            w.utf8(cmd);
-        }
-        None => {
-            w.utf8("shell");
-            w.boolean(true);
-        }
-    }
-    t.send(&w.into_bytes()).await?;
-    if !await_request_reply(t, &mut remote_window).await? {
-        return Err(Error::Channel("server refused to run the command".into()));
-    }
-
-    let mut local_window = LOCAL_WINDOW;
-    let mut exit: Option<ExitStatus> = None;
-
-    // --- shuttle data until the channel closes in both directions
-    let mut stdin_buf = vec![0u8; MAX_CHUNK as usize];
-    let mut pending_in: Vec<u8> = Vec::new();
-    let mut stdin_eof = false;
-    let mut sent_eof = false;
-    let mut sent_close = false;
-    let mut recvd_close = false;
-
-    while !(sent_close && recvd_close) {
-        // Ship queued stdin as the window allows.
-        flush_pending(t, peer, None, &mut pending_in, &mut remote_window, remote_max).await?;
-        if stdin_eof && pending_in.is_empty() && !sent_eof {
-            t.send(&simple(msg::CHANNEL_EOF, peer)).await?;
-            sent_eof = true;
-        }
-        if t.should_rekey() {
-            t.rekey_initiate().await?;
-            continue;
-        }
-
-        tokio::select! {
-            biased;
-            // Both arms are cancel-safe: recv_raw resumes via the
-            // transport's read state, a dropped read() loses nothing.
-            pkt = t.recv_raw() => {
-                let p = pkt?;
-                let mut r = Reader::new(&p);
-                match r.byte()? {
-                    msg::IGNORE | msg::DEBUG | msg::UNIMPLEMENTED => {}
-                    msg::EXT_INFO => t.note_ext_info(&p)?,
-                    msg::KEXINIT => t.rekey_respond(p).await?,
-                    msg::DISCONNECT => {
-                        // A peer that says goodbye after delivering the
-                        // exit status is merely terse, not broken.
-                        match exit {
-                            Some(e) => return Ok(e),
-                            None => return Err(Error::proto("disconnect before exit status")),
-                        }
-                    }
-                    msg::CHANNEL_DATA => {
-                        r.u32()?;
-                        let data = r.string()?;
-                        if let Some(add) = consume_local_window(&mut local_window, data.len())? {
-                            t.send(&window_adjust(peer, add)).await?;
-                        }
-                        stdout.write_all(data).await?;
-                        stdout.flush().await?;
-                    }
-                    msg::CHANNEL_EXTENDED_DATA => {
-                        r.u32()?;
-                        let kind = r.u32()?;
-                        let data = r.string()?;
-                        if let Some(add) = consume_local_window(&mut local_window, data.len())? {
-                            t.send(&window_adjust(peer, add)).await?;
-                        }
-                        if kind == STDERR {
-                            stderr.write_all(data).await?;
-                            stderr.flush().await?;
-                        }
-                    }
-                    msg::CHANNEL_WINDOW_ADJUST => {
-                        r.u32()?;
-                        remote_window = remote_window.saturating_add(r.u32()?);
-                    }
-                    msg::CHANNEL_REQUEST => {
-                        r.u32()?;
-                        let kind = r.utf8()?.to_owned();
-                        let want_reply = r.boolean()?;
-                        match kind.as_str() {
-                            "exit-status" => {
-                                exit = Some(ExitStatus { code: Some(r.u32()?), signal: None });
-                            }
-                            "exit-signal" => {
-                                exit = Some(ExitStatus {
-                                    code: None,
-                                    signal: Some(r.utf8()?.to_owned()),
-                                });
-                            }
-                            _ => {}
-                        }
-                        if want_reply {
-                            t.send(&simple(msg::CHANNEL_FAILURE, peer)).await?;
-                        }
-                    }
-                    msg::CHANNEL_EOF => {}
-                    msg::CHANNEL_CLOSE => {
-                        recvd_close = true;
-                        if !sent_close {
-                            t.send(&simple(msg::CHANNEL_CLOSE, peer)).await?;
-                            sent_close = true;
-                        }
-                    }
-                    msg::GLOBAL_REQUEST => refuse_global_request(t, &p).await?,
-                    other => return Err(Error::proto(format!("unexpected message {other}"))),
-                }
-            }
-            n = stdin.read(&mut stdin_buf), if pending_in.is_empty() && !stdin_eof => {
-                match n? {
-                    0 => stdin_eof = true,
-                    n => pending_in.extend_from_slice(&stdin_buf[..n]),
-                }
-            }
-            ws = maybe_recv(resize.as_mut()) => {
-                match ws {
-                    Some((cols, rows, xpix, ypix)) => {
-                        let mut w = chan(msg::CHANNEL_REQUEST, peer);
-                        w.utf8("window-change");
-                        w.boolean(false);
-                        w.u32(cols);
-                        w.u32(rows);
-                        w.u32(xpix);
-                        w.u32(ypix);
-                        t.send(&w.into_bytes()).await?;
-                    }
-                    None => resize = None, // sender gone; stop watching
-                }
-            }
-        }
-    }
-
-    Ok(exit.unwrap_or(ExitStatus { code: None, signal: None }))
+    let conn = mux::Connection::new(t, forward::Policy::DenyAll);
+    let handle = conn.handle();
+    let (tx, rx) = oneshot::channel();
+    handle.open_session(session::SessionSpec {
+        command: command.map(str::to_owned),
+        pty: pty.cloned(),
+        resize,
+        stdin: Box::new(stdin),
+        stdout: Box::new(stdout),
+        stderr: Box::new(stderr),
+        exit: tx,
+        end_connection_on_close: true,
+    });
+    conn.run(None).await?;
+    rx.await
+        .map_err(|_| Error::Channel("session ended without an exit status".into()))
 }
 
-// -------------------------------------------------------------- server --
-
-/// Read the first CHANNEL_OPEN of a connection, refusing global requests
-/// that precede it, and return its raw payload. Lets the server pick a
-/// per-connection mode (session vs forwarding) from the channel type.
-pub async fn first_channel_open<S>(t: &mut Transport<S>) -> Result<Vec<u8>>
+/// Serve a single connection that carries only a session (no forwarding).
+/// `primed` is a CHANNEL_OPEN already read off the wire, or `None`.
+pub async fn server_session<S>(t: Transport<S>, primed: Option<Vec<u8>>) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    loop {
-        let p = t.recv().await?;
-        match p[0] {
-            msg::CHANNEL_OPEN => return Ok(p),
-            msg::GLOBAL_REQUEST => refuse_global_request(t, &p).await?,
-            other => return Err(Error::proto(format!("unexpected message {other}"))),
-        }
-    }
-}
-
-/// The channel type named in a CHANNEL_OPEN payload.
-pub fn channel_open_type(payload: &[u8]) -> Result<String> {
-    let mut r = Reader::new(payload);
-    r.byte()?;
-    Ok(r.utf8()?.to_owned())
-}
-
-/// Serve one session channel: accept it, run the requested command, wire
-/// the child's stdio to the channel, report the exit status. `primed` is a
-/// CHANNEL_OPEN already read off the wire (from [`first_channel_open`]);
-/// pass `None` to read it here.
-pub async fn server_session<S>(t: &mut Transport<S>, primed: Option<Vec<u8>>) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send,
-{
-    // --- accept a session channel
-    let mut primed = primed;
-    let (client_id, mut remote_window, remote_max) = loop {
-        let p = match primed.take() {
-            Some(p) => p,
-            None => t.recv().await?,
-        };
-        let mut r = Reader::new(&p);
-        match r.byte()? {
-            msg::CHANNEL_OPEN => {
-                let kind = r.utf8()?.to_owned();
-                let sender = r.u32()?;
-                let window = r.u32()?;
-                let max = r.u32()?;
-                if kind == "session" {
-                    let mut w = chan(msg::CHANNEL_OPEN_CONFIRMATION, sender);
-                    w.u32(0); // our id
-                    w.u32(LOCAL_WINDOW);
-                    w.u32(MAX_CHUNK);
-                    t.send(&w.into_bytes()).await?;
-                    break (sender, window, max);
-                }
-                let mut w = chan(msg::CHANNEL_OPEN_FAILURE, sender);
-                w.u32(open_failure::UNKNOWN_CHANNEL_TYPE);
-                w.utf8("only session channels are served");
-                w.utf8("");
-                t.send(&w.into_bytes()).await?;
-            }
-            msg::GLOBAL_REQUEST => refuse_global_request(t, &p).await?,
-            other => return Err(Error::proto(format!("unexpected message {other}"))),
-        }
-    };
-
-    // --- wait for exec/shell, honoring pty-req; refuse what we don't do
-    let mut early_stdin: Vec<u8> = Vec::new();
-    let mut local_window = LOCAL_WINDOW;
-    let mut stdin_eof = false;
-    let mut allocated: Option<pty::Pty> = None;
-    let mut child = loop {
-        let p = t.recv().await?;
-        let mut r = Reader::new(&p);
-        match r.byte()? {
-            msg::CHANNEL_REQUEST => {
-                r.u32()?;
-                let kind = r.utf8()?.to_owned();
-                let want_reply = r.boolean()?;
-                let mut cmd = match kind.as_str() {
-                    "exec" => {
-                        let line = r.utf8()?.to_owned();
-                        let mut c = Command::new("/bin/sh");
-                        c.arg("-c").arg(line);
-                        c
-                    }
-                    "shell" => {
-                        Command::new(std::env::var("SHELL").unwrap_or("/bin/sh".into()))
-                    }
-                    "pty-req" => {
-                        let term = r.utf8()?.to_owned();
-                        let cols = r.u32()?;
-                        let rows = r.u32()?;
-                        let xpix = r.u32()?;
-                        let ypix = r.u32()?;
-                        let _modes = r.string()?; // we leave pty defaults
-                        match pty::Pty::allocate(&term, cols, rows, xpix, ypix) {
-                            Ok(p) => {
-                                allocated = Some(p);
-                                if want_reply {
-                                    t.send(&simple(msg::CHANNEL_SUCCESS, client_id)).await?;
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!("pty allocation failed: {e}");
-                                if want_reply {
-                                    t.send(&simple(msg::CHANNEL_FAILURE, client_id)).await?;
-                                }
-                            }
-                        }
-                        continue;
-                    }
-                    "window-change" => {
-                        let cols = r.u32()?;
-                        let rows = r.u32()?;
-                        let xpix = r.u32()?;
-                        let ypix = r.u32()?;
-                        if let Some(p) = &allocated {
-                            p.resize(cols, rows, xpix, ypix);
-                        }
-                        if want_reply {
-                            t.send(&simple(msg::CHANNEL_SUCCESS, client_id)).await?;
-                        }
-                        continue;
-                    }
-                    _ => {
-                        if want_reply {
-                            t.send(&simple(msg::CHANNEL_FAILURE, client_id)).await?;
-                        }
-                        continue;
-                    }
-                };
-                let spawned = match allocated.as_mut() {
-                    Some(p) => spawn_on_pty(&mut cmd, p),
-                    None => cmd
-                        .stdin(std::process::Stdio::piped())
-                        .stdout(std::process::Stdio::piped())
-                        .stderr(std::process::Stdio::piped())
-                        .spawn(),
-                };
-                match spawned {
-                    Ok(c) => {
-                        if want_reply {
-                            t.send(&simple(msg::CHANNEL_SUCCESS, client_id)).await?;
-                        }
-                        break c;
-                    }
-                    Err(e) => {
-                        tracing::warn!("spawn failed: {e}");
-                        if want_reply {
-                            t.send(&simple(msg::CHANNEL_FAILURE, client_id)).await?;
-                        }
-                        return Err(Error::Channel(format!("cannot spawn: {e}")));
-                    }
-                }
-            }
-            // A pipelining client may ship stdin before we accepted exec.
-            msg::CHANNEL_DATA => {
-                r.u32()?;
-                let data = r.string()?;
-                if let Some(add) = consume_local_window(&mut local_window, data.len())? {
-                    t.send(&window_adjust(client_id, add)).await?;
-                }
-                early_stdin.extend_from_slice(data);
-            }
-            msg::CHANNEL_EOF => stdin_eof = true,
-            msg::CHANNEL_WINDOW_ADJUST => {
-                r.u32()?;
-                remote_window = remote_window.saturating_add(r.u32()?);
-            }
-            msg::GLOBAL_REQUEST => refuse_global_request(t, &p).await?,
-            other => return Err(Error::proto(format!("unexpected message {other}"))),
-        }
-    };
-
-    // --- pump: child stdio (pipes or pty master) ⇄ channel
-    let mut child_stdin = child.stdin.take();
-    let mut child_stdout = child.stdout.take();
-    let mut child_stderr = child.stderr.take();
-    let (mut pty_r, mut pty_w, pty_fd) = match allocated.take() {
-        Some(p) => {
-            let (master, fd) = p.into_parts();
-            let (r, w) = tokio::io::split(master);
-            (Some(r), Some(w), Some(fd))
-        }
-        None => (None, None, None),
-    };
-    let is_pty = pty_fd.is_some();
-
-    if !early_stdin.is_empty() {
-        if let Some(w) = pty_w.as_mut() {
-            w.write_all(&early_stdin).await.ok();
-        } else if let Some(cin) = child_stdin.as_mut() {
-            cin.write_all(&early_stdin).await.ok();
-        }
-        early_stdin.clear();
-    }
-    if stdin_eof && !is_pty {
-        child_stdin = None; // dropping closes the pipe
-    }
-
-    let mut out_buf = vec![0u8; MAX_CHUNK as usize];
-    let mut pty_buf = vec![0u8; if is_pty { MAX_CHUNK as usize } else { 0 }];
-    let mut err_buf = vec![0u8; MAX_CHUNK as usize];
-    let mut pending_out: Vec<u8> = Vec::new();
-    let mut pending_err: Vec<u8> = Vec::new();
-    let mut stdout_eof = false;
-    // A pty merges stderr into the terminal stream.
-    let mut stderr_eof = is_pty;
-    let mut exit: Option<std::process::ExitStatus> = None;
-    let mut sent_close = false;
-    let mut recvd_close = false;
-    let mut reported = false;
-
-    while !(sent_close && recvd_close) {
-        flush_pending(t, client_id, None, &mut pending_out, &mut remote_window, remote_max)
-            .await?;
-        flush_pending(
-            t,
-            client_id,
-            Some(STDERR),
-            &mut pending_err,
-            &mut remote_window,
-            remote_max,
-        )
-        .await?;
-
-        // Child fully drained and gone: report and close our side.
-        if let (Some(status), true, true, true, true, false) = (
-            exit,
-            stdout_eof,
-            stderr_eof,
-            pending_out.is_empty(),
-            pending_err.is_empty(),
-            reported,
-        ) {
-            send_exit(t, client_id, status).await?;
-            t.send(&simple(msg::CHANNEL_EOF, client_id)).await?;
-            t.send(&simple(msg::CHANNEL_CLOSE, client_id)).await?;
-            sent_close = true;
-            reported = true;
-            continue;
-        }
-        if t.should_rekey() {
-            t.rekey_initiate().await?;
-            continue;
-        }
-
-        tokio::select! {
-            biased;
-            pkt = t.recv_raw() => {
-                let p = pkt?;
-                let mut r = Reader::new(&p);
-                match r.byte()? {
-                    msg::IGNORE | msg::DEBUG | msg::UNIMPLEMENTED => {}
-                    msg::EXT_INFO => t.note_ext_info(&p)?,
-                    msg::KEXINIT => t.rekey_respond(p).await?,
-                    msg::DISCONNECT => return Err(Error::Disconnect("peer left".into())),
-                    msg::CHANNEL_DATA => {
-                        r.u32()?;
-                        let data = r.string()?;
-                        if let Some(add) = consume_local_window(&mut local_window, data.len())? {
-                            t.send(&window_adjust(client_id, add)).await?;
-                        }
-                        // Backpressure note: a child that never reads can
-                        // stall this write; the client's window (2 MiB)
-                        // bounds how much can pile up.
-                        if let Some(w) = pty_w.as_mut() {
-                            if w.write_all(data).await.is_err() {
-                                pty_w = None;
-                            }
-                        } else if let Some(cin) = child_stdin.as_mut() {
-                            if cin.write_all(data).await.is_err() {
-                                child_stdin = None; // child closed its end
-                            }
-                        }
-                    }
-                    msg::CHANNEL_EOF => {
-                        // A pty has no separable input half to close.
-                        if !is_pty {
-                            child_stdin = None;
-                        }
-                    }
-                    msg::CHANNEL_CLOSE => {
-                        recvd_close = true;
-                        if !sent_close {
-                            t.send(&simple(msg::CHANNEL_CLOSE, client_id)).await?;
-                            sent_close = true;
-                        }
-                    }
-                    msg::CHANNEL_WINDOW_ADJUST => {
-                        r.u32()?;
-                        remote_window = remote_window.saturating_add(r.u32()?);
-                    }
-                    msg::CHANNEL_REQUEST => {
-                        r.u32()?;
-                        let kind = r.utf8()?.to_owned();
-                        let want_reply = r.boolean()?;
-                        if kind == "window-change" {
-                            let cols = r.u32()?;
-                            let rows = r.u32()?;
-                            let xpix = r.u32()?;
-                            let ypix = r.u32()?;
-                            if let Some(fd) = pty_fd {
-                                pty::resize_fd(fd, cols, rows, xpix, ypix);
-                            }
-                            if want_reply {
-                                t.send(&simple(msg::CHANNEL_SUCCESS, client_id)).await?;
-                            }
-                        } else if want_reply {
-                            t.send(&simple(msg::CHANNEL_FAILURE, client_id)).await?;
-                        }
-                    }
-                    msg::GLOBAL_REQUEST => refuse_global_request(t, &p).await?,
-                    other => return Err(Error::proto(format!("unexpected message {other}"))),
-                }
-            }
-            n = maybe_read(child_stdout.as_mut(), &mut out_buf), if !stdout_eof && pending_out.is_empty() => {
-                match n? {
-                    0 => stdout_eof = true,
-                    n => pending_out.extend_from_slice(&out_buf[..n]),
-                }
-            }
-            n = maybe_read(pty_r.as_mut(), &mut pty_buf), if !stdout_eof && pending_out.is_empty() => {
-                match n? {
-                    0 => stdout_eof = true,
-                    n => pending_out.extend_from_slice(&pty_buf[..n]),
-                }
-            }
-            n = maybe_read(child_stderr.as_mut(), &mut err_buf), if !stderr_eof && pending_err.is_empty() => {
-                match n? {
-                    0 => stderr_eof = true,
-                    n => pending_err.extend_from_slice(&err_buf[..n]),
-                }
-            }
-            status = child.wait(), if exit.is_none() => {
-                exit = Some(status?);
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Spawn the child with the pty slave as its stdio and controlling
-/// terminal, in its own session.
-#[cfg(unix)]
-fn spawn_on_pty(cmd: &mut Command, p: &mut pty::Pty) -> std::io::Result<tokio::process::Child> {
-    let slave = p
-        .take_slave()
-        .ok_or_else(|| std::io::Error::other("pty slave already consumed"))?;
-    cmd.stdin(std::process::Stdio::from(slave.try_clone()?))
-        .stdout(std::process::Stdio::from(slave.try_clone()?))
-        .stderr(std::process::Stdio::from(slave))
-        .env("TERM", &p.term);
-    unsafe {
-        cmd.pre_exec(|| {
-            if libc::setsid() < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    cmd.spawn()
-}
-
-async fn send_exit<S>(
-    t: &mut Transport<S>,
-    peer: u32,
-    status: std::process::ExitStatus,
-) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send,
-{
-    match status.code() {
-        Some(code) => {
-            let mut w = chan(msg::CHANNEL_REQUEST, peer);
-            w.utf8("exit-status");
-            w.boolean(false);
-            w.u32(code as u32);
-            t.send(&w.into_bytes()).await
-        }
-        None => {
-            #[cfg(unix)]
-            let name = {
-                use std::os::unix::process::ExitStatusExt;
-                match status.signal() {
-                    Some(1) => "HUP",
-                    Some(2) => "INT",
-                    Some(3) => "QUIT",
-                    Some(6) => "ABRT",
-                    Some(9) => "KILL",
-                    Some(11) => "SEGV",
-                    Some(13) => "PIPE",
-                    Some(15) => "TERM",
-                    _ => "UNKNOWN",
-                }
-            };
-            #[cfg(not(unix))]
-            let name = "UNKNOWN";
-            let mut w = chan(msg::CHANNEL_REQUEST, peer);
-            w.utf8("exit-signal");
-            w.boolean(false);
-            w.utf8(name);
-            w.boolean(false); // no core dump info
-            w.utf8("");
-            w.utf8("");
-            t.send(&w.into_bytes()).await
-        }
-    }
+    mux::Connection::new(t, forward::Policy::DenyAll)
+        .run(primed)
+        .await
 }
 
 #[cfg(test)]
@@ -824,19 +189,26 @@ mod tests {
     use crate::crypto::ed25519::PrivateKey;
     use crate::transport::{ClientConfig, ServerConfig};
     use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
     use tokio::io::duplex;
 
-    /// AsyncWrite that appends into a Vec.
-    #[derive(Default)]
-    struct Sink(Vec<u8>);
+    /// A shareable AsyncWrite that appends into a Vec — cloneable so a copy
+    /// can be read back after the session task has moved the original.
+    #[derive(Clone, Default)]
+    struct Sink(Arc<Mutex<Vec<u8>>>);
+    impl Sink {
+        fn take(&self) -> Vec<u8> {
+            std::mem::take(&mut self.0.lock().unwrap())
+        }
+    }
     impl AsyncWrite for Sink {
         fn poll_write(
-            mut self: Pin<&mut Self>,
+            self: Pin<&mut Self>,
             _cx: &mut Context<'_>,
             buf: &[u8],
         ) -> Poll<std::io::Result<usize>> {
-            self.0.extend_from_slice(buf);
+            self.0.lock().unwrap().extend_from_slice(buf);
             Poll::Ready(Ok(buf.len()))
         }
         fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
@@ -850,10 +222,7 @@ mod tests {
         }
     }
 
-    async fn run(
-        command: &str,
-        stdin: &'static [u8],
-    ) -> (ExitStatus, Vec<u8>, Vec<u8>) {
+    async fn run(command: &str, stdin: &'static [u8]) -> (ExitStatus, Vec<u8>, Vec<u8>) {
         let (a, b) = duplex(1 << 20);
         let user_key = PrivateKey::generate();
         let host_key = PrivateKey::generate();
@@ -862,7 +231,11 @@ mod tests {
             keys: vec![user_key.public()],
             banner: None,
         };
+        let command = command.to_owned();
 
+        let out = Sink::default();
+        let err = Sink::default();
+        let (out2, err2) = (out.clone(), err.clone());
         let client_side = async move {
             let mut t = Transport::client(
                 a,
@@ -872,21 +245,18 @@ mod tests {
             )
             .await?;
             auth::client(&mut t, "tester", &user_key, |_| {}).await?;
-            let mut out = Sink::default();
-            let mut err = Sink::default();
             let status =
-                client_session(&mut t, Some(command), None, None, stdin, &mut out, &mut err)
-                    .await?;
-            Ok::<_, Error>((status, out.0, err.0))
+                client_session(t, Some(&command), None, None, stdin, out, err).await?;
+            Ok::<_, Error>(status)
         };
         let server_side = async move {
             let mut t = Transport::server(b, ServerConfig { host_key }).await?;
             auth::server(&mut t, &policy).await?;
-            server_session(&mut t, None).await
+            server_session(t, None).await
         };
         let (c, s) = tokio::join!(client_side, server_side);
         s.unwrap();
-        c.unwrap()
+        (c.unwrap(), out2.take(), err2.take())
     }
 
     #[tokio::test]
@@ -947,24 +317,24 @@ mod tests {
                 xpix: 0,
                 ypix: 0,
             };
-            let mut out = Sink::default();
-            let mut err = Sink::default();
+            let out = Sink::default();
+            let out2 = out.clone();
             let status = client_session(
-                &mut t,
+                t,
                 Some("tty; echo TERM=$TERM; stty size"),
                 Some(&req),
                 None,
                 &b""[..],
-                &mut out,
-                &mut err,
+                out,
+                Sink::default(),
             )
             .await?;
-            Ok::<_, Error>((status, out.0))
+            Ok::<_, Error>((status, out2.take()))
         };
         let server_side = async move {
             let mut t = Transport::server(b, ServerConfig { host_key }).await?;
             auth::server(&mut t, &policy).await?;
-            server_session(&mut t, None).await
+            server_session(t, None).await
         };
         let (c, s) = tokio::join!(client_side, server_side);
         s.unwrap();

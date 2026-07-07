@@ -51,11 +51,15 @@ the format matches `ssh-keygen` (bcrypt + AES-256-CTR).
 ### Port forwarding
 
 Local (`-L`) forwarding tunnels a local port to a target reachable from the
-server, as a dedicated forwarding connection (`-N`):
+server. It runs alongside a session on the same connection, or on its own
+with `-N`:
 
 ```console
-# forward localhost:8080 to db:5432 as seen from the server
+# a dedicated tunnel (no remote command)
 $ shh -N -L 8080:db.internal:5432 you@gateway
+
+# a session and a tunnel over one connection, like OpenSSH
+$ shh -L 8080:db.internal:5432 you@gateway 'tail -f /var/log/app.log'
 ```
 
 The server refuses forwarding by default; an operator opts targets in
@@ -66,9 +70,9 @@ $ shhd -L 0.0.0.0:2222 --permit-open db.internal:5432 --permit-open 127.0.0.1:*
 # or --permit-open any to allow everything (trusted networks only)
 ```
 
-Interoperates with OpenSSH both ways (`ssh -L` through `shhd`, `shh -L`
-through `sshd`). Combining a session and forwarding on one connection, and
-remote (`-R`) forwarding, are not yet supported.
+Interoperates with OpenSSH both ways (`ssh -L … host cmd` through `shhd`,
+`shh -L … host cmd` through `sshd`), session and forwards multiplexed on
+one connection. Remote (`-R`) forwarding is not yet supported.
 
 ## Interoperability
 
@@ -82,11 +86,11 @@ readable (unencrypted keys for now).
 
 ## Status
 
-Milestones 1–3: transport, auth, exec sessions, interactive PTY sessions
-(pty-req, window-change, controlling terminal), encrypted key files, and
-`direct-tcpip` local (`-L`) port forwarding with a server-side allowlist
-are complete and tested (`cargo test`). Not yet implemented: session and
-forwarding on one connection, remote (`-R`) forwarding, FIDO2
-`sk-ssh-ed25519` keys, certificates, sshd-style privilege separation.
-Treat it as a working protocol implementation, not a hardened production
-daemon.
+Transport, auth, exec sessions, interactive PTY sessions (pty-req,
+window-change, controlling terminal), encrypted key files, and
+`direct-tcpip` local (`-L`) port forwarding with a server-side allowlist —
+all multiplexed so a session and any number of forwards share one
+connection — are complete and tested (`cargo test`). Not yet implemented:
+remote (`-R`) forwarding, FIDO2 `sk-ssh-ed25519` keys, certificates,
+sshd-style privilege separation. Treat it as a working protocol
+implementation, not a hardened production daemon.

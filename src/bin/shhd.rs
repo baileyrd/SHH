@@ -165,34 +165,12 @@ async fn main() -> std::io::Result<()> {
                 }
             };
 
-            // The first channel the client opens picks the mode: a session
-            // (exec/shell/pty) or a forwarding connection (direct-tcpip).
-            let first = match connect::first_channel_open(&mut t).await {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::info!(%addr, %user, "no channel opened: {e}");
-                    t.bail(&e).await;
-                    return;
-                }
-            };
-            let kind = connect::channel_open_type(&first).unwrap_or_default();
-            let result = match kind.as_str() {
-                "session" => {
-                    tracing::info!(%addr, %user, "session started");
-                    connect::server_session(&mut t, Some(first)).await
-                }
-                "direct-tcpip" => {
-                    tracing::info!(%addr, %user, "forwarding started");
-                    let fwd = connect::forward::Policy::parse(&permit_open)
-                        .expect("policy validated at startup");
-                    connect::mux::Connection::new(t, fwd).run(Some(first)).await
-                }
-                other => {
-                    tracing::info!(%addr, %user, "unsupported first channel {other:?}");
-                    return;
-                }
-            };
-            match result {
+            // One multiplexed connection serves sessions and, where the
+            // allowlist permits, direct-tcpip forwards — concurrently.
+            tracing::info!(%addr, %user, "connection established");
+            let fwd = connect::forward::Policy::parse(&permit_open)
+                .expect("policy validated at startup");
+            match connect::mux::Connection::new(t, fwd).run(None).await {
                 Ok(()) => tracing::info!(%addr, %user, "connection ended"),
                 Err(e) => tracing::info!(%addr, %user, "connection error: {e}"),
             }

@@ -86,9 +86,10 @@ we enforce it.
 ### Other cuts
 - No SSH1 compatibility of any kind, including the version-string dialects.
 - No `none` cipher, no `none` auth success path.
-- TCP forwarding (`direct-tcpip`) uses an explicit server allowlist
-  (`--permit-open`, default deny) rather than RFC 4254's open-by-default
-  posture, where any authenticated user may open a forward to any address.
+- TCP forwarding uses explicit server allowlists (`--permit-open` for `-L`
+  targets, `--permit-listen` for `-R` binds; both default deny) rather than
+  RFC 4254's open-by-default posture, where any authenticated user may open
+  a forward to any address or make the server listen on any port.
 - Random packet padding is always fresh CSPRNG output (RFC 4253 merely
   suggests randomness).
 
@@ -127,11 +128,12 @@ shh/                 one library crate
    terminal, raw client mode, window-change on SIGWINCH, and
    passphrase-protected key files (bcrypt + AES-256-CTR, `ssh-keygen`
    compatible in both directions).
-3. **Port forwarding (done).** `direct-tcpip` local (`-L`) forwarding
-   through a channel multiplexer, with a default-deny server allowlist
-   (`--permit-open`) rather than RFC 4254's open-by-default posture.
-   Sessions and forwards are both multiplexer channels, so any mix of them
-   rides one connection — a foreground session tears everything down on
-   exit, matching OpenSSH. Remote (`-R`) forwarding remains.
+3. **Port forwarding (done).** Local `direct-tcpip` (`-L`) and remote
+   `forwarded-tcpip` / `tcpip-forward` (`-R`) forwarding through the channel
+   multiplexer, each behind a default-deny server allowlist (`--permit-open`
+   for `-L` targets, `--permit-listen` for `-R` binds) rather than RFC
+   4254's open-by-default posture. Sessions and forwards are both
+   multiplexer channels, so any mix of them rides one connection — a
+   foreground session tears everything down on exit, matching OpenSSH.
 4. Keep-alives, `sk-ssh-ed25519` FIDO2 keys, certificates, agent protocol,
    hardened privilege separation in `shhd`.

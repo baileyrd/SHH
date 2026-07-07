@@ -205,6 +205,66 @@ pub async fn serve_local_forward(
     }
 }
 
+/// A parsed `-R` remote forward: ask the server to listen on
+/// `listen_bind:listen_port`, and connect the connections it forwards back
+/// to `target_host:target_port` (reachable from this side).
+pub struct RemoteForward {
+    pub listen_bind: String,
+    pub listen_port: u16,
+    pub target_host: String,
+    pub target_port: u16,
+}
+
+impl RemoteForward {
+    /// Parse `[bind:]port:host:hostport`. A bare `port` binds loopback on
+    /// the server; an explicit bind of `*` or empty means all interfaces.
+    pub fn parse(spec: &str) -> Result<RemoteForward, String> {
+        let parts: Vec<&str> = spec.split(':').collect();
+        let (bind, port, host, hport) = match parts.as_slice() {
+            [port, host, hport] => ("127.0.0.1", *port, *host, *hport),
+            [bind, port, host, hport] => (*bind, *port, *host, *hport),
+            _ => {
+                return Err(format!(
+                    "bad -R spec {spec:?} (want [bind:]port:host:hostport)"
+                ))
+            }
+        };
+        let listen_port: u16 = port
+            .parse()
+            .map_err(|_| format!("bad listen port in -R spec {spec:?}"))?;
+        let target_port: u16 = hport
+            .parse()
+            .map_err(|_| format!("bad host port in -R spec {spec:?}"))?;
+        if host.is_empty() {
+            return Err(format!("empty target host in -R spec {spec:?}"));
+        }
+        Ok(RemoteForward {
+            listen_bind: bind.to_string(),
+            listen_port,
+            target_host: host.to_string(),
+            target_port,
+        })
+    }
+}
+
+/// Accept connections on a server-side remote-forward listener and open a
+/// `forwarded-tcpip` channel back to the client for each. `addr`/`port` are
+/// the listened address as the client requested them (echoed in the open).
+pub async fn serve_remote_listener(
+    listener: TcpListener,
+    addr: String,
+    port: u16,
+    handle: Handle,
+) {
+    loop {
+        let Ok((sock, peer)) = listener.accept().await else {
+            break;
+        };
+        sock.set_nodelay(true).ok();
+        handle.open_forwarded(addr.clone(), port, peer.ip().to_string(), peer.port(), sock);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,5 +301,23 @@ mod tests {
 
         assert!(LocalForward::parse("nope").is_err());
         assert!(LocalForward::parse("80:host:notaport").is_err());
+    }
+
+    #[test]
+    fn remote_forward_specs() {
+        let f = RemoteForward::parse("9000:localhost:3000").unwrap();
+        assert_eq!(f.listen_bind, "127.0.0.1");
+        assert_eq!(f.listen_port, 9000);
+        assert_eq!(f.target_host, "localhost");
+        assert_eq!(f.target_port, 3000);
+
+        let f = RemoteForward::parse("*:8080:10.0.0.2:80").unwrap();
+        assert_eq!(f.listen_bind, "*");
+        assert_eq!(f.listen_port, 8080);
+        assert_eq!(f.target_host, "10.0.0.2");
+        assert_eq!(f.target_port, 80);
+
+        assert!(RemoteForward::parse("nope").is_err());
+        assert!(RemoteForward::parse("notaport:host:80").is_err());
     }
 }

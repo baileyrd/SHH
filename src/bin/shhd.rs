@@ -43,6 +43,12 @@ struct Args {
     /// is refused entirely.
     #[arg(long = "permit-open", value_name = "host:port")]
     permit_open: Vec<String>,
+
+    /// Permit remote (`-R`) forwarding: bind a listener for a client
+    /// (repeatable). `bind:port`, port `*` for any, or `any`. Default:
+    /// remote forwarding is refused entirely.
+    #[arg(long = "permit-listen", value_name = "bind:port")]
+    permit_listen: Vec<String>,
 }
 
 fn default_path(name: &str) -> PathBuf {
@@ -123,15 +129,22 @@ async fn main() -> std::io::Result<()> {
         None => tracing::info!("accepting any username (keys still gate access)"),
     }
 
-    // Validate the forwarding allowlist up front so a typo fails at startup.
-    if let Err(e) = connect::forward::Policy::parse(&args.permit_open) {
-        eprintln!("shhd: {e}");
-        std::process::exit(2);
+    // Validate the forwarding allowlists up front so a typo fails at startup.
+    for (flag, specs) in [("--permit-open", &args.permit_open), ("--permit-listen", &args.permit_listen)] {
+        if let Err(e) = connect::forward::Policy::parse(specs) {
+            eprintln!("shhd: {flag}: {e}");
+            std::process::exit(2);
+        }
     }
     if args.permit_open.is_empty() {
-        tracing::info!("port forwarding disabled (no --permit-open)");
+        tracing::info!("local (-L) forwarding disabled (no --permit-open)");
     } else {
-        tracing::info!("port forwarding permitted for: {}", args.permit_open.join(", "));
+        tracing::info!("local (-L) forwarding permitted for: {}", args.permit_open.join(", "));
+    }
+    if args.permit_listen.is_empty() {
+        tracing::info!("remote (-R) forwarding disabled (no --permit-listen)");
+    } else {
+        tracing::info!("remote (-R) forwarding permitted for: {}", args.permit_listen.join(", "));
     }
 
     let listener = TcpListener::bind(&args.listen).await?;
@@ -147,6 +160,7 @@ async fn main() -> std::io::Result<()> {
             banner: args.banner.clone(),
         };
         let permit_open = args.permit_open.clone();
+        let permit_listen = args.permit_listen.clone();
         tokio::spawn(async move {
             let config = ServerConfig { host_key };
             let mut t = match Transport::server(socket, config).await {
@@ -166,11 +180,14 @@ async fn main() -> std::io::Result<()> {
             };
 
             // One multiplexed connection serves sessions and, where the
-            // allowlist permits, direct-tcpip forwards — concurrently.
+            // allowlists permit, `-L` and `-R` forwards — concurrently.
             tracing::info!(%addr, %user, "connection established");
             let fwd = connect::forward::Policy::parse(&permit_open)
                 .expect("policy validated at startup");
-            match connect::mux::Connection::new(t, fwd).run(None).await {
+            let listen = connect::forward::Policy::parse(&permit_listen)
+                .expect("policy validated at startup");
+            let conn = connect::mux::Connection::new(t, fwd).listen_policy(listen);
+            match conn.run(None).await {
                 Ok(()) => tracing::info!(%addr, %user, "connection ended"),
                 Err(e) => tracing::info!(%addr, %user, "connection error: {e}"),
             }

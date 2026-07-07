@@ -14,12 +14,13 @@
 //! connection. Session-specific traffic (channel requests, extended data,
 //! request replies) flows over the same task channels.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Semaphore};
+use tokio::task::AbortHandle;
 
 use super::forward::{self, Policy};
 use super::session::{self, SessionSpec};
@@ -33,15 +34,25 @@ use crate::{Error, Result};
 
 /// Commands from channel tasks and forward acceptors to the loop.
 pub(crate) enum Cmd {
-    /// A local acceptor asks to open a direct-tcpip channel carrying `stream`.
-    OpenDirect {
-        target_host: String,
-        target_port: u16,
+    /// An acceptor asks to open a tunnel channel (`direct-tcpip` for `-L`,
+    /// `forwarded-tcpip` for `-R`) carrying an accepted socket. `addr`/`port`
+    /// are the open's address fields.
+    OpenTunnel {
+        channel_type: &'static str,
+        addr: String,
+        port: u16,
         orig_host: String,
         orig_port: u16,
         stream: TcpStream,
     },
-    /// A client asks to open a session channel.
+    /// A client asks the server to listen and forward back (`tcpip-forward`).
+    RemoteForward {
+        bind: String,
+        port: u16,
+        target_host: String,
+        target_port: u16,
+    },
+    /// A client asks a session channel.
     OpenSession(Box<SessionSpec>),
     /// Result of a server-side connect for an incoming direct-tcpip open.
     Connected {
@@ -90,7 +101,7 @@ pub struct Handle {
 }
 
 impl Handle {
-    /// Request a direct-tcpip channel for an accepted local connection.
+    /// Open a direct-tcpip channel (`-L`) for an accepted local connection.
     pub fn open_direct(
         &self,
         target_host: String,
@@ -99,12 +110,50 @@ impl Handle {
         orig_port: u16,
         stream: TcpStream,
     ) {
-        let _ = self.tx.send(Cmd::OpenDirect {
-            target_host,
-            target_port,
+        let _ = self.tx.send(Cmd::OpenTunnel {
+            channel_type: "direct-tcpip",
+            addr: target_host,
+            port: target_port,
             orig_host,
             orig_port,
             stream,
+        });
+    }
+
+    /// Open a forwarded-tcpip channel (`-R`) for a connection accepted on a
+    /// server-side listener. `addr`/`port` are the listened address.
+    pub fn open_forwarded(
+        &self,
+        addr: String,
+        port: u16,
+        orig_host: String,
+        orig_port: u16,
+        stream: TcpStream,
+    ) {
+        let _ = self.tx.send(Cmd::OpenTunnel {
+            channel_type: "forwarded-tcpip",
+            addr,
+            port,
+            orig_host,
+            orig_port,
+            stream,
+        });
+    }
+
+    /// Ask the server to listen on `bind:port` and forward connections back
+    /// to `target_host:target_port` (reachable from this side).
+    pub fn request_remote_forward(
+        &self,
+        bind: String,
+        port: u16,
+        target_host: String,
+        target_port: u16,
+    ) {
+        let _ = self.tx.send(Cmd::RemoteForward {
+            bind,
+            port,
+            target_host,
+            target_port,
         });
     }
 
@@ -136,33 +185,78 @@ enum Pending {
     Session(Box<SessionSpec>),
 }
 
+/// A `tcpip-forward` we sent and are awaiting a reply for.
+struct PendingForward {
+    bind: String,
+    port: u16,
+    target: (String, u16),
+}
+
 /// The connection loop.
 pub struct Connection<S> {
     t: Transport<S>,
+    /// Gates incoming direct-tcpip opens (`-L` target, server role).
     policy: Policy,
+    /// Gates incoming tcpip-forward requests (`-R` listen, server role).
+    listen_policy: Policy,
     channels: HashMap<u32, Chan>,
     pending: HashMap<u32, Pending>,
+    /// Established remote forwards (client role): server bind → local target.
+    remote_forwards: HashMap<(String, u16), (String, u16)>,
+    /// Bound server-side listeners (server role), for cancel + teardown.
+    listeners: HashMap<(String, u16), AbortHandle>,
+    /// tcpip-forward requests awaiting a reply (client role).
+    pending_forwards: VecDeque<PendingForward>,
     next_id: u32,
     cmd_tx: mpsc::UnboundedSender<Cmd>,
     cmd_rx: mpsc::UnboundedReceiver<Cmd>,
     done: bool,
 }
 
+impl<S> Drop for Connection<S> {
+    fn drop(&mut self) {
+        // Stop any server-side remote-forward listeners with the connection.
+        for (_, h) in self.listeners.drain() {
+            h.abort();
+        }
+    }
+}
+
+/// Map a requested bind address to something bindable.
+fn normalize_bind(bind: &str) -> String {
+    match bind {
+        "" | "*" => "0.0.0.0".to_string(),
+        "localhost" => "127.0.0.1".to_string(),
+        other => other.to_string(),
+    }
+}
+
 impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
     /// Wrap an authenticated transport. `policy` gates *incoming*
     /// direct-tcpip opens (server role); a client passes [`Policy::DenyAll`].
+    /// Remote-forward listening is denied until [`Connection::listen_policy`].
     pub fn new(t: Transport<S>, policy: Policy) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         Connection {
             t,
             policy,
+            listen_policy: Policy::DenyAll,
             channels: HashMap::new(),
             pending: HashMap::new(),
+            remote_forwards: HashMap::new(),
+            listeners: HashMap::new(),
+            pending_forwards: VecDeque::new(),
             next_id: 0,
             cmd_tx,
             cmd_rx,
             done: false,
         }
+    }
+
+    /// Set the policy gating incoming `tcpip-forward` (remote `-R`) requests.
+    pub fn listen_policy(mut self, policy: Policy) -> Self {
+        self.listen_policy = policy;
+        self
     }
 
     /// A handle for opening channels from outside the loop.
@@ -218,7 +312,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
             msg::EXT_INFO => self.t.note_ext_info(&p)?,
             msg::KEXINIT => self.t.rekey_respond(p).await?,
             msg::DISCONNECT => self.done = true,
-            msg::GLOBAL_REQUEST => super::refuse_global_request(&mut self.t, &p).await?,
+            msg::GLOBAL_REQUEST => self.on_global_request(&p).await?,
+            msg::REQUEST_SUCCESS => self.on_global_reply(&p, true),
+            msg::REQUEST_FAILURE => self.on_global_reply(&p, false),
             msg::CHANNEL_OPEN => self.on_channel_open(&p).await?,
             msg::CHANNEL_OPEN_CONFIRMATION => self.on_open_confirm(&p)?,
             msg::CHANNEL_OPEN_FAILURE => self.on_open_failure(&p)?,
@@ -257,6 +353,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
                 self.spawn_session_server(id, sender, window, max);
                 Ok(())
             }
+            // Server side of `-L`: connect out to the requested target.
             "direct-tcpip" => {
                 let host = r.utf8()?.to_owned();
                 let port = u16::try_from(r.u32()?).map_err(|_| Error::proto("port out of range"))?;
@@ -273,27 +370,68 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
                         )
                         .await;
                 }
-                // Connect out in a task so a slow SYN can't stall the loop.
-                let cmd_tx = self.cmd_tx.clone();
-                tokio::spawn(async move {
-                    let stream = TcpStream::connect((host.as_str(), port)).await;
-                    if let Ok(s) = &stream {
-                        s.set_nodelay(true).ok();
-                    }
-                    let _ = cmd_tx.send(Cmd::Connected {
-                        peer_id: sender,
-                        peer_window: window,
-                        peer_max: max,
-                        stream,
-                    });
-                });
+                self.spawn_connect(sender, window, max, host, port);
                 Ok(())
+            }
+            // Client side of `-R`: match the listened address to a forward we
+            // requested, then connect to its local target.
+            "forwarded-tcpip" => {
+                let addr = r.utf8()?.to_owned();
+                let port = u16::try_from(r.u32()?).map_err(|_| Error::proto("port out of range"))?;
+                let _orig_host = r.utf8()?;
+                let _orig_port = r.u32()?;
+                r.finish()?;
+                match self.lookup_remote(&addr, port) {
+                    Some((host, tport)) => {
+                        self.spawn_connect(sender, window, max, host, tport);
+                        Ok(())
+                    }
+                    None => {
+                        tracing::info!(%addr, port, "forwarded-tcpip has no matching request");
+                        self.reject_open(
+                            sender,
+                            open_failure::ADMINISTRATIVELY_PROHIBITED,
+                            "no matching remote forward",
+                        )
+                        .await
+                    }
+                }
             }
             _ => {
                 self.reject_open(sender, open_failure::UNKNOWN_CHANNEL_TYPE, "unsupported channel type")
                     .await
             }
         }
+    }
+
+    /// Connect out to `host:port` in a task (so a slow SYN can't stall the
+    /// loop), reporting the result back as [`Cmd::Connected`].
+    fn spawn_connect(&self, peer_id: u32, peer_window: u32, peer_max: u32, host: String, port: u16) {
+        let cmd_tx = self.cmd_tx.clone();
+        tokio::spawn(async move {
+            let stream = TcpStream::connect((host.as_str(), port)).await;
+            if let Ok(s) = &stream {
+                s.set_nodelay(true).ok();
+            }
+            let _ = cmd_tx.send(Cmd::Connected {
+                peer_id,
+                peer_window,
+                peer_max,
+                stream,
+            });
+        });
+    }
+
+    /// Find the local target for a `forwarded-tcpip` open, matching the exact
+    /// (address, port) first and falling back to any forward on that port.
+    fn lookup_remote(&self, addr: &str, port: u16) -> Option<(String, u16)> {
+        if let Some(t) = self.remote_forwards.get(&(addr.to_string(), port)) {
+            return Some(t.clone());
+        }
+        self.remote_forwards
+            .iter()
+            .find(|((_, p), _)| *p == port)
+            .map(|(_, v)| v.clone())
     }
 
     async fn reject_open(&mut self, peer: u32, reason: u32, desc: &str) -> Result<()> {
@@ -445,13 +583,118 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         }
     }
 
+    // --------------------------------------------------- global requests
+
+    async fn on_global_request(&mut self, p: &[u8]) -> Result<()> {
+        let mut r = Reader::new(p);
+        r.byte()?;
+        let name = r.utf8()?.to_owned();
+        let want_reply = r.boolean()?;
+        match name.as_str() {
+            "tcpip-forward" => {
+                let bind = r.utf8()?.to_owned();
+                let port = r.u32()?;
+                self.handle_tcpip_forward(bind, port, want_reply).await
+            }
+            "cancel-tcpip-forward" => {
+                let bind = r.utf8()?.to_owned();
+                let port = u16::try_from(r.u32()?).unwrap_or(0);
+                if let Some(h) = self.listeners.remove(&(normalize_bind(&bind), port)) {
+                    h.abort();
+                    tracing::info!(%bind, port, "remote forward cancelled");
+                }
+                if want_reply {
+                    self.t.send(&[msg::REQUEST_SUCCESS]).await?;
+                }
+                Ok(())
+            }
+            _ => {
+                if want_reply {
+                    self.t.send(&[msg::REQUEST_FAILURE]).await?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Server side: honor `tcpip-forward` by binding a listener (subject to
+    /// the listen policy) whose connections open forwarded-tcpip channels.
+    async fn handle_tcpip_forward(&mut self, bind: String, req_port: u32, want_reply: bool) -> Result<()> {
+        let req_port = u16::try_from(req_port).unwrap_or(0);
+        // Match the policy against the requested bind and its canonical form,
+        // so `--permit-listen 127.0.0.1:PORT` also accepts OpenSSH's default
+        // `localhost` bind (and `0.0.0.0` accepts an empty/`*` bind).
+        let permitted = self.listen_policy.permits(&bind, req_port)
+            || self.listen_policy.permits(&normalize_bind(&bind), req_port);
+        if !permitted {
+            tracing::info!(%bind, port = req_port, "tcpip-forward refused by policy");
+            if want_reply {
+                self.t.send(&[msg::REQUEST_FAILURE]).await?;
+            }
+            return Ok(());
+        }
+        let addr = normalize_bind(&bind);
+        let listener = match TcpListener::bind((addr.as_str(), req_port)).await {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::warn!(%bind, port = req_port, "bind failed: {e}");
+                if want_reply {
+                    self.t.send(&[msg::REQUEST_FAILURE]).await?;
+                }
+                return Ok(());
+            }
+        };
+        let actual = listener.local_addr().map(|a| a.port()).unwrap_or(req_port);
+        if want_reply {
+            let mut w = Writer::new();
+            w.byte(msg::REQUEST_SUCCESS);
+            // RFC 4254 §7.1: echo the allocated port only when 0 was asked.
+            if req_port == 0 {
+                w.u32(actual as u32);
+            }
+            self.t.send(&w.into_bytes()).await?;
+        }
+        tracing::info!(%bind, port = actual, "listening for remote forward");
+        let task = tokio::spawn(forward::serve_remote_listener(
+            listener,
+            bind.clone(),
+            actual,
+            self.handle(),
+        ));
+        self.listeners.insert((addr, actual), task.abort_handle());
+        Ok(())
+    }
+
+    /// Client side: correlate a `tcpip-forward` reply with the request we
+    /// sent and, on success, register the forward so its channels can match.
+    fn on_global_reply(&mut self, p: &[u8], success: bool) {
+        let Some(req) = self.pending_forwards.pop_front() else {
+            return;
+        };
+        if !success {
+            tracing::warn!(bind = %req.bind, port = req.port, "server refused remote forward");
+            return;
+        }
+        // For a port-0 request the reply carries the allocated port.
+        let port = if req.port == 0 {
+            let mut r = Reader::new(p);
+            let _ = r.byte();
+            r.u32().ok().and_then(|v| u16::try_from(v).ok()).unwrap_or(0)
+        } else {
+            req.port
+        };
+        tracing::info!(bind = %req.bind, port, "remote forward established");
+        self.remote_forwards.insert((req.bind, port), req.target);
+    }
+
     // ---------------------------------------------------- task commands
 
     async fn on_cmd(&mut self, cmd: Cmd) -> Result<()> {
         match cmd {
-            Cmd::OpenDirect {
-                target_host,
-                target_port,
+            Cmd::OpenTunnel {
+                channel_type,
+                addr,
+                port,
                 orig_host,
                 orig_port,
                 stream,
@@ -460,14 +703,33 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
                 self.pending.insert(id, Pending::Direct(stream));
                 let mut w = Writer::new();
                 w.byte(msg::CHANNEL_OPEN);
-                w.utf8("direct-tcpip");
+                w.utf8(channel_type);
                 w.u32(id);
                 w.u32(LOCAL_WINDOW);
                 w.u32(MAX_CHUNK);
-                w.utf8(&target_host);
-                w.u32(target_port as u32);
+                w.utf8(&addr);
+                w.u32(port as u32);
                 w.utf8(&orig_host);
                 w.u32(orig_port as u32);
+                self.t.send(&w.into_bytes()).await?;
+            }
+            Cmd::RemoteForward {
+                bind,
+                port,
+                target_host,
+                target_port,
+            } => {
+                self.pending_forwards.push_back(PendingForward {
+                    bind: bind.clone(),
+                    port,
+                    target: (target_host, target_port),
+                });
+                let mut w = Writer::new();
+                w.byte(msg::GLOBAL_REQUEST);
+                w.utf8("tcpip-forward");
+                w.boolean(true); // want_reply
+                w.utf8(&bind);
+                w.u32(port as u32);
                 self.t.send(&w.into_bytes()).await?;
             }
             Cmd::OpenSession(spec) => {
@@ -839,6 +1101,49 @@ mod tests {
         let mut buf2 = [0u8; 5];
         app2.read_exact(&mut buf2).await.unwrap();
         assert_eq!(&buf2, b"again");
+
+        drop(app);
+        drop(client);
+        drop(server);
+    }
+
+    #[tokio::test]
+    async fn remote_forward_round_trips() {
+        // The client asks the server to listen; connections there come back
+        // as forwarded-tcpip channels the client splices to a local target.
+        let target = echo_server().await; // reachable from the "client"
+        let (client_t, server_t) = transport_pair().await;
+
+        // Server permits remote-forward binds.
+        let server = tokio::spawn(async move {
+            Connection::new(server_t, Policy::DenyAll)
+                .listen_policy(Policy::AllowAll)
+                .run(None)
+                .await
+        });
+
+        // Grab a free port for the server's listener, then ask for it.
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rport = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let client_conn = Connection::new(client_t, Policy::DenyAll);
+        let handle = client_conn.handle();
+        handle.request_remote_forward("127.0.0.1".into(), rport, "127.0.0.1".into(), target.port());
+        let client = tokio::spawn(async move { client_conn.run(None).await });
+
+        // Connect to the server-side port (retry until it's bound), then
+        // exercise the reverse tunnel end to end.
+        let mut app = loop {
+            match TcpStream::connect(("127.0.0.1", rport)).await {
+                Ok(s) => break s,
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+            }
+        };
+        app.write_all(b"reverse").await.unwrap();
+        let mut buf = [0u8; 7];
+        app.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"reverse");
 
         drop(app);
         drop(client);

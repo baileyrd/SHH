@@ -58,7 +58,13 @@ struct Args {
     #[arg(short = 'L', long = "local-forward", value_name = "spec")]
     local_forward: Vec<String>,
 
-    /// Do not run a remote command; hold the connection open (for -L).
+    /// Remote port forward: `[bind:]port:host:hostport` (repeatable). The
+    /// server listens on `bind:port` and forwards back to `host:hostport`
+    /// reachable from here.
+    #[arg(short = 'R', long = "remote-forward", value_name = "spec")]
+    remote_forward: Vec<String>,
+
+    /// Do not run a remote command; hold the connection open (for -L / -R).
     #[arg(short = 'N', long = "no-command")]
     no_command: bool,
 }
@@ -206,11 +212,16 @@ async fn run(args: Args) -> Result<i32, String> {
         .or_else(|| std::env::var("USER").ok())
         .ok_or("no username (use user@host or -l)")?;
 
-    // Parse -L specs before touching the network so a typo fails instantly.
+    // Parse -L / -R specs before touching the network so a typo fails fast.
     let forwards: Vec<connect::forward::LocalForward> = args
         .local_forward
         .iter()
         .map(|s| connect::forward::LocalForward::parse(s))
+        .collect::<Result<_, _>>()?;
+    let remotes: Vec<connect::forward::RemoteForward> = args
+        .remote_forward
+        .iter()
+        .map(|s| connect::forward::RemoteForward::parse(s))
         .collect::<Result<_, _>>()?;
     if args.no_command && !args.command.is_empty() {
         return Err("-N does not take a remote command".into());
@@ -261,9 +272,24 @@ async fn run(args: Args) -> Result<i32, String> {
         ));
     }
 
+    // Ask the server to set up each -R remote forward. The reply (and the
+    // resulting forwarded-tcpip channels) are handled by the loop.
+    for rf in &remotes {
+        eprintln!(
+            "shh: remote forward {}:{} -> {}:{}",
+            rf.listen_bind, rf.listen_port, rf.target_host, rf.target_port
+        );
+        handle.request_remote_forward(
+            rf.listen_bind.clone(),
+            rf.listen_port,
+            rf.target_host.clone(),
+            rf.target_port,
+        );
+    }
+
     // -N: no session — hold the connection open for the forwards until Ctrl-C.
     if args.no_command {
-        if forwards.is_empty() {
+        if forwards.is_empty() && remotes.is_empty() {
             eprintln!("shh: connected to {user}@{host}; holding open (Ctrl-C to exit)");
         }
         tokio::select! {

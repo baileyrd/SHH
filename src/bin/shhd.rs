@@ -1,9 +1,12 @@
 //! shhd — the SHH server.
 //!
-//! Serves session channels (exec/shell) to holders of authorized Ed25519
-//! keys. Runs as the invoking user with no privilege separation yet, so
-//! point it at a dedicated account or a container if exposing it beyond
-//! localhost.
+//! Serves session channels (exec/shell) and, where the allowlists permit,
+//! `-L`/`-R` forwards, to holders of authorized keys or valid certificates.
+//! When run as root it drops each session to the authenticated user's
+//! account (uid/gid/groups, home, login shell); an unknown user is refused
+//! rather than run with root privileges. The pre-auth code is not yet
+//! sandboxed in a separate process, so still prefer a container or a
+//! dedicated account when exposing it broadly.
 
 use std::path::PathBuf;
 
@@ -69,6 +72,12 @@ struct Args {
     /// Unanswered keepalives before dropping an unresponsive client.
     #[arg(long, default_value_t = 3)]
     keepalive_count: u32,
+
+    /// Do not drop to the authenticated user; run every session as the
+    /// account `shhd` itself runs as. Use only for single-user or test
+    /// setups where login names are not system accounts.
+    #[arg(long)]
+    no_privilege_drop: bool,
 }
 
 fn default_path(name: &str) -> PathBuf {
@@ -192,6 +201,13 @@ async fn main() -> std::io::Result<()> {
         tracing::info!("remote (-R) forwarding permitted for: {}", args.permit_listen.join(", "));
     }
 
+    let is_root = nix::unistd::geteuid().is_root();
+    if args.no_privilege_drop {
+        tracing::warn!("privilege drop disabled — sessions run as the shhd account");
+    } else if !is_root {
+        tracing::warn!("not running as root — sessions run as the shhd account (cannot drop)");
+    }
+
     let listener = TcpListener::bind(&args.listen).await?;
     tracing::info!("listening on {}", args.listen);
 
@@ -210,6 +226,7 @@ async fn main() -> std::io::Result<()> {
         let permit_listen = args.permit_listen.clone();
         let ka_interval = args.keepalive_interval;
         let ka_count = args.keepalive_count;
+        let no_privilege_drop = args.no_privilege_drop;
         tokio::spawn(async move {
             let config = ServerConfig {
                 host_key,
@@ -231,6 +248,26 @@ async fn main() -> std::io::Result<()> {
                 }
             };
 
+            // Resolve the account the session should run as. When we are
+            // root we drop to it; an unknown user is refused rather than run
+            // with our own (root) privileges.
+            let session_user = if no_privilege_drop {
+                None
+            } else {
+                match connect::UserContext::for_user(&user) {
+                    Some(ctx) => {
+                        tracing::info!(%addr, %user, uid = ctx.uid, "session will run as user");
+                        Some(ctx)
+                    }
+                    None if is_root => {
+                        tracing::warn!(%addr, %user, "no such system user; refusing session");
+                        t.disconnect(11, "no such user").await.ok();
+                        return;
+                    }
+                    None => None, // not root: can't drop anyway, run as self
+                }
+            };
+
             // One multiplexed connection serves sessions and, where the
             // allowlists permit, `-L` and `-R` forwards — concurrently.
             tracing::info!(%addr, %user, "connection established");
@@ -240,7 +277,8 @@ async fn main() -> std::io::Result<()> {
                 .expect("policy validated at startup");
             let conn = connect::mux::Connection::new(t, fwd)
                 .listen_policy(listen)
-                .keepalive(std::time::Duration::from_secs(ka_interval), ka_count);
+                .keepalive(std::time::Duration::from_secs(ka_interval), ka_count)
+                .session_user(session_user);
             match conn.run(None).await {
                 Ok(()) => tracing::info!(%addr, %user, "connection ended"),
                 Err(e) => tracing::info!(%addr, %user, "connection error: {e}"),

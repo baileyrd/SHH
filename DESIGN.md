@@ -154,5 +154,12 @@ shh/                 one library crate
 5. **Keep-alives (done).** Both sides send `keepalive@openssh.com` global
    requests after a configurable idle interval and drop a peer that leaves
    several unanswered, keeping NAT state warm and surfacing dead
-   connections instead of hanging. Remaining: `sk-ssh-ed25519` FIDO2 keys,
-   agent protocol, hardened privilege separation in `shhd`.
+   connections instead of hanging.
+6. **Privilege drop (done).** When `shhd` runs as root it resolves the
+   authenticated login name in the password database and drops each
+   session to that account — gid, supplementary groups, then uid, in a
+   single post-fork hook that also sets `HOME`/`USER`/`SHELL`, changes to
+   the home directory, and runs the login shell. An unknown user is
+   refused rather than run as root. Remaining: `sk-ssh-ed25519` FIDO2 keys,
+   agent protocol, and a sandboxed pre-auth process (privilege
+   *separation*, a further step beyond this privilege *drop*).

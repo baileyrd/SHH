@@ -141,7 +141,11 @@ TCP forwarding with server-side allowlists, and connection keep-alives —
 all multiplexed so a session and any number of forwards share one
 connection — are complete and tested (`cargo test`). Keep-alives probe an
 idle peer (`keepalive@openssh.com`) and drop it after several unanswered
-probes (`--keepalive-interval` / `--keepalive-count`, on by default). Not
-yet implemented: FIDO2 `sk-ssh-ed25519` keys, sshd-style privilege
-separation. Treat it as a working protocol implementation, not a hardened
-production daemon.
+probes (`--keepalive-interval` / `--keepalive-count`, on by default). When
+`shhd` runs as root it drops each session to the authenticated user's
+account — uid, gid, supplementary groups, home directory, and login shell
+— so a session is never more privileged than the account that logged in;
+an unknown login name is refused. Not yet implemented: FIDO2
+`sk-ssh-ed25519` keys, and a sandboxed pre-auth process (privilege
+*separation*, distinct from the privilege *drop* above). Treat it as a
+working protocol implementation, not a hardened production daemon.

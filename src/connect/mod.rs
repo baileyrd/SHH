@@ -2,12 +2,16 @@
 //! tool actually needs: one `session` channel per connection, `exec` or
 //! `shell`, bidirectional data with real window flow control, exit status.
 //!
-//! Not present, on purpose (for now): PTY allocation, TCP forwarding, X11,
-//! agent forwarding. Forwarding will arrive with an explicit allowlist
-//! model rather than RFC 4254's open-by-default posture.
+//! Not present, on purpose (for now): TCP forwarding, X11, agent
+//! forwarding. Forwarding will arrive with an explicit allowlist model
+//! rather than RFC 4254's open-by-default posture.
+
+#[cfg(unix)]
+pub mod pty;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::Command;
+use tokio::sync::mpsc;
 
 use crate::transport::Transport;
 use crate::wire::{msg, Reader, Writer};
@@ -24,6 +28,37 @@ const STDERR: u32 = 1; // SSH_EXTENDED_DATA_STDERR
 pub struct ExitStatus {
     pub code: Option<u32>,
     pub signal: Option<String>,
+}
+
+/// Ask the server for a pseudo-terminal with these dimensions.
+pub struct PtyRequest {
+    pub term: String,
+    pub cols: u32,
+    pub rows: u32,
+    pub xpix: u32,
+    pub ypix: u32,
+}
+
+/// A terminal resize: (cols, rows, xpixels, ypixels).
+pub type WindowChange = (u32, u32, u32, u32);
+
+/// Read from a reader that may not exist; absent readers never produce.
+async fn maybe_read<R: AsyncRead + Unpin>(
+    r: Option<&mut R>,
+    buf: &mut [u8],
+) -> std::io::Result<usize> {
+    match r {
+        Some(r) => r.read(buf).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Receive from a channel that may not exist.
+async fn maybe_recv<T>(rx: Option<&mut mpsc::Receiver<T>>) -> Option<T> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
 }
 
 // ------------------------------------------------------- packet helpers --
@@ -103,6 +138,28 @@ where
     Ok(())
 }
 
+/// Wait for CHANNEL_SUCCESS/FAILURE to a request we sent, absorbing the
+/// traffic that may legitimately arrive first.
+async fn await_request_reply<S>(t: &mut Transport<S>, remote_window: &mut u32) -> Result<bool>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    loop {
+        let p = t.recv().await?;
+        let mut r = Reader::new(&p);
+        match r.byte()? {
+            msg::CHANNEL_SUCCESS => return Ok(true),
+            msg::CHANNEL_FAILURE => return Ok(false),
+            msg::CHANNEL_WINDOW_ADJUST => {
+                r.u32()?;
+                *remote_window = remote_window.saturating_add(r.u32()?);
+            }
+            msg::GLOBAL_REQUEST => refuse_global_request(t, &p).await?,
+            other => return Err(Error::proto(format!("unexpected message {other}"))),
+        }
+    }
+}
+
 /// Reply to a GLOBAL_REQUEST we don't serve (they're all optional
 /// extensions; OpenSSH sends `hostkeys-00@openssh.com` routinely).
 async fn refuse_global_request<S>(t: &mut Transport<S>, payload: &[u8]) -> Result<()>
@@ -121,10 +178,13 @@ where
 // -------------------------------------------------------------- client --
 
 /// Open a session, run `command` (or a shell when `None`), shuttle stdio,
-/// and return the remote exit status.
+/// and return the remote exit status. With `pty`, a pseudo-terminal is
+/// requested first; `resize` events become window-change requests.
 pub async fn client_session<S, I, O, E>(
     t: &mut Transport<S>,
     command: Option<&str>,
+    pty: Option<&PtyRequest>,
+    mut resize: Option<mpsc::Receiver<WindowChange>>,
     mut stdin: I,
     mut stdout: O,
     mut stderr: E,
@@ -166,7 +226,23 @@ where
         }
     };
 
-    // --- request exec or shell
+    // --- optional pty, then exec or shell (each waits for its reply)
+    if let Some(req) = pty {
+        let mut w = chan(msg::CHANNEL_REQUEST, peer);
+        w.utf8("pty-req");
+        w.boolean(true);
+        w.utf8(&req.term);
+        w.u32(req.cols);
+        w.u32(req.rows);
+        w.u32(req.xpix);
+        w.u32(req.ypix);
+        w.string(b""); // terminal modes: server-side defaults
+        t.send(&w.into_bytes()).await?;
+        if !await_request_reply(t, &mut remote_window).await? {
+            return Err(Error::Channel("server refused to allocate a pty".into()));
+        }
+    }
+
     let mut w = chan(msg::CHANNEL_REQUEST, peer);
     match command {
         Some(cmd) => {
@@ -180,26 +256,12 @@ where
         }
     }
     t.send(&w.into_bytes()).await?;
+    if !await_request_reply(t, &mut remote_window).await? {
+        return Err(Error::Channel("server refused to run the command".into()));
+    }
 
     let mut local_window = LOCAL_WINDOW;
     let mut exit: Option<ExitStatus> = None;
-
-    loop {
-        let p = t.recv().await?;
-        let mut r = Reader::new(&p);
-        match r.byte()? {
-            msg::CHANNEL_SUCCESS => break,
-            msg::CHANNEL_FAILURE => {
-                return Err(Error::Channel("server refused to run the command".into()))
-            }
-            msg::CHANNEL_WINDOW_ADJUST => {
-                r.u32()?;
-                remote_window = remote_window.saturating_add(r.u32()?);
-            }
-            msg::GLOBAL_REQUEST => refuse_global_request(t, &p).await?,
-            other => return Err(Error::proto(format!("unexpected message {other}"))),
-        }
-    }
 
     // --- shuttle data until the channel closes in both directions
     let mut stdin_buf = vec![0u8; MAX_CHUNK as usize];
@@ -303,6 +365,21 @@ where
                     n => pending_in.extend_from_slice(&stdin_buf[..n]),
                 }
             }
+            ws = maybe_recv(resize.as_mut()) => {
+                match ws {
+                    Some((cols, rows, xpix, ypix)) => {
+                        let mut w = chan(msg::CHANNEL_REQUEST, peer);
+                        w.utf8("window-change");
+                        w.boolean(false);
+                        w.u32(cols);
+                        w.u32(rows);
+                        w.u32(xpix);
+                        w.u32(ypix);
+                        t.send(&w.into_bytes()).await?;
+                    }
+                    None => resize = None, // sender gone; stop watching
+                }
+            }
         }
     }
 
@@ -346,10 +423,11 @@ where
         }
     };
 
-    // --- wait for exec/shell; refuse decorations we don't do (pty, env)
+    // --- wait for exec/shell, honoring pty-req; refuse what we don't do
     let mut early_stdin: Vec<u8> = Vec::new();
     let mut local_window = LOCAL_WINDOW;
     let mut stdin_eof = false;
+    let mut allocated: Option<pty::Pty> = None;
     let mut child = loop {
         let p = t.recv().await?;
         let mut r = Reader::new(&p);
@@ -366,9 +444,43 @@ where
                         c
                     }
                     "shell" => {
-                        // No PTY support yet, so this is a pipe shell:
-                        // fine for scripted use, not a login terminal.
                         Command::new(std::env::var("SHELL").unwrap_or("/bin/sh".into()))
+                    }
+                    "pty-req" => {
+                        let term = r.utf8()?.to_owned();
+                        let cols = r.u32()?;
+                        let rows = r.u32()?;
+                        let xpix = r.u32()?;
+                        let ypix = r.u32()?;
+                        let _modes = r.string()?; // we leave pty defaults
+                        match pty::Pty::allocate(&term, cols, rows, xpix, ypix) {
+                            Ok(p) => {
+                                allocated = Some(p);
+                                if want_reply {
+                                    t.send(&simple(msg::CHANNEL_SUCCESS, client_id)).await?;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("pty allocation failed: {e}");
+                                if want_reply {
+                                    t.send(&simple(msg::CHANNEL_FAILURE, client_id)).await?;
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    "window-change" => {
+                        let cols = r.u32()?;
+                        let rows = r.u32()?;
+                        let xpix = r.u32()?;
+                        let ypix = r.u32()?;
+                        if let Some(p) = &allocated {
+                            p.resize(cols, rows, xpix, ypix);
+                        }
+                        if want_reply {
+                            t.send(&simple(msg::CHANNEL_SUCCESS, client_id)).await?;
+                        }
+                        continue;
                     }
                     _ => {
                         if want_reply {
@@ -377,12 +489,15 @@ where
                         continue;
                     }
                 };
-                let child = cmd
-                    .stdin(std::process::Stdio::piped())
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped())
-                    .spawn();
-                match child {
+                let spawned = match allocated.as_mut() {
+                    Some(p) => spawn_on_pty(&mut cmd, p),
+                    None => cmd
+                        .stdin(std::process::Stdio::piped())
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::piped())
+                        .spawn(),
+                };
+                match spawned {
                     Ok(c) => {
                         if want_reply {
                             t.send(&simple(msg::CHANNEL_SUCCESS, client_id)).await?;
@@ -417,27 +532,40 @@ where
         }
     };
 
-    // --- pump: child stdio ⇄ channel
+    // --- pump: child stdio (pipes or pty master) ⇄ channel
     let mut child_stdin = child.stdin.take();
-    let mut child_stdout = child.stdout.take().expect("stdout was piped");
-    let mut child_stderr = child.stderr.take().expect("stderr was piped");
+    let mut child_stdout = child.stdout.take();
+    let mut child_stderr = child.stderr.take();
+    let (mut pty_r, mut pty_w, pty_fd) = match allocated.take() {
+        Some(p) => {
+            let (master, fd) = p.into_parts();
+            let (r, w) = tokio::io::split(master);
+            (Some(r), Some(w), Some(fd))
+        }
+        None => (None, None, None),
+    };
+    let is_pty = pty_fd.is_some();
 
     if !early_stdin.is_empty() {
-        if let Some(cin) = child_stdin.as_mut() {
+        if let Some(w) = pty_w.as_mut() {
+            w.write_all(&early_stdin).await.ok();
+        } else if let Some(cin) = child_stdin.as_mut() {
             cin.write_all(&early_stdin).await.ok();
         }
         early_stdin.clear();
     }
-    if stdin_eof {
+    if stdin_eof && !is_pty {
         child_stdin = None; // dropping closes the pipe
     }
 
     let mut out_buf = vec![0u8; MAX_CHUNK as usize];
+    let mut pty_buf = vec![0u8; if is_pty { MAX_CHUNK as usize } else { 0 }];
     let mut err_buf = vec![0u8; MAX_CHUNK as usize];
     let mut pending_out: Vec<u8> = Vec::new();
     let mut pending_err: Vec<u8> = Vec::new();
     let mut stdout_eof = false;
-    let mut stderr_eof = false;
+    // A pty merges stderr into the terminal stream.
+    let mut stderr_eof = is_pty;
     let mut exit: Option<std::process::ExitStatus> = None;
     let mut sent_close = false;
     let mut recvd_close = false;
@@ -493,16 +621,25 @@ where
                         if let Some(add) = consume_local_window(&mut local_window, data.len())? {
                             t.send(&window_adjust(client_id, add)).await?;
                         }
-                        if let Some(cin) = child_stdin.as_mut() {
-                            // Backpressure note: a child that never reads
-                            // can stall this write; the client's window
-                            // (2 MiB) bounds how much can pile up.
+                        // Backpressure note: a child that never reads can
+                        // stall this write; the client's window (2 MiB)
+                        // bounds how much can pile up.
+                        if let Some(w) = pty_w.as_mut() {
+                            if w.write_all(data).await.is_err() {
+                                pty_w = None;
+                            }
+                        } else if let Some(cin) = child_stdin.as_mut() {
                             if cin.write_all(data).await.is_err() {
                                 child_stdin = None; // child closed its end
                             }
                         }
                     }
-                    msg::CHANNEL_EOF => { child_stdin = None; }
+                    msg::CHANNEL_EOF => {
+                        // A pty has no separable input half to close.
+                        if !is_pty {
+                            child_stdin = None;
+                        }
+                    }
                     msg::CHANNEL_CLOSE => {
                         recvd_close = true;
                         if !sent_close {
@@ -516,8 +653,20 @@ where
                     }
                     msg::CHANNEL_REQUEST => {
                         r.u32()?;
-                        let _kind = r.utf8()?;
-                        if r.boolean()? {
+                        let kind = r.utf8()?.to_owned();
+                        let want_reply = r.boolean()?;
+                        if kind == "window-change" {
+                            let cols = r.u32()?;
+                            let rows = r.u32()?;
+                            let xpix = r.u32()?;
+                            let ypix = r.u32()?;
+                            if let Some(fd) = pty_fd {
+                                pty::resize_fd(fd, cols, rows, xpix, ypix);
+                            }
+                            if want_reply {
+                                t.send(&simple(msg::CHANNEL_SUCCESS, client_id)).await?;
+                            }
+                        } else if want_reply {
                             t.send(&simple(msg::CHANNEL_FAILURE, client_id)).await?;
                         }
                     }
@@ -525,13 +674,19 @@ where
                     other => return Err(Error::proto(format!("unexpected message {other}"))),
                 }
             }
-            n = child_stdout.read(&mut out_buf), if !stdout_eof && pending_out.is_empty() => {
+            n = maybe_read(child_stdout.as_mut(), &mut out_buf), if !stdout_eof && pending_out.is_empty() => {
                 match n? {
                     0 => stdout_eof = true,
                     n => pending_out.extend_from_slice(&out_buf[..n]),
                 }
             }
-            n = child_stderr.read(&mut err_buf), if !stderr_eof && pending_err.is_empty() => {
+            n = maybe_read(pty_r.as_mut(), &mut pty_buf), if !stdout_eof && pending_out.is_empty() => {
+                match n? {
+                    0 => stdout_eof = true,
+                    n => pending_out.extend_from_slice(&pty_buf[..n]),
+                }
+            }
+            n = maybe_read(child_stderr.as_mut(), &mut err_buf), if !stderr_eof && pending_err.is_empty() => {
                 match n? {
                     0 => stderr_eof = true,
                     n => pending_err.extend_from_slice(&err_buf[..n]),
@@ -543,6 +698,31 @@ where
         }
     }
     Ok(())
+}
+
+/// Spawn the child with the pty slave as its stdio and controlling
+/// terminal, in its own session.
+#[cfg(unix)]
+fn spawn_on_pty(cmd: &mut Command, p: &mut pty::Pty) -> std::io::Result<tokio::process::Child> {
+    let slave = p
+        .take_slave()
+        .ok_or_else(|| std::io::Error::other("pty slave already consumed"))?;
+    cmd.stdin(std::process::Stdio::from(slave.try_clone()?))
+        .stdout(std::process::Stdio::from(slave.try_clone()?))
+        .stderr(std::process::Stdio::from(slave))
+        .env("TERM", &p.term);
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    cmd.spawn()
 }
 
 async fn send_exit<S>(
@@ -648,7 +828,9 @@ mod tests {
             auth::client(&mut t, "tester", &user_key, |_| {}).await?;
             let mut out = Sink::default();
             let mut err = Sink::default();
-            let status = client_session(&mut t, Some(command), stdin, &mut out, &mut err).await?;
+            let status =
+                client_session(&mut t, Some(command), None, None, stdin, &mut out, &mut err)
+                    .await?;
             Ok::<_, Error>((status, out.0, err.0))
         };
         let server_side = async move {
@@ -691,5 +873,60 @@ mod tests {
         let (status, _, _) = run("kill -9 $$", b"").await;
         assert_eq!(status.code, None);
         assert_eq!(status.signal.as_deref(), Some("KILL"));
+    }
+
+    #[tokio::test]
+    async fn pty_session_gets_a_real_terminal() {
+        let (a, b) = duplex(1 << 20);
+        let user_key = PrivateKey::generate();
+        let host_key = PrivateKey::generate();
+        let policy = auth::Policy {
+            user: None,
+            keys: vec![user_key.public()],
+            banner: None,
+        };
+        let client_side = async move {
+            let mut t = Transport::client(
+                a,
+                ClientConfig {
+                    verify_host_key: Box::new(|_| Ok(())),
+                },
+            )
+            .await?;
+            auth::client(&mut t, "tester", &user_key, |_| {}).await?;
+            let req = PtyRequest {
+                term: "vt100".into(),
+                cols: 132,
+                rows: 43,
+                xpix: 0,
+                ypix: 0,
+            };
+            let mut out = Sink::default();
+            let mut err = Sink::default();
+            let status = client_session(
+                &mut t,
+                Some("tty; echo TERM=$TERM; stty size"),
+                Some(&req),
+                None,
+                &b""[..],
+                &mut out,
+                &mut err,
+            )
+            .await?;
+            Ok::<_, Error>((status, out.0))
+        };
+        let server_side = async move {
+            let mut t = Transport::server(b, ServerConfig { host_key }).await?;
+            auth::server(&mut t, &policy).await?;
+            server_session(&mut t).await
+        };
+        let (c, s) = tokio::join!(client_side, server_side);
+        s.unwrap();
+        let (status, out) = c.unwrap();
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("/dev/pts/"), "no pty in output: {text}");
+        assert!(text.contains("TERM=vt100"), "TERM not set: {text}");
+        assert!(text.contains("43 132"), "winsize not applied: {text}");
+        assert_eq!(status.code, Some(0));
     }
 }

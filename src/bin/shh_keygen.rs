@@ -18,9 +18,37 @@ struct Args {
     #[arg(short = 'C', long = "comment", default_value = "")]
     comment: String,
 
+    /// Passphrase ("" for none). Prompted for interactively when omitted.
+    #[arg(short = 'N', long = "passphrase")]
+    passphrase: Option<String>,
+
     /// Overwrite an existing key.
     #[arg(long)]
     force: bool,
+}
+
+/// Resolve the passphrase: flag wins; otherwise prompt twice on the
+/// terminal; no terminal means unencrypted.
+fn choose_passphrase(flag: Option<String>) -> std::io::Result<Option<String>> {
+    if let Some(p) = flag {
+        return Ok(if p.is_empty() { None } else { Some(p) });
+    }
+    if !std::path::Path::new("/dev/tty").exists() {
+        return Ok(None);
+    }
+    let first = match shh::tty::read_passphrase("Enter passphrase (empty for none): ") {
+        Ok(p) => p,
+        Err(_) => return Ok(None), // no usable tty after all
+    };
+    if first.is_empty() {
+        return Ok(None);
+    }
+    let second = shh::tty::read_passphrase("Enter same passphrase again: ")?;
+    if first != second {
+        eprintln!("shh-keygen: passphrases do not match");
+        std::process::exit(1);
+    }
+    Ok(Some(first))
 }
 
 fn main() -> std::io::Result<()> {
@@ -37,6 +65,9 @@ fn main() -> std::io::Result<()> {
     }
 
     let key = PrivateKey::generate();
+    let passphrase = choose_passphrase(args.passphrase)?;
+    let encoded = keyfile::encode_private_protected(&key, &args.comment, passphrase.as_deref())
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
 
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true);
@@ -46,7 +77,7 @@ fn main() -> std::io::Result<()> {
         opts.mode(0o600);
     }
     let mut f = opts.open(&args.file)?;
-    f.write_all(keyfile::encode_private(&key, &args.comment).as_bytes())?;
+    f.write_all(encoded.as_bytes())?;
 
     let pub_path = {
         let mut p = args.file.clone().into_os_string();

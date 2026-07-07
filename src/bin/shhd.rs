@@ -37,6 +37,12 @@ struct Args {
     /// Banner text shown to clients before authentication.
     #[arg(long)]
     banner: Option<String>,
+
+    /// Permit direct-tcpip forwarding to a target (repeatable). `host:port`,
+    /// port `*` for any port, or `any` for all targets. Default: forwarding
+    /// is refused entirely.
+    #[arg(long = "permit-open", value_name = "host:port")]
+    permit_open: Vec<String>,
 }
 
 fn default_path(name: &str) -> PathBuf {
@@ -117,6 +123,17 @@ async fn main() -> std::io::Result<()> {
         None => tracing::info!("accepting any username (keys still gate access)"),
     }
 
+    // Validate the forwarding allowlist up front so a typo fails at startup.
+    if let Err(e) = connect::forward::Policy::parse(&args.permit_open) {
+        eprintln!("shhd: {e}");
+        std::process::exit(2);
+    }
+    if args.permit_open.is_empty() {
+        tracing::info!("port forwarding disabled (no --permit-open)");
+    } else {
+        tracing::info!("port forwarding permitted for: {}", args.permit_open.join(", "));
+    }
+
     let listener = TcpListener::bind(&args.listen).await?;
     tracing::info!("listening on {}", args.listen);
 
@@ -129,6 +146,7 @@ async fn main() -> std::io::Result<()> {
             keys: keys.clone(),
             banner: args.banner.clone(),
         };
+        let permit_open = args.permit_open.clone();
         tokio::spawn(async move {
             let config = ServerConfig { host_key };
             let mut t = match Transport::server(socket, config).await {
@@ -146,13 +164,37 @@ async fn main() -> std::io::Result<()> {
                     return;
                 }
             };
-            tracing::info!(%addr, %user, "session started");
-            match connect::server_session(&mut t).await {
-                Ok(()) => tracing::info!(%addr, %user, "session ended"),
+
+            // The first channel the client opens picks the mode: a session
+            // (exec/shell/pty) or a forwarding connection (direct-tcpip).
+            let first = match connect::first_channel_open(&mut t).await {
+                Ok(p) => p,
                 Err(e) => {
-                    tracing::info!(%addr, %user, "session error: {e}");
+                    tracing::info!(%addr, %user, "no channel opened: {e}");
                     t.bail(&e).await;
+                    return;
                 }
+            };
+            let kind = connect::channel_open_type(&first).unwrap_or_default();
+            let result = match kind.as_str() {
+                "session" => {
+                    tracing::info!(%addr, %user, "session started");
+                    connect::server_session(&mut t, Some(first)).await
+                }
+                "direct-tcpip" => {
+                    tracing::info!(%addr, %user, "forwarding started");
+                    let fwd = connect::forward::Policy::parse(&permit_open)
+                        .expect("policy validated at startup");
+                    connect::mux::Connection::new(t, fwd).run(Some(first)).await
+                }
+                other => {
+                    tracing::info!(%addr, %user, "unsupported first channel {other:?}");
+                    return;
+                }
+            };
+            match result {
+                Ok(()) => tracing::info!(%addr, %user, "connection ended"),
+                Err(e) => tracing::info!(%addr, %user, "connection error: {e}"),
             }
         });
     }

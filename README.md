@@ -48,6 +48,28 @@ terminal (or use `--accept-new`), and a changed key is a hard error.
 Keys may be passphrase-protected (`shh-keygen -N`, prompted otherwise);
 the format matches `ssh-keygen` (bcrypt + AES-256-CTR).
 
+### Port forwarding
+
+Local (`-L`) forwarding tunnels a local port to a target reachable from the
+server, as a dedicated forwarding connection (`-N`):
+
+```console
+# forward localhost:8080 to db:5432 as seen from the server
+$ shh -N -L 8080:db.internal:5432 you@gateway
+```
+
+The server refuses forwarding by default; an operator opts targets in
+explicitly (the opposite of OpenSSH's default-open posture):
+
+```console
+$ shhd -L 0.0.0.0:2222 --permit-open db.internal:5432 --permit-open 127.0.0.1:*
+# or --permit-open any to allow everything (trusted networks only)
+```
+
+Interoperates with OpenSSH both ways (`ssh -L` through `shhd`, `shh -L`
+through `sshd`). Combining a session and forwarding on one connection, and
+remote (`-R`) forwarding, are not yet supported.
+
 ## Interoperability
 
 Verified against OpenSSH 9.6 in both directions (`ssh → shhd` and
@@ -60,10 +82,11 @@ readable (unencrypted keys for now).
 
 ## Status
 
-Milestones 1–2: transport, auth, exec sessions, interactive PTY sessions
-(pty-req, window-change, controlling terminal), and encrypted key files
-are complete and tested (`cargo test`). Not yet implemented: TCP
-forwarding (planned with an explicit allowlist model), FIDO2
+Milestones 1–3: transport, auth, exec sessions, interactive PTY sessions
+(pty-req, window-change, controlling terminal), encrypted key files, and
+`direct-tcpip` local (`-L`) port forwarding with a server-side allowlist
+are complete and tested (`cargo test`). Not yet implemented: session and
+forwarding on one connection, remote (`-R`) forwarding, FIDO2
 `sk-ssh-ed25519` keys, certificates, sshd-style privilege separation.
 Treat it as a working protocol implementation, not a hardened production
 daemon.

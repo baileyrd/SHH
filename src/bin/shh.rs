@@ -53,6 +53,15 @@ struct Args {
     /// Never allocate a pseudo-terminal.
     #[arg(short = 'T', long, conflicts_with = "tty")]
     no_tty: bool,
+
+    /// Local port forward: `[bind:]localport:host:hostport` (repeatable).
+    /// Currently requires -N (a forwarding-only connection).
+    #[arg(short = 'L', long = "local-forward", value_name = "spec")]
+    local_forward: Vec<String>,
+
+    /// Do not run a remote command; hold the connection open (for -L).
+    #[arg(short = 'N', long = "no-command")]
+    no_command: bool,
 }
 
 fn default_path(name: &str) -> PathBuf {
@@ -198,6 +207,19 @@ async fn run(args: Args) -> Result<i32, String> {
         .or_else(|| std::env::var("USER").ok())
         .ok_or("no username (use user@host or -l)")?;
 
+    // Parse -L specs before touching the network so a typo fails instantly.
+    let forwards: Vec<connect::forward::LocalForward> = args
+        .local_forward
+        .iter()
+        .map(|s| connect::forward::LocalForward::parse(s))
+        .collect::<Result<_, _>>()?;
+    if !forwards.is_empty() && !args.no_command {
+        return Err("port forwarding currently requires -N (a forwarding-only connection)".into());
+    }
+    if args.no_command && !args.command.is_empty() {
+        return Err("-N does not take a remote command".into());
+    }
+
     let identity = find_identity(args.identity)?;
     let text = std::fs::read_to_string(&identity)
         .map_err(|e| format!("{}: {e}", identity.display()))?;
@@ -222,6 +244,36 @@ async fn run(args: Args) -> Result<i32, String> {
     auth::client(&mut t, &user, &key, |banner| eprint!("{banner}"))
         .await
         .map_err(|e| e.to_string())?;
+
+    // Forwarding / no-command mode: multiplex direct-tcpip channels instead
+    // of running a session.
+    if args.no_command {
+        let conn = connect::mux::Connection::new(t, connect::forward::Policy::DenyAll);
+        let handle = conn.handle();
+        for spec in &forwards {
+            let listener = tokio::net::TcpListener::bind(&spec.bind)
+                .await
+                .map_err(|e| format!("bind {}: {e}", spec.bind))?;
+            eprintln!(
+                "shh: forwarding {} -> {}:{}",
+                spec.bind, spec.target_host, spec.target_port
+            );
+            tokio::spawn(connect::forward::serve_local_forward(
+                listener,
+                spec.target_host.clone(),
+                spec.target_port,
+                handle.clone(),
+            ));
+        }
+        if forwards.is_empty() {
+            eprintln!("shh: connected to {user}@{host}; holding open (Ctrl-C to exit)");
+        }
+        tokio::select! {
+            r = conn.run(None) => r.map_err(|e| e.to_string())?,
+            _ = tokio::signal::ctrl_c() => eprintln!("\nshh: closing"),
+        }
+        return Ok(0);
+    }
 
     let command = if args.command.is_empty() {
         None

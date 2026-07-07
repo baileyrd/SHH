@@ -16,11 +16,13 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::AbortHandle;
+use tokio::time::MissedTickBehavior;
 
 use super::forward::{self, Policy};
 use super::session::{self, SessionSpec};
@@ -185,12 +187,24 @@ enum Pending {
     Session(Box<SessionSpec>),
 }
 
-/// A `tcpip-forward` we sent and are awaiting a reply for.
-struct PendingForward {
-    bind: String,
-    port: u16,
-    target: (String, u16),
+/// A global request we sent with want_reply, awaiting its reply. RFC 4254
+/// guarantees replies arrive in request order, so one FIFO queue correlates
+/// them regardless of kind.
+enum PendingGlobal {
+    /// A `tcpip-forward`; on success, register (bind, port) → target.
+    Forward {
+        bind: String,
+        port: u16,
+        target: (String, u16),
+    },
+    /// A `keepalive@openssh.com`; any reply proves the peer is alive.
+    Keepalive,
 }
+
+/// Default liveness settings: probe after this much silence, and give up
+/// after this many unanswered probes (~90s to notice a dead peer).
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+const KEEPALIVE_MAX_MISSED: u32 = 3;
 
 /// The connection loop.
 pub struct Connection<S> {
@@ -205,8 +219,14 @@ pub struct Connection<S> {
     remote_forwards: HashMap<(String, u16), (String, u16)>,
     /// Bound server-side listeners (server role), for cancel + teardown.
     listeners: HashMap<(String, u16), AbortHandle>,
-    /// tcpip-forward requests awaiting a reply (client role).
-    pending_forwards: VecDeque<PendingForward>,
+    /// Global requests awaiting a reply, in send order.
+    pending_global: VecDeque<PendingGlobal>,
+    // Liveness.
+    keepalive_interval: Option<Duration>,
+    keepalive_max_missed: u32,
+    keepalive_outstanding: u32,
+    /// Set whenever a packet arrives; a keepalive tick clears it.
+    recv_since_tick: bool,
     next_id: u32,
     cmd_tx: mpsc::UnboundedSender<Cmd>,
     cmd_rx: mpsc::UnboundedReceiver<Cmd>,
@@ -219,6 +239,17 @@ impl<S> Drop for Connection<S> {
         for (_, h) in self.listeners.drain() {
             h.abort();
         }
+    }
+}
+
+/// Await the next tick of an optional interval; pend forever when there is
+/// none (keepalives disabled), so the select arm simply never fires.
+async fn tick(interval: Option<&mut tokio::time::Interval>) {
+    match interval {
+        Some(i) => {
+            i.tick().await;
+        }
+        None => std::future::pending().await,
     }
 }
 
@@ -245,7 +276,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
             pending: HashMap::new(),
             remote_forwards: HashMap::new(),
             listeners: HashMap::new(),
-            pending_forwards: VecDeque::new(),
+            pending_global: VecDeque::new(),
+            keepalive_interval: Some(KEEPALIVE_INTERVAL),
+            keepalive_max_missed: KEEPALIVE_MAX_MISSED,
+            keepalive_outstanding: 0,
+            recv_since_tick: true,
             next_id: 0,
             cmd_tx,
             cmd_rx,
@@ -256,6 +291,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
     /// Set the policy gating incoming `tcpip-forward` (remote `-R`) requests.
     pub fn listen_policy(mut self, policy: Policy) -> Self {
         self.listen_policy = policy;
+        self
+    }
+
+    /// Configure liveness probes: send a keepalive after `interval` of
+    /// silence and give up after `max_missed` unanswered ones. `interval`
+    /// of zero disables keepalives.
+    pub fn keepalive(mut self, interval: Duration, max_missed: u32) -> Self {
+        self.keepalive_interval = (!interval.is_zero()).then_some(interval);
+        self.keepalive_max_missed = max_missed.max(1);
         self
     }
 
@@ -273,6 +317,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         if let Some(p) = primed {
             self.on_packet(p).await?;
         }
+        // A liveness ticker (or a never-firing timer when keepalives are off).
+        let mut ka = self.keepalive_interval.map(|d| {
+            let mut i = tokio::time::interval(d);
+            i.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            i
+        });
         while !self.done {
             if self.t.should_rekey() {
                 self.t.rekey_initiate().await?;
@@ -286,16 +336,43 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
 
             tokio::select! {
                 biased;
-                pkt = self.t.recv_raw() => self.on_packet(pkt?).await?,
+                pkt = self.t.recv_raw() => {
+                    self.recv_since_tick = true;
+                    self.on_packet(pkt?).await?;
+                }
                 cmd = self.cmd_rx.recv() => {
                     // We hold a sender, so this is never None.
                     if let Some(cmd) = cmd {
                         self.on_cmd(cmd).await?;
                     }
                 }
+                _ = tick(ka.as_mut()) => self.on_keepalive_tick().await?,
             }
         }
         Ok(())
+    }
+
+    /// Handle a liveness tick: if nothing arrived since the last tick, probe
+    /// the peer; too many unanswered probes means it is gone.
+    async fn on_keepalive_tick(&mut self) -> Result<()> {
+        if self.recv_since_tick {
+            self.recv_since_tick = false;
+            self.keepalive_outstanding = 0;
+            return Ok(());
+        }
+        if self.keepalive_outstanding >= self.keepalive_max_missed {
+            return Err(Error::Disconnect(format!(
+                "peer unresponsive to {} keepalives",
+                self.keepalive_outstanding
+            )));
+        }
+        self.keepalive_outstanding += 1;
+        self.pending_global.push_back(PendingGlobal::Keepalive);
+        let mut w = Writer::new();
+        w.byte(msg::GLOBAL_REQUEST);
+        w.utf8("keepalive@openssh.com");
+        w.boolean(true); // want_reply
+        self.t.send(&w.into_bytes()).await
     }
 
     fn alloc_id(&mut self) -> u32 {
@@ -665,26 +742,32 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         Ok(())
     }
 
-    /// Client side: correlate a `tcpip-forward` reply with the request we
-    /// sent and, on success, register the forward so its channels can match.
+    /// Correlate a global-request reply with the request we sent (replies
+    /// arrive in order). A keepalive reply proves liveness; a tcpip-forward
+    /// reply registers the forward on success.
     fn on_global_reply(&mut self, p: &[u8], success: bool) {
-        let Some(req) = self.pending_forwards.pop_front() else {
-            return;
-        };
-        if !success {
-            tracing::warn!(bind = %req.bind, port = req.port, "server refused remote forward");
-            return;
+        match self.pending_global.pop_front() {
+            None => {}
+            Some(PendingGlobal::Keepalive) => {
+                self.keepalive_outstanding = 0;
+            }
+            Some(PendingGlobal::Forward { bind, port, target }) => {
+                if !success {
+                    tracing::warn!(%bind, port, "server refused remote forward");
+                    return;
+                }
+                // For a port-0 request the reply carries the allocated port.
+                let port = if port == 0 {
+                    let mut r = Reader::new(p);
+                    let _ = r.byte();
+                    r.u32().ok().and_then(|v| u16::try_from(v).ok()).unwrap_or(0)
+                } else {
+                    port
+                };
+                tracing::info!(%bind, port, "remote forward established");
+                self.remote_forwards.insert((bind, port), target);
+            }
         }
-        // For a port-0 request the reply carries the allocated port.
-        let port = if req.port == 0 {
-            let mut r = Reader::new(p);
-            let _ = r.byte();
-            r.u32().ok().and_then(|v| u16::try_from(v).ok()).unwrap_or(0)
-        } else {
-            req.port
-        };
-        tracing::info!(bind = %req.bind, port, "remote forward established");
-        self.remote_forwards.insert((req.bind, port), req.target);
     }
 
     // ---------------------------------------------------- task commands
@@ -719,7 +802,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
                 target_host,
                 target_port,
             } => {
-                self.pending_forwards.push_back(PendingForward {
+                self.pending_global.push_back(PendingGlobal::Forward {
                     bind: bind.clone(),
                     port,
                     target: (target_host, target_port),
@@ -1103,6 +1186,39 @@ mod tests {
         drop(app);
         drop(client);
         drop(server);
+    }
+
+    #[tokio::test]
+    async fn dead_peer_detected_by_keepalive() {
+        let (client_t, server_t) = transport_pair().await;
+        // The peer's socket stays open, but nobody services it — so our
+        // keepalives go unanswered.
+        let _held = server_t;
+        let client = Connection::new(client_t, Policy::DenyAll)
+            .keepalive(Duration::from_millis(50), 2);
+        let r = tokio::time::timeout(Duration::from_secs(3), client.run(None)).await;
+        match r {
+            Ok(Err(Error::Disconnect(_))) => {}
+            other => panic!("expected a keepalive timeout, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn keepalives_keep_an_idle_connection_alive() {
+        let (client_t, server_t) = transport_pair().await;
+        // A live peer answers keepalives, so the client never times out.
+        let server = tokio::spawn(
+            Connection::new(server_t, Policy::AllowAll)
+                .keepalive(Duration::from_millis(50), 2)
+                .run(None),
+        );
+        let client = Connection::new(client_t, Policy::DenyAll)
+            .keepalive(Duration::from_millis(50), 2);
+        // Running past several keepalive intervals must NOT end the loop;
+        // a timeout here means it's healthily still going.
+        let r = tokio::time::timeout(Duration::from_millis(500), client.run(None)).await;
+        assert!(r.is_err(), "idle connection died despite answered keepalives");
+        server.abort();
     }
 
     #[tokio::test]

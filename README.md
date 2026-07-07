@@ -136,9 +136,12 @@ readable (unencrypted keys for now).
 
 Transport, auth (keys and CA-signed user certificates), host certificates,
 exec sessions, interactive PTY sessions (pty-req, window-change,
-controlling terminal), encrypted key files, and local (`-L`) and remote
-(`-R`) TCP forwarding with server-side allowlists — all multiplexed so a
-session and any number of forwards share one connection — are complete and
-tested (`cargo test`). Not yet implemented: FIDO2 `sk-ssh-ed25519` keys,
-sshd-style privilege separation. Treat it as a working protocol
-implementation, not a hardened production daemon.
+controlling terminal), encrypted key files, local (`-L`) and remote (`-R`)
+TCP forwarding with server-side allowlists, and connection keep-alives —
+all multiplexed so a session and any number of forwards share one
+connection — are complete and tested (`cargo test`). Keep-alives probe an
+idle peer (`keepalive@openssh.com`) and drop it after several unanswered
+probes (`--keepalive-interval` / `--keepalive-count`, on by default). Not
+yet implemented: FIDO2 `sk-ssh-ed25519` keys, sshd-style privilege
+separation. Treat it as a working protocol implementation, not a hardened
+production daemon.

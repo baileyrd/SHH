@@ -61,6 +61,14 @@ struct Args {
     /// remote forwarding is refused entirely.
     #[arg(long = "permit-listen", value_name = "bind:port")]
     permit_listen: Vec<String>,
+
+    /// Seconds of silence before probing a client with a keepalive (0 off).
+    #[arg(long, default_value_t = 30)]
+    keepalive_interval: u64,
+
+    /// Unanswered keepalives before dropping an unresponsive client.
+    #[arg(long, default_value_t = 3)]
+    keepalive_count: u32,
 }
 
 fn default_path(name: &str) -> PathBuf {
@@ -200,6 +208,8 @@ async fn main() -> std::io::Result<()> {
         };
         let permit_open = args.permit_open.clone();
         let permit_listen = args.permit_listen.clone();
+        let ka_interval = args.keepalive_interval;
+        let ka_count = args.keepalive_count;
         tokio::spawn(async move {
             let config = ServerConfig {
                 host_key,
@@ -228,7 +238,9 @@ async fn main() -> std::io::Result<()> {
                 .expect("policy validated at startup");
             let listen = connect::forward::Policy::parse(&permit_listen)
                 .expect("policy validated at startup");
-            let conn = connect::mux::Connection::new(t, fwd).listen_policy(listen);
+            let conn = connect::mux::Connection::new(t, fwd)
+                .listen_policy(listen)
+                .keepalive(std::time::Duration::from_secs(ka_interval), ka_count);
             match conn.run(None).await {
                 Ok(()) => tracing::info!(%addr, %user, "connection ended"),
                 Err(e) => tracing::info!(%addr, %user, "connection error: {e}"),

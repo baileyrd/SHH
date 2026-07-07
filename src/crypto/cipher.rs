@@ -94,7 +94,7 @@ pub trait PacketCipher: Send {
 /// Sanity-check a length field and its alignment before allocating.
 fn check_length(len: usize, align: usize) -> Result<usize> {
     // padlen byte + minimum padding, and room for at least an empty payload
-    if len < 1 + MIN_PAD || len > MAX_PACKET || len % align != 0 {
+    if !(1 + MIN_PAD..=MAX_PACKET).contains(&len) || len % align != 0 {
         return Err(Error::proto(format!("bad packet length {len}")));
     }
     Ok(len)
@@ -146,8 +146,9 @@ impl PacketCipher for PlainCipher {
 
     fn packet_length(&self, _seq: u32, first4: [u8; 4]) -> Result<usize> {
         let len = u32::from_be_bytes(first4) as usize;
-        // alignment check covers len+4; (len+4)%8==0 ⇔ len%8==4… check directly
-        if len < 1 + MIN_PAD || len > MAX_PACKET || (len + 4) % 8 != 0 {
+        // for the plain cipher the 4-byte length field itself counts
+        // toward the 8-byte alignment
+        if !(1 + MIN_PAD..=MAX_PACKET).contains(&len) || (len + 4) % 8 != 0 {
             return Err(Error::proto(format!("bad packet length {len}")));
         }
         Ok(len)
@@ -361,9 +362,8 @@ mod tests {
         let real = rx
             .packet_length(0, w1[..4].try_into().unwrap())
             .unwrap();
-        match rx.packet_length(5, w1[..4].try_into().unwrap()) {
-            Ok(l) => assert_ne!(l, real),
-            Err(_) => {}
+        if let Ok(l) = rx.packet_length(5, w1[..4].try_into().unwrap()) {
+            assert_ne!(l, real);
         }
     }
 

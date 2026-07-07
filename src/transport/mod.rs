@@ -403,6 +403,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Transport<S> {
     ) -> Result<()> {
         let theirs = kexinit::KexInit::parse(&theirs_bytes)?;
         let neg = kexinit::negotiate(self.side, ours, &theirs)?;
+        tracing::debug!(
+            kex = ?neg.kex,
+            c2s = ?neg.cipher_c2s,
+            s2c = ?neg.cipher_s2c,
+            "negotiated"
+        );
         if neg.discard_guess {
             let _ = self.recv_raw().await?;
         }
@@ -652,11 +658,8 @@ mod tests {
     /// task: a rekey needs both ends of the pipe making progress.
     fn echo_server(mut s: Transport<tokio::io::DuplexStream>) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            loop {
-                match s.recv().await {
-                    Ok(p) => s.send(&p).await.unwrap(),
-                    Err(_) => break,
-                }
+            while let Ok(p) = s.recv().await {
+                s.send(&p).await.unwrap();
             }
         })
     }

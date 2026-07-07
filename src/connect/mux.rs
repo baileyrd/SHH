@@ -227,6 +227,8 @@ pub struct Connection<S> {
     keepalive_outstanding: u32,
     /// Set whenever a packet arrives; a keepalive tick clears it.
     recv_since_tick: bool,
+    /// The account server-side sessions run as (privilege drop when root).
+    session_user: Option<super::UserContext>,
     next_id: u32,
     cmd_tx: mpsc::UnboundedSender<Cmd>,
     cmd_rx: mpsc::UnboundedReceiver<Cmd>,
@@ -281,6 +283,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
             keepalive_max_missed: KEEPALIVE_MAX_MISSED,
             keepalive_outstanding: 0,
             recv_since_tick: true,
+            session_user: None,
             next_id: 0,
             cmd_tx,
             cmd_rx,
@@ -300,6 +303,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
     pub fn keepalive(mut self, interval: Duration, max_missed: u32) -> Self {
         self.keepalive_interval = (!interval.is_zero()).then_some(interval);
         self.keepalive_max_missed = max_missed.max(1);
+        self
+    }
+
+    /// Run server-side sessions as this account (privilege drop when root).
+    pub fn session_user(mut self, user: Option<super::UserContext>) -> Self {
+        self.session_user = user;
         self
     }
 
@@ -966,6 +975,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
             remote_max,
             rx,
             self.cmd_tx.clone(),
+            self.session_user.clone(),
         ));
     }
 

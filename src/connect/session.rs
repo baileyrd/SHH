@@ -276,6 +276,7 @@ pub(crate) async fn session_server_task(
     remote_max: u32,
     mut to_task: mpsc::UnboundedReceiver<ToTask>,
     cmd_tx: mpsc::UnboundedSender<Cmd>,
+    user: Option<super::UserContext>,
 ) {
     let mut allocated: Option<pty::Pty> = None;
     let mut early_stdin: Vec<u8> = Vec::new();
@@ -317,17 +318,20 @@ pub(crate) async fn session_server_task(
                     }
                 }
                 "exec" | "shell" => {
-                    let mut cmd = if kind == "exec" {
+                    // The login shell: the account's shell when we know it,
+                    // else $SHELL / /bin/sh.
+                    let shell = match &user {
+                        Some(u) => u.shell.clone(),
+                        None => std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()),
+                    };
+                    let mut cmd = Command::new(&shell);
+                    if kind == "exec" {
                         let mut r = Reader::new(&data);
                         let line = r.utf8().unwrap_or("").to_owned();
-                        let mut c = Command::new("/bin/sh");
-                        c.arg("-c").arg(line);
-                        c
-                    } else {
-                        Command::new(std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()))
-                    };
+                        cmd.arg("-c").arg(line);
+                    }
                     cmd.kill_on_drop(true);
-                    match spawn_child(&mut cmd, allocated.as_mut()) {
+                    match spawn_child(&mut cmd, allocated.as_mut(), user.as_ref()) {
                         Ok(c) => {
                             if want_reply {
                                 let _ = cmd_tx.send(Cmd::RequestReply { id, success: true });
@@ -489,38 +493,73 @@ fn allocate_pty(data: &[u8], slot: &mut Option<pty::Pty>) -> bool {
     }
 }
 
-/// Spawn the child, on the pty slave if one was allocated, else on pipes.
+/// Spawn the child: wire its stdio to the pty slave (if any) or to pipes,
+/// set the login environment and working directory, and — in one post-fork
+/// `pre_exec` hook — become a session leader with the pty as controlling
+/// terminal and, when running as root, drop to the target user's
+/// credentials before exec.
 fn spawn_child(
     cmd: &mut Command,
     pty: Option<&mut pty::Pty>,
+    user: Option<&super::UserContext>,
 ) -> std::io::Result<tokio::process::Child> {
-    match pty {
-        Some(p) => spawn_on_pty(cmd, p),
-        None => cmd
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn(),
-    }
-}
+    let is_pty = match pty {
+        Some(p) => {
+            let slave = p
+                .take_slave()
+                .ok_or_else(|| std::io::Error::other("pty slave already consumed"))?;
+            cmd.stdin(Stdio::from(slave.try_clone()?))
+                .stdout(Stdio::from(slave.try_clone()?))
+                .stderr(Stdio::from(slave))
+                .env("TERM", &p.term);
+            true
+        }
+        None => {
+            cmd.stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            false
+        }
+    };
 
-/// Spawn with the pty slave as stdio and controlling terminal, in a new
-/// session.
-fn spawn_on_pty(cmd: &mut Command, p: &mut pty::Pty) -> std::io::Result<tokio::process::Child> {
-    let slave = p
-        .take_slave()
-        .ok_or_else(|| std::io::Error::other("pty slave already consumed"))?;
-    cmd.stdin(Stdio::from(slave.try_clone()?))
-        .stdout(Stdio::from(slave.try_clone()?))
-        .stderr(Stdio::from(slave))
-        .env("TERM", &p.term);
+    // Login environment and home directory.
+    if let Some(u) = user {
+        cmd.env("HOME", &u.home)
+            .env("USER", &u.name)
+            .env("LOGNAME", &u.name)
+            .env("SHELL", &u.shell)
+            .current_dir(&u.home);
+    }
+
+    // The privilege drop only happens when we can actually do it (root).
+    let drop = user
+        .filter(|_| nix::unistd::geteuid().is_root())
+        .map(|u| {
+            (
+                nix::unistd::Uid::from_raw(u.uid),
+                nix::unistd::Gid::from_raw(u.gid),
+                std::ffi::CString::new(u.name.clone()).ok(),
+            )
+        });
+
+    // One post-fork hook: session/controlling-tty setup as root, then the
+    // credential drop (gid + supplementary groups + uid, in that order).
     unsafe {
-        cmd.pre_exec(|| {
-            if libc::setsid() < 0 {
-                return Err(std::io::Error::last_os_error());
+        cmd.pre_exec(move || {
+            if is_pty {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
             }
-            if libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
-                return Err(std::io::Error::last_os_error());
+            if let Some((uid, gid, name)) = &drop {
+                nix::unistd::setgid(*gid).map_err(std::io::Error::from)?;
+                if let Some(name) = name {
+                    nix::unistd::initgroups(name, *gid).map_err(std::io::Error::from)?;
+                }
+                nix::unistd::setuid(*uid).map_err(std::io::Error::from)?;
             }
             Ok(())
         });

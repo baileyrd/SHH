@@ -47,6 +47,39 @@ pub struct ExitStatus {
     pub signal: Option<String>,
 }
 
+/// The system account a session should run as. When `shhd` runs as root it
+/// drops to this user (gid, supplementary groups, then uid) before
+/// executing, and runs the user's login shell in their home directory —
+/// so a session is never more privileged than the account that logged in.
+#[derive(Clone)]
+pub struct UserContext {
+    pub name: String,
+    pub uid: u32,
+    pub gid: u32,
+    pub home: std::path::PathBuf,
+    pub shell: String,
+}
+
+impl UserContext {
+    /// Look up a user in the password database.
+    #[cfg(unix)]
+    pub fn for_user(name: &str) -> Option<UserContext> {
+        let user = nix::unistd::User::from_name(name).ok().flatten()?;
+        let shell = user.shell.to_string_lossy().into_owned();
+        Some(UserContext {
+            name: user.name,
+            uid: user.uid.as_raw(),
+            gid: user.gid.as_raw(),
+            home: user.dir,
+            shell: if shell.is_empty() {
+                "/bin/sh".to_string()
+            } else {
+                shell
+            },
+        })
+    }
+}
+
 /// Ask the server for a pseudo-terminal with these dimensions.
 #[derive(Clone)]
 pub struct PtyRequest {
@@ -205,6 +238,15 @@ mod tests {
         ) -> Poll<std::io::Result<()>> {
             Poll::Ready(Ok(()))
         }
+    }
+
+    #[test]
+    fn user_context_resolves_known_and_unknown() {
+        let root = UserContext::for_user("root").expect("root always exists");
+        assert_eq!(root.uid, 0);
+        assert_eq!(root.name, "root");
+        assert!(root.home.as_os_str().len() > 1);
+        assert!(UserContext::for_user("no-such-user-9c1f2b").is_none());
     }
 
     async fn run(command: &str, stdin: &'static [u8]) -> (ExitStatus, Vec<u8>, Vec<u8>) {

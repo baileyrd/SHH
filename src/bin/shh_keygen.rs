@@ -37,9 +37,15 @@ struct Args {
     #[arg(short = 'I', long = "cert-id", default_value = "shh")]
     cert_id: String,
 
-    /// Comma-separated principals the certificate is valid for (empty: any).
+    /// Comma-separated principals the certificate is valid for. For user
+    /// certs these are login names; for host certs (`--host`) they are
+    /// hostnames (empty is rejected for host certs).
     #[arg(short = 'n', long = "principals", default_value = "")]
     principals: String,
+
+    /// Sign a host certificate instead of a user certificate.
+    #[arg(short = 'H', long = "host")]
+    host: bool,
 
     /// Certificate validity in days from now.
     #[arg(long = "days", default_value_t = 365)]
@@ -110,11 +116,20 @@ fn sign_certificate(args: &Args, ca_path: &Path) -> std::io::Result<()> {
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
         .collect();
+    if args.host && principals.is_empty() {
+        eprintln!("shh-keygen: a host certificate needs at least one hostname (-n)");
+        std::process::exit(1);
+    }
     let now = cert::now_secs();
     let valid_after = now.saturating_sub(60); // small clock-skew grace
     let valid_before = now + args.days.saturating_mul(86_400);
 
-    let blob = cert::sign_user_cert(
+    let sign = if args.host {
+        cert::sign_host_cert
+    } else {
+        cert::sign_user_cert
+    };
+    let blob = sign(
         &ca,
         &user_key,
         args.serial,
@@ -140,7 +155,8 @@ fn sign_certificate(args: &Args, ca_path: &Path) -> std::io::Result<()> {
     } else {
         principals.join(",")
     };
-    println!("certificate: {}", cert_path.display());
+    let kind = if args.host { "host" } else { "user" };
+    println!("{kind} certificate: {}", cert_path.display());
     println!("  signed by CA {}", ca.public().fingerprint());
     println!("  id {:?}, serial {}, valid for {} day(s), principals: {who}", args.cert_id, args.serial, args.days);
     Ok(())

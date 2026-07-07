@@ -326,6 +326,22 @@ pub fn known_hosts_line(label: &str, key: &PublicKey) -> String {
     format!("{label} {}", encode_public(key, ""))
 }
 
+/// Collect the trusted host-certificate CA keys from `@cert-authority` lines
+/// in known_hosts. The host pattern is not matched (we trust the CA for any
+/// host it certifies); only Ed25519 CA keys are returned.
+pub fn known_hosts_cert_authorities(text: &str) -> Vec<PublicKey> {
+    text.lines()
+        .map(str::trim)
+        .filter_map(|line| line.strip_prefix("@cert-authority"))
+        .filter_map(|rest| {
+            // `<host-pattern> ssh-ed25519 AAAA... comment`
+            let rest = rest.trim_start();
+            let (_pattern, keypart) = rest.split_once(char::is_whitespace)?;
+            decode_public(keypart.trim_start()).ok().map(|(k, _)| k)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

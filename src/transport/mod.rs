@@ -18,8 +18,9 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use zeroize::Zeroizing;
 
+use crate::crypto::cert::{Certificate, CERT_ALGO, CERT_TYPE_HOST};
 use crate::crypto::cipher::{self, PacketCipher, PlainCipher};
-use crate::crypto::ed25519::{PrivateKey, PublicKey};
+use crate::crypto::ed25519::{PrivateKey, PublicKey, ALGO};
 use crate::crypto::kdf::{self, Usage};
 use crate::crypto::kex::{self, ClientKex};
 use crate::wire::{disconnect, msg, Reader, Writer};
@@ -27,21 +28,63 @@ use crate::{Error, Result};
 
 pub use kexinit::Side;
 
+/// The host-key algorithms we advertise: the certificate type (preferred)
+/// plus the plain key when certificates are in play, otherwise just the key.
+fn host_key_algos(with_cert: bool) -> Vec<String> {
+    if with_cert {
+        vec![CERT_ALGO.to_string(), ALGO.to_string()]
+    } else {
+        vec![ALGO.to_string()]
+    }
+}
+
 const REKEY_BYTES: u64 = 1 << 30; // 1 GiB
 const REKEY_INTERVAL: Duration = Duration::from_secs(3600);
 /// Rekey long before a sequence counter can wrap (RFC 4253 §9 requires a
 /// rekey within 2^32 packets; we stay far under it).
 const REKEY_PACKETS: u32 = 1 << 28;
 
-/// Callback deciding whether a server host key is trusted.
+/// Callback deciding whether a server host key is trusted (the TOFU path,
+/// used when the server presents a bare key rather than a certificate).
 pub type HostKeyVerifier = Box<dyn FnMut(&PublicKey) -> Result<()> + Send>;
 
 pub struct ClientConfig {
     pub verify_host_key: HostKeyVerifier,
+    /// Trusted host-certificate CAs. When non-empty, the client offers the
+    /// certificate host-key algorithm and verifies a presented host cert
+    /// against these CAs, the hostname, and its validity window.
+    pub host_cas: Vec<PublicKey>,
+    /// The hostname being connected to, checked against a host cert's
+    /// principals.
+    pub hostname: String,
+}
+
+impl ClientConfig {
+    /// A plain TOFU client with no host-certificate trust.
+    pub fn with_verifier(verify_host_key: HostKeyVerifier) -> Self {
+        ClientConfig {
+            verify_host_key,
+            host_cas: Vec::new(),
+            hostname: String::new(),
+        }
+    }
 }
 
 pub struct ServerConfig {
     pub host_key: PrivateKey,
+    /// An optional host certificate (`ssh-ed25519-cert-v01`) certifying
+    /// `host_key`. When present, it is offered as the host key so clients
+    /// that trust the CA skip TOFU.
+    pub host_cert: Option<Vec<u8>>,
+}
+
+impl ServerConfig {
+    pub fn with_host_key(host_key: PrivateKey) -> Self {
+        ServerConfig {
+            host_key,
+            host_cert: None,
+        }
+    }
 }
 
 /// Progress of an in-flight packet read. Lives in the transport so that a
@@ -77,9 +120,14 @@ pub struct Transport<S> {
     /// peer's KEXINIT during a rekey we initiated.
     pub(crate) queued: VecDeque<Vec<u8>>,
 
-    // Server identity material.
+    // Host-key material.
     host_key: Option<PrivateKey>,      // when we are the server
-    verifier: Option<HostKeyVerifier>, // when we are the client
+    host_cert: Option<Vec<u8>>,        // optional server host certificate
+    verifier: Option<HostKeyVerifier>, // TOFU decision, when we are the client
+    host_cas: Vec<PublicKey>,          // trusted host-cert CAs (client)
+    hostname: String,                  // for host-cert principal check (client)
+    /// Host-key algorithms we advertise in KEXINIT (cert + plain, or plain).
+    host_key_algos: Vec<String>,
     peer_host_key: Option<PublicKey>,
 
     peer_ext_info: bool,
@@ -89,6 +137,9 @@ pub struct Transport<S> {
 impl<S: AsyncRead + AsyncWrite + Unpin + Send> Transport<S> {
     pub async fn client(io: S, config: ClientConfig) -> Result<Self> {
         let mut t = Self::new(io, Side::Client, None, Some(config.verify_host_key));
+        t.host_cas = config.host_cas;
+        t.hostname = config.hostname;
+        t.host_key_algos = host_key_algos(!t.host_cas.is_empty());
         t.exchange_idents().await?;
         t.initial_kex().await?;
         Ok(t)
@@ -96,6 +147,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Transport<S> {
 
     pub async fn server(io: S, config: ServerConfig) -> Result<Self> {
         let mut t = Self::new(io, Side::Server, Some(config.host_key), None);
+        t.host_cert = config.host_cert;
+        t.host_key_algos = host_key_algos(t.host_cert.is_some());
         t.exchange_idents().await?;
         t.initial_kex().await?;
         Ok(t)
@@ -124,11 +177,46 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Transport<S> {
             session_id: Vec::new(),
             queued: VecDeque::new(),
             host_key,
+            host_cert: None,
             verifier,
+            host_cas: Vec::new(),
+            hostname: String::new(),
+            host_key_algos: vec![crate::crypto::ed25519::ALGO.to_string()],
             peer_host_key: None,
             peer_ext_info: false,
             server_sig_algs: None,
         }
+    }
+
+    /// Verify a presented host certificate against our trusted CAs, the
+    /// hostname, and its validity window, returning the certified key.
+    fn verify_host_cert(&self, blob: &[u8]) -> Result<PublicKey> {
+        let cert = Certificate::parse_and_verify(blob)
+            .map_err(|e| Error::HostKey(format!("host certificate: {e}")))?;
+        if cert.cert_type != CERT_TYPE_HOST {
+            return Err(Error::HostKey("presented a non-host certificate".into()));
+        }
+        if !self.host_cas.contains(&cert.ca_key) {
+            return Err(Error::HostKey(format!(
+                "host certificate signed by an untrusted CA ({})",
+                cert.ca_key.fingerprint()
+            )));
+        }
+        if !cert.valid_at(crate::crypto::cert::now_secs()) {
+            return Err(Error::HostKey("host certificate is expired or not yet valid".into()));
+        }
+        // A host cert lists hostnames as principals; empty means "any host",
+        // which we refuse for host certs (too broad to be a real identity).
+        if cert.principals.is_empty() {
+            return Err(Error::HostKey("host certificate lists no hostnames".into()));
+        }
+        if !cert.permits_principal(&self.hostname) {
+            return Err(Error::HostKey(format!(
+                "host certificate is not valid for {:?}",
+                self.hostname
+            )));
+        }
+        Ok(cert.key)
     }
 
     /// The session identifier: the exchange hash of the first key exchange.
@@ -351,7 +439,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Transport<S> {
     }
 
     async fn initial_kex(&mut self) -> Result<()> {
-        let ours = kexinit::KexInit::local(self.side);
+        let ours = kexinit::KexInit::local(self.side, &self.host_key_algos);
         let ours_bytes = ours.encode();
         self.send_raw(&ours_bytes).await?;
         // Strict KEX: the first packet on the wire must be KEXINIT.
@@ -366,7 +454,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Transport<S> {
     /// the peer's KEXINIT arrives, then run the exchange.
     pub(crate) async fn rekey_initiate(&mut self) -> Result<()> {
         tracing::debug!("initiating rekey");
-        let ours = kexinit::KexInit::local(self.side);
+        let ours = kexinit::KexInit::local(self.side, &self.host_key_algos);
         let ours_bytes = ours.encode();
         self.send_raw(&ours_bytes).await?;
         let theirs_bytes = loop {
@@ -389,7 +477,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Transport<S> {
     /// The peer wants new keys (its KEXINIT payload is `theirs_bytes`).
     pub(crate) async fn rekey_respond(&mut self, theirs_bytes: Vec<u8>) -> Result<()> {
         tracing::debug!("peer initiated rekey");
-        let ours = kexinit::KexInit::local(self.side);
+        let ours = kexinit::KexInit::local(self.side, &self.host_key_algos);
         let ours_bytes = ours.encode();
         self.send_raw(&ours_bytes).await?;
         self.run_kex(&ours, ours_bytes, theirs_bytes).await
@@ -443,12 +531,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Transport<S> {
                 let sig = r.string()?.to_vec();
                 r.finish()?;
 
-                let host_key = PublicKey::from_blob(&k_s)?;
-                // Trust decision first, then the proof of possession.
-                (self
-                    .verifier
-                    .as_mut()
-                    .expect("client always has a verifier"))(&host_key)?;
+                // Trust decision first, then the proof of possession. A host
+                // certificate is checked against our trusted CAs, the
+                // hostname, and its validity; a bare key goes through TOFU.
+                let host_key = if neg.host_key_algo == CERT_ALGO {
+                    self.verify_host_cert(&k_s)?
+                } else {
+                    let hk = PublicKey::from_blob(&k_s)?;
+                    (self
+                        .verifier
+                        .as_mut()
+                        .expect("client always has a verifier"))(&hk)?;
+                    hk
+                };
 
                 let k = eph.finish(&q_s)?;
                 let h = exchange_hash(&v_c, &v_s, i_c, i_s, &k_s, &q_c, &q_s, &k);
@@ -469,7 +564,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Transport<S> {
 
                 let (q_s, k) = kex::server_exchange(neg.kex, &q_c)?;
                 let host_key = self.host_key.as_ref().expect("server always has a host key");
-                let k_s = host_key.public().to_blob();
+                // Present the certificate as the host key when it was
+                // negotiated; we still sign with the (certified) private key.
+                let k_s = if neg.host_key_algo == CERT_ALGO {
+                    self.host_cert
+                        .clone()
+                        .expect("cert host-key algo implies we have a host cert")
+                } else {
+                    host_key.public().to_blob()
+                };
                 let h = exchange_hash(&v_c, &v_s, i_c, i_s, &k_s, &q_c, &q_s, &k);
                 let sig = host_key.sign(&h);
 
@@ -608,9 +711,7 @@ mod tests {
     use tokio::io::duplex;
 
     fn trusting_client() -> ClientConfig {
-        ClientConfig {
-            verify_host_key: Box::new(|_| Ok(())),
-        }
+        ClientConfig::with_verifier(Box::new(|_| Ok(())))
     }
 
     async fn pair() -> (
@@ -621,7 +722,7 @@ mod tests {
         let host_key = PrivateKey::generate();
         let (c, s) = tokio::join!(
             Transport::client(a, trusting_client()),
-            Transport::server(b, ServerConfig { host_key }),
+            Transport::server(b, ServerConfig::with_host_key(host_key)),
         );
         (c.unwrap(), s.unwrap())
     }
@@ -642,17 +743,75 @@ mod tests {
         assert!(algs.contains(&"ssh-ed25519-cert-v01@openssh.com".to_string()));
     }
 
+    /// A server that presents a host cert (signed by `ca`) for `principals`,
+    /// against a client that trusts `client_cas` and connects to `hostname`.
+    async fn cert_handshake(
+        ca: &PrivateKey,
+        principals: &[&str],
+        hostname: &str,
+        client_cas: Vec<PublicKey>,
+    ) -> (
+        Result<Transport<tokio::io::DuplexStream>>,
+        Result<Transport<tokio::io::DuplexStream>>,
+    ) {
+        let (a, b) = duplex(1 << 20);
+        let host_key = PrivateKey::generate();
+        let principals: Vec<String> = principals.iter().map(|s| s.to_string()).collect();
+        let host_cert = crate::crypto::cert::sign_host_cert(
+            ca,
+            &host_key.public(),
+            1,
+            "host",
+            &principals,
+            0,
+            u64::MAX,
+        );
+        let client = ClientConfig {
+            verify_host_key: Box::new(|_| panic!("TOFU must not run when a cert is presented")),
+            host_cas: client_cas,
+            hostname: hostname.to_string(),
+        };
+        let server = ServerConfig {
+            host_key,
+            host_cert: Some(host_cert),
+        };
+        tokio::join!(Transport::client(a, client), Transport::server(b, server))
+    }
+
+    #[tokio::test]
+    async fn host_certificate_accepted_and_tofu_skipped() {
+        let ca = PrivateKey::generate();
+        let (c, s) = cert_handshake(&ca, &["myhost"], "myhost", vec![ca.public()]).await;
+        c.unwrap();
+        s.unwrap();
+    }
+
+    #[tokio::test]
+    async fn host_certificate_wrong_hostname_rejected() {
+        let ca = PrivateKey::generate();
+        // Trust the right CA, but connect under a hostname the cert omits.
+        let (c, _s) = cert_handshake(&ca, &["realhost"], "wronghost", vec![ca.public()]).await;
+        assert!(matches!(c, Err(Error::HostKey(_))));
+    }
+
+    #[tokio::test]
+    async fn host_certificate_untrusted_ca_rejected() {
+        let ca = PrivateKey::generate();
+        let stranger = PrivateKey::generate();
+        // Cert is signed by `ca`, but the client only trusts `stranger`.
+        let (c, _s) = cert_handshake(&ca, &["myhost"], "myhost", vec![stranger.public()]).await;
+        assert!(matches!(c, Err(Error::HostKey(_))));
+    }
+
     #[tokio::test]
     async fn client_rejects_untrusted_host_key() {
         let (a, b) = duplex(1 << 20);
         let host_key = PrivateKey::generate();
         let client = Transport::client(
             a,
-            ClientConfig {
-                verify_host_key: Box::new(|_| Err(Error::HostKey("not on the list".into()))),
-            },
+            ClientConfig::with_verifier(Box::new(|_| Err(Error::HostKey("not on the list".into())))),
         );
-        let server = Transport::server(b, ServerConfig { host_key });
+        let server = Transport::server(b, ServerConfig::with_host_key(host_key));
         let (c, _s) = tokio::join!(client, server);
         assert!(matches!(c, Err(Error::HostKey(_))));
     }

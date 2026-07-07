@@ -48,9 +48,14 @@ Terrapin attack (CVE-2023-48795) by construction. The RFCs treat message
 injection tolerance during KEX as a feature; we treat it as a bug.
 
 ### Host keys and user keys
-`ssh-ed25519` (RFC 8709) only. RSA drags in SHA-1 legacy and key-size
-negotiation; ECDSA has nonce-reuse fragility; DSA is dead. Ed25519 signatures
-are deterministic, fast, small, and misuse-resistant.
+`ssh-ed25519` (RFC 8709) only, plus its certificate form
+(`ssh-ed25519-cert-v01@openssh.com`) as a host-key algorithm when a host
+certificate is in use. RSA drags in SHA-1 legacy and key-size negotiation;
+ECDSA has nonce-reuse fragility; DSA is dead. Ed25519 signatures are
+deterministic, fast, small, and misuse-resistant. A client offers the
+certificate host-key algorithm only when it has trusted host CAs, so a
+plain-key TOFU handshake is byte-for-byte what it was before certificates
+existed.
 
 ### Ciphers — AEAD only, MACs are vestigial
 `chacha20-poly1305@openssh.com` and `aes256-gcm@openssh.com`. No CBC (padding
@@ -140,9 +145,11 @@ shh/                 one library crate
    4254's open-by-default posture. Sessions and forwards are both
    multiplexer channels, so any mix of them rides one connection — a
    foreground session tears everything down on exit, matching OpenSSH.
-4. **Certificate auth (done).** CA-signed Ed25519 user certificates
-   (`ssh-ed25519-cert-v01@openssh.com`): `shh-keygen -s` issues them, `shhd
-   --trusted-ca-keys` trusts a CA, and `shh` presents `<id>-cert.pub`
-   automatically. Interoperable with `ssh-keygen` / OpenSSH both ways.
-   Remaining: keep-alives, `sk-ssh-ed25519` FIDO2 keys, host certificates,
-   agent protocol, hardened privilege separation in `shhd`.
+4. **Certificate auth (done).** CA-signed Ed25519 user *and host*
+   certificates (`ssh-ed25519-cert-v01@openssh.com`): `shh-keygen -s`
+   issues them (`-H` for host certs), `shhd --trusted-ca-keys` / `shh
+   --trusted-cas` trust user CAs, `shhd --host-cert` presents a host cert,
+   and `shh` verifies it against `@cert-authority` / `--host-ca` CAs instead
+   of TOFU. Interoperable with `ssh-keygen` / OpenSSH both ways. Remaining:
+   keep-alives, `sk-ssh-ed25519` FIDO2 keys, agent protocol, hardened
+   privilege separation in `shhd`.

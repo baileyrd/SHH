@@ -972,11 +972,9 @@ mod tests {
         let (c, s) = tokio::join!(
             Transport::client(
                 a,
-                ClientConfig {
-                    verify_host_key: Box::new(|_| Ok(())),
-                },
+                ClientConfig::with_verifier(Box::new(|_| Ok(()))),
             ),
-            Transport::server(b, ServerConfig { host_key }),
+            Transport::server(b, ServerConfig::with_host_key(host_key)),
         );
         (c.unwrap(), s.unwrap())
     }

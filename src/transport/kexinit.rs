@@ -38,7 +38,7 @@ pub struct KexInit {
 impl KexInit {
     /// Our own KEXINIT. The strict-KEX marker is always present: this
     /// implementation does not have a non-strict mode.
-    pub fn local(side: Side) -> Self {
+    pub fn local(side: Side, host_keys: &[String]) -> Self {
         let mut kex: Vec<String> = crypto::KEX_ALGORITHMS.iter().map(|s| s.to_string()).collect();
         match side {
             Side::Client => {
@@ -56,7 +56,7 @@ impl KexInit {
         KexInit {
             cookie,
             kex,
-            host_keys: strs(crypto::HOST_KEY_ALGORITHMS),
+            host_keys: host_keys.to_vec(),
             enc_c2s: strs(crypto::CIPHERS),
             enc_s2c: strs(crypto::CIPHERS),
             mac_c2s: strs(crypto::MACS),
@@ -133,6 +133,8 @@ impl KexInit {
 #[derive(Debug)]
 pub struct Negotiated {
     pub kex: kex::Algorithm,
+    /// The chosen host-key algorithm: `ssh-ed25519` or the certificate type.
+    pub host_key_algo: String,
     pub cipher_c2s: cipher::Algorithm,
     pub cipher_s2c: cipher::Algorithm,
     /// Peer advertised ext-info (RFC 8308).
@@ -184,11 +186,12 @@ pub fn negotiate(side: Side, ours: &KexInit, theirs: &KexInit) -> Result<Negotia
         .ok_or_else(|| Error::proto(format!("negotiated unusable kex {kex_name:?}")))?;
 
     let host_key = choose("host key", &client.host_keys, &server.host_keys)?;
-    if host_key != "ssh-ed25519" {
+    if host_key != "ssh-ed25519" && host_key != crate::crypto::cert::CERT_ALGO {
         return Err(Error::proto(format!(
             "negotiated unusable host key algorithm {host_key:?}"
         )));
     }
+    let host_key_algo = host_key.to_string();
 
     let c2s = choose("cipher (client→server)", &client.enc_c2s, &server.enc_c2s)?;
     let s2c = choose("cipher (server→client)", &client.enc_s2c, &server.enc_s2c)?;
@@ -211,6 +214,7 @@ pub fn negotiate(side: Side, ours: &KexInit, theirs: &KexInit) -> Result<Negotia
 
     Ok(Negotiated {
         kex,
+        host_key_algo,
         cipher_c2s,
         cipher_s2c,
         peer_ext_info: theirs.kex.iter().any(|a| a == peer_ext),
@@ -224,7 +228,7 @@ mod tests {
 
     #[test]
     fn encode_parse_roundtrip() {
-        let ki = KexInit::local(Side::Client);
+        let ki = KexInit::local(Side::Client, &["ssh-ed25519".to_string()]);
         let bytes = ki.encode();
         let back = KexInit::parse(&bytes).unwrap();
         assert_eq!(back.cookie, ki.cookie);
@@ -235,8 +239,8 @@ mod tests {
 
     #[test]
     fn negotiates_preferred_algorithms() {
-        let c = KexInit::local(Side::Client);
-        let s = KexInit::local(Side::Server);
+        let c = KexInit::local(Side::Client, &["ssh-ed25519".to_string()]);
+        let s = KexInit::local(Side::Server, &["ssh-ed25519".to_string()]);
         let n = negotiate(Side::Client, &c, &s).unwrap();
         assert_eq!(n.kex, kex::Algorithm::MlKem768X25519Sha256);
         assert_eq!(n.cipher_c2s, cipher::Algorithm::ChaChaPoly);
@@ -246,8 +250,8 @@ mod tests {
 
     #[test]
     fn falls_back_to_curve25519() {
-        let c = KexInit::local(Side::Client);
-        let mut s = KexInit::local(Side::Server);
+        let c = KexInit::local(Side::Client, &["ssh-ed25519".to_string()]);
+        let mut s = KexInit::local(Side::Server, &["ssh-ed25519".to_string()]);
         s.kex = vec!["curve25519-sha256".into(), STRICT_SERVER.into()];
         let n = negotiate(Side::Client, &c, &s).unwrap();
         assert_eq!(n.kex, kex::Algorithm::Curve25519Sha256);
@@ -255,35 +259,35 @@ mod tests {
 
     #[test]
     fn refuses_peer_without_strict_kex() {
-        let c = KexInit::local(Side::Client);
-        let mut s = KexInit::local(Side::Server);
+        let c = KexInit::local(Side::Client, &["ssh-ed25519".to_string()]);
+        let mut s = KexInit::local(Side::Server, &["ssh-ed25519".to_string()]);
         s.kex.retain(|a| a != STRICT_SERVER);
         assert!(negotiate(Side::Client, &c, &s).is_err());
     }
 
     #[test]
     fn refuses_legacy_only_peer() {
-        let c = KexInit::local(Side::Client);
-        let mut s = KexInit::local(Side::Server);
+        let c = KexInit::local(Side::Client, &["ssh-ed25519".to_string()]);
+        let mut s = KexInit::local(Side::Server, &["ssh-ed25519".to_string()]);
         s.kex = vec!["diffie-hellman-group14-sha256".into(), STRICT_SERVER.into()];
         assert!(matches!(
             negotiate(Side::Client, &c, &s),
             Err(Error::Negotiation { .. })
         ));
 
-        let mut s = KexInit::local(Side::Server);
+        let mut s = KexInit::local(Side::Server, &["ssh-ed25519".to_string()]);
         s.host_keys = vec!["rsa-sha2-512".into()];
         assert!(negotiate(Side::Client, &c, &s).is_err());
 
-        let mut s = KexInit::local(Side::Server);
+        let mut s = KexInit::local(Side::Server, &["ssh-ed25519".to_string()]);
         s.enc_c2s = vec!["aes128-cbc".into()];
         assert!(negotiate(Side::Client, &c, &s).is_err());
     }
 
     #[test]
     fn wrong_guess_flagged_for_discard() {
-        let c = KexInit::local(Side::Client);
-        let mut s = KexInit::local(Side::Server);
+        let c = KexInit::local(Side::Client, &["ssh-ed25519".to_string()]);
+        let mut s = KexInit::local(Side::Server, &["ssh-ed25519".to_string()]);
         s.kex = vec![
             "curve25519-sha256".into(),
             "mlkem768x25519-sha256".into(),

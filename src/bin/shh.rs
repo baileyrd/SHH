@@ -45,6 +45,12 @@ struct Args {
     #[arg(long, default_value_os_t = default_path("known_hosts"))]
     known_hosts: PathBuf,
 
+    /// Trusted host-certificate CA keys, one per line (in addition to any
+    /// `@cert-authority` lines in known_hosts). A host presenting a valid
+    /// certificate from a trusted CA is accepted without a TOFU prompt.
+    #[arg(long)]
+    host_ca: Option<PathBuf>,
+
     /// Trust and record an unseen host key without prompting.
     #[arg(long)]
     accept_new: bool,
@@ -268,6 +274,17 @@ async fn run(args: Args) -> Result<i32, String> {
     let known_hosts = args.known_hosts.clone();
     let accept_new = args.accept_new;
 
+    // Trusted host-certificate CAs: from --host-ca and from `@cert-authority`
+    // lines in known_hosts. With any, a valid host cert skips the TOFU prompt.
+    let mut host_cas = Vec::new();
+    if let Some(path) = &args.host_ca {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        host_cas.extend(keyfile::parse_authorized_keys(&text));
+    }
+    if let Ok(text) = std::fs::read_to_string(&args.known_hosts) {
+        host_cas.extend(keyfile::known_hosts_cert_authorities(&text));
+    }
+
     let socket = TcpStream::connect((host.as_str(), args.port))
         .await
         .map_err(|e| format!("connect to {label}: {e}"))?;
@@ -275,6 +292,8 @@ async fn run(args: Args) -> Result<i32, String> {
 
     let config = ClientConfig {
         verify_host_key: Box::new(move |k| verify_host_key(k, &label, &known_hosts, accept_new)),
+        host_cas,
+        hostname: host.clone(),
     };
     let mut t = Transport::client(socket, config)
         .await

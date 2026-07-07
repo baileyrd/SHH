@@ -214,6 +214,7 @@ mod tests {
         let policy = auth::Policy {
             user: Some("tester".into()),
             keys: vec![user_key.public()],
+            trusted_cas: vec![],
             banner: None,
         };
         let command = command.to_owned();
@@ -229,7 +230,7 @@ mod tests {
                 },
             )
             .await?;
-            auth::client(&mut t, "tester", &user_key, |_| {}).await?;
+            auth::client(&mut t, "tester", &user_key, None, |_| {}).await?;
             let status =
                 client_session(t, Some(&command), None, None, stdin, out, err).await?;
             Ok::<_, Error>(status)
@@ -284,6 +285,7 @@ mod tests {
         let policy = auth::Policy {
             user: None,
             keys: vec![user_key.public()],
+            trusted_cas: vec![],
             banner: None,
         };
         let client_side = async move {
@@ -294,7 +296,7 @@ mod tests {
                 },
             )
             .await?;
-            auth::client(&mut t, "tester", &user_key, |_| {}).await?;
+            auth::client(&mut t, "tester", &user_key, None, |_| {}).await?;
             let req = PtyRequest {
                 term: "vt100".into(),
                 cols: 132,

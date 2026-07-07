@@ -520,7 +520,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Transport<S> {
             w.byte(msg::EXT_INFO);
             w.u32(1);
             w.utf8("server-sig-algs");
-            w.utf8("ssh-ed25519");
+            w.utf8("ssh-ed25519,ssh-ed25519-cert-v01@openssh.com");
             let payload = w.into_bytes();
             self.send_raw(&payload).await?;
         }
@@ -635,8 +635,11 @@ mod tests {
         assert_eq!(s.recv().await.unwrap(), vec![99, 1, 2, 3]);
         s.send(&[100, 9]).await.unwrap();
         assert_eq!(c.recv().await.unwrap(), vec![100, 9]);
-        // Client advertised ext-info-c, so the server sent server-sig-algs.
-        assert_eq!(c.server_sig_algs(), Some(&["ssh-ed25519".to_string()][..]));
+        // Client advertised ext-info-c, so the server sent server-sig-algs
+        // (plain Ed25519 plus the certificate algorithm).
+        let algs = c.server_sig_algs().unwrap();
+        assert!(algs.contains(&"ssh-ed25519".to_string()));
+        assert!(algs.contains(&"ssh-ed25519-cert-v01@openssh.com".to_string()));
     }
 
     #[tokio::test]

@@ -71,8 +71,13 @@ trains users to type secrets into prompts; `keyboard-interactive` is the same
 with more steps. Neither is implemented — not disabled, *not present*.
 `publickey` with Ed25519 keys is the only method. The signature is computed
 over the session identifier exactly per RFC 4252 §7, binding auth to the
-channel. (Planned: `sk-ssh-ed25519@openssh.com` FIDO2 keys and OpenSSH-style
-certificates.)
+channel. Both bare keys and OpenSSH-style Ed25519 user certificates
+(`ssh-ed25519-cert-v01@openssh.com`) are accepted: a server may trust a CA
+(`--trusted-ca-keys`) and admit any certificate it signed whose validity
+window covers now and whose principals include the login name. We fail
+closed on unrecognized critical options, and host certificates plus
+`force-command` / `source-address` are not yet honored. (Planned:
+`sk-ssh-ed25519@openssh.com` FIDO2 keys.)
 
 ### Rekeying
 Automatic and non-negotiable: rekey after 1 GiB of traffic in either
@@ -135,5 +140,9 @@ shh/                 one library crate
    4254's open-by-default posture. Sessions and forwards are both
    multiplexer channels, so any mix of them rides one connection — a
    foreground session tears everything down on exit, matching OpenSSH.
-4. Keep-alives, `sk-ssh-ed25519` FIDO2 keys, certificates, agent protocol,
-   hardened privilege separation in `shhd`.
+4. **Certificate auth (done).** CA-signed Ed25519 user certificates
+   (`ssh-ed25519-cert-v01@openssh.com`): `shh-keygen -s` issues them, `shhd
+   --trusted-ca-keys` trusts a CA, and `shh` presents `<id>-cert.pub`
+   automatically. Interoperable with `ssh-keygen` / OpenSSH both ways.
+   Remaining: keep-alives, `sk-ssh-ed25519` FIDO2 keys, host certificates,
+   agent protocol, hardened privilege separation in `shhd`.

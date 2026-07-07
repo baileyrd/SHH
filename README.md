@@ -38,6 +38,30 @@ $ shhd -L 127.0.0.1:2222        # host key generated on first run
 $ shh -p 2222 you@127.0.0.1 'uname -a'
 ```
 
+### Certificates
+
+Instead of listing every key in `authorized_keys`, a server can trust a
+certificate authority and accept any Ed25519 user certificate it signed —
+scoped by a validity window and a principal (login-name) list. The format
+is OpenSSH's `ssh-ed25519-cert-v01@openssh.com`, so `shh-keygen` and
+`ssh-keygen` issue and consume each other's certificates.
+
+```console
+# a CA signs a user's key for principal "deploy", valid 90 days
+$ shh-keygen -s ca_key -I alice@corp -n deploy --days 90 -f id_ed25519.pub
+# writes id_ed25519-cert.pub
+
+# server: trust the CA (authorized_keys can be empty)
+$ shhd --trusted-ca-keys /etc/shh/user_ca.pub --user deploy
+
+# client: the cert next to the key is presented automatically
+$ shh -i id_ed25519 deploy@host uptime
+```
+
+SHH honors the validity window and principals and fails closed on any
+critical option it doesn't implement. Host certificates and
+`force-command` / `source-address` options are not yet honored.
+
 `shh host cmd` behaves like `ssh`: stdin is forwarded, stdout/stderr come
 back separated, and the remote exit status becomes `shh`'s exit status.
 `shh host` with a terminal opens an interactive shell on a real
@@ -93,11 +117,11 @@ readable (unencrypted keys for now).
 
 ## Status
 
-Transport, auth, exec sessions, interactive PTY sessions (pty-req,
-window-change, controlling terminal), encrypted key files, and local
-(`-L`) and remote (`-R`) TCP forwarding with server-side allowlists — all
-multiplexed so a session and any number of forwards share one connection —
-are complete and tested (`cargo test`). Not yet implemented: FIDO2
-`sk-ssh-ed25519` keys, certificates, sshd-style privilege separation.
-Treat it as a working protocol implementation, not a hardened production
-daemon.
+Transport, auth (keys and CA-signed certificates), exec sessions,
+interactive PTY sessions (pty-req, window-change, controlling terminal),
+encrypted key files, and local (`-L`) and remote (`-R`) TCP forwarding with
+server-side allowlists — all multiplexed so a session and any number of
+forwards share one connection — are complete and tested (`cargo test`). Not
+yet implemented: FIDO2 `sk-ssh-ed25519` keys, host certificates, sshd-style
+privilege separation. Treat it as a working protocol implementation, not a
+hardened production daemon.

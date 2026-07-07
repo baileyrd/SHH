@@ -1,13 +1,22 @@
-//! The connection protocol (RFC 4254), scoped to what a remote-command
-//! tool actually needs: one `session` channel per connection, `exec` or
-//! `shell`, bidirectional data with real window flow control, exit status.
+//! The connection protocol (RFC 4254): session channels (exec / shell /
+//! pty, with window flow control and exit status) and `direct-tcpip`
+//! port forwarding.
 //!
-//! Not present, on purpose (for now): TCP forwarding, X11, agent
-//! forwarding. Forwarding will arrive with an explicit allowlist model
-//! rather than RFC 4254's open-by-default posture.
+//! Forwarding uses an explicit allowlist model rather than RFC 4254's
+//! open-by-default posture — see [`forward::Policy`]. To keep the
+//! well-exercised session path free of regression risk, direct-tcpip
+//! forwarding lives in a separate multiplexer ([`mux::Connection`]) and a
+//! given connection runs *either* a session *or* forwarding, decided by
+//! the first channel opened. Mixing both on one connection is a later
+//! milestone.
+//!
+//! Not present yet: reverse (`-R`) forwarding, X11, agent forwarding.
 
 #[cfg(unix)]
 pub mod pty;
+
+pub mod forward;
+pub mod mux;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::Command;
@@ -18,12 +27,19 @@ use crate::wire::{msg, Reader, Writer};
 use crate::{Error, Result};
 
 /// Receive window we grant the peer, and the largest data chunk we send.
-const LOCAL_WINDOW: u32 = 2 * 1024 * 1024;
-const MAX_CHUNK: u32 = 32 * 1024;
+pub(crate) const LOCAL_WINDOW: u32 = 2 * 1024 * 1024;
+pub(crate) const MAX_CHUNK: u32 = 32 * 1024;
 /// Re-grant the window when the peer has consumed half of it.
-const WINDOW_REFILL: u32 = LOCAL_WINDOW / 2;
+pub(crate) const WINDOW_REFILL: u32 = LOCAL_WINDOW / 2;
 
 const STDERR: u32 = 1; // SSH_EXTENDED_DATA_STDERR
+
+/// CHANNEL_OPEN_FAILURE reason codes (RFC 4254 §5.1).
+pub(crate) mod open_failure {
+    pub const ADMINISTRATIVELY_PROHIBITED: u32 = 1;
+    pub const CONNECT_FAILED: u32 = 2;
+    pub const UNKNOWN_CHANNEL_TYPE: u32 = 3;
+}
 
 pub struct ExitStatus {
     pub code: Option<u32>,
@@ -63,14 +79,14 @@ async fn maybe_recv<T>(rx: Option<&mut mpsc::Receiver<T>>) -> Option<T> {
 
 // ------------------------------------------------------- packet helpers --
 
-fn chan(byte: u8, peer: u32) -> Writer {
+pub(crate) fn chan(byte: u8, peer: u32) -> Writer {
     let mut w = Writer::new();
     w.byte(byte);
     w.u32(peer);
     w
 }
 
-fn data_packet(peer: u32, data: &[u8]) -> Vec<u8> {
+pub(crate) fn data_packet(peer: u32, data: &[u8]) -> Vec<u8> {
     let mut w = chan(msg::CHANNEL_DATA, peer);
     w.string(data);
     w.into_bytes()
@@ -83,13 +99,13 @@ fn ext_data_packet(peer: u32, kind: u32, data: &[u8]) -> Vec<u8> {
     w.into_bytes()
 }
 
-fn window_adjust(peer: u32, add: u32) -> Vec<u8> {
+pub(crate) fn window_adjust(peer: u32, add: u32) -> Vec<u8> {
     let mut w = chan(msg::CHANNEL_WINDOW_ADJUST, peer);
     w.u32(add);
     w.into_bytes()
 }
 
-fn simple(byte: u8, peer: u32) -> Vec<u8> {
+pub(crate) fn simple(byte: u8, peer: u32) -> Vec<u8> {
     chan(byte, peer).into_bytes()
 }
 
@@ -162,7 +178,7 @@ where
 
 /// Reply to a GLOBAL_REQUEST we don't serve (they're all optional
 /// extensions; OpenSSH sends `hostkeys-00@openssh.com` routinely).
-async fn refuse_global_request<S>(t: &mut Transport<S>, payload: &[u8]) -> Result<()>
+pub(crate) async fn refuse_global_request<S>(t: &mut Transport<S>, payload: &[u8]) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
@@ -388,15 +404,45 @@ where
 
 // -------------------------------------------------------------- server --
 
+/// Read the first CHANNEL_OPEN of a connection, refusing global requests
+/// that precede it, and return its raw payload. Lets the server pick a
+/// per-connection mode (session vs forwarding) from the channel type.
+pub async fn first_channel_open<S>(t: &mut Transport<S>) -> Result<Vec<u8>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    loop {
+        let p = t.recv().await?;
+        match p[0] {
+            msg::CHANNEL_OPEN => return Ok(p),
+            msg::GLOBAL_REQUEST => refuse_global_request(t, &p).await?,
+            other => return Err(Error::proto(format!("unexpected message {other}"))),
+        }
+    }
+}
+
+/// The channel type named in a CHANNEL_OPEN payload.
+pub fn channel_open_type(payload: &[u8]) -> Result<String> {
+    let mut r = Reader::new(payload);
+    r.byte()?;
+    Ok(r.utf8()?.to_owned())
+}
+
 /// Serve one session channel: accept it, run the requested command, wire
-/// the child's stdio to the channel, report the exit status.
-pub async fn server_session<S>(t: &mut Transport<S>) -> Result<()>
+/// the child's stdio to the channel, report the exit status. `primed` is a
+/// CHANNEL_OPEN already read off the wire (from [`first_channel_open`]);
+/// pass `None` to read it here.
+pub async fn server_session<S>(t: &mut Transport<S>, primed: Option<Vec<u8>>) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     // --- accept a session channel
+    let mut primed = primed;
     let (client_id, mut remote_window, remote_max) = loop {
-        let p = t.recv().await?;
+        let p = match primed.take() {
+            Some(p) => p,
+            None => t.recv().await?,
+        };
         let mut r = Reader::new(&p);
         match r.byte()? {
             msg::CHANNEL_OPEN => {
@@ -413,7 +459,7 @@ where
                     break (sender, window, max);
                 }
                 let mut w = chan(msg::CHANNEL_OPEN_FAILURE, sender);
-                w.u32(3); // SSH_OPEN_UNKNOWN_CHANNEL_TYPE
+                w.u32(open_failure::UNKNOWN_CHANNEL_TYPE);
                 w.utf8("only session channels are served");
                 w.utf8("");
                 t.send(&w.into_bytes()).await?;
@@ -836,7 +882,7 @@ mod tests {
         let server_side = async move {
             let mut t = Transport::server(b, ServerConfig { host_key }).await?;
             auth::server(&mut t, &policy).await?;
-            server_session(&mut t).await
+            server_session(&mut t, None).await
         };
         let (c, s) = tokio::join!(client_side, server_side);
         s.unwrap();
@@ -918,7 +964,7 @@ mod tests {
         let server_side = async move {
             let mut t = Transport::server(b, ServerConfig { host_key }).await?;
             auth::server(&mut t, &policy).await?;
-            server_session(&mut t).await
+            server_session(&mut t, None).await
         };
         let (c, s) = tokio::join!(client_side, server_side);
         s.unwrap();

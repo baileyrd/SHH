@@ -86,8 +86,9 @@ we enforce it.
 ### Other cuts
 - No SSH1 compatibility of any kind, including the version-string dialects.
 - No `none` cipher, no `none` auth success path.
-- No TCP forwarding in milestone 1 (planned: `direct-tcpip` with an explicit
-  allowlist model rather than RFC 4254's open-by-default posture).
+- TCP forwarding (`direct-tcpip`) uses an explicit server allowlist
+  (`--permit-open`, default deny) rather than RFC 4254's open-by-default
+  posture, where any authenticated user may open a forward to any address.
 - Random packet padding is always fresh CSPRNG output (RFC 4253 merely
   suggests randomness).
 
@@ -126,5 +127,10 @@ shh/                 one library crate
    terminal, raw client mode, window-change on SIGWINCH, and
    passphrase-protected key files (bcrypt + AES-256-CTR, `ssh-keygen`
    compatible in both directions).
-3. `direct-tcpip` forwarding with allowlists; keep-alives; `sk-ssh-ed25519`.
-4. Certificates, agent protocol, hardened privilege separation in `shhd`.
+3. **Port forwarding (done).** `direct-tcpip` local (`-L`) forwarding
+   through a channel multiplexer, with a default-deny server allowlist
+   (`--permit-open`) rather than RFC 4254's open-by-default posture. A
+   connection runs either a session or forwarding, chosen by the first
+   channel opened; unifying the two, and remote (`-R`) forwarding, remain.
+4. Keep-alives, `sk-ssh-ed25519` FIDO2 keys, certificates, agent protocol,
+   hardened privilege separation in `shhd`.

@@ -25,6 +25,12 @@ struct Args {
     #[arg(long, default_value_os_t = default_path("host_key"))]
     host_key: PathBuf,
 
+    /// Host certificate to present (an `ssh-ed25519-cert-v01` line certifying
+    /// the host key). Clients that trust the CA skip TOFU. Default:
+    /// `<host_key>-cert.pub` if it exists.
+    #[arg(long)]
+    host_cert: Option<PathBuf>,
+
     /// authorized_keys file (standard format; Ed25519 lines count).
     #[arg(long, default_value_os_t = default_path("authorized_keys"))]
     authorized_keys: PathBuf,
@@ -101,6 +107,22 @@ async fn main() -> std::io::Result<()> {
     let host_key = load_or_create_host_key(&args.host_key)?;
     tracing::info!("host key fingerprint: {}", host_key.public().fingerprint());
 
+    // Load a host certificate if configured or sitting next to the host key.
+    let host_cert_path = args.host_cert.clone().or_else(|| {
+        let p = PathBuf::from(format!("{}-cert.pub", args.host_key.display()));
+        p.exists().then_some(p)
+    });
+    let host_cert = match &host_cert_path {
+        Some(path) => {
+            let line = std::fs::read_to_string(path)?;
+            let blob = keyfile::decode_cert(line.trim())
+                .map_err(|e| std::io::Error::other(format!("{}: {e}", path.display())))?;
+            tracing::info!("presenting host certificate {}", path.display());
+            Some(blob)
+        }
+        None => None,
+    };
+
     let keys = match std::fs::read_to_string(&args.authorized_keys) {
         Ok(text) => keyfile::parse_authorized_keys(&text),
         Err(e) => {
@@ -169,6 +191,7 @@ async fn main() -> std::io::Result<()> {
         let (socket, addr) = listener.accept().await?;
         socket.set_nodelay(true).ok();
         let host_key = host_key.clone();
+        let host_cert = host_cert.clone();
         let policy = auth::Policy {
             user: user.clone(),
             keys: keys.clone(),
@@ -178,7 +201,10 @@ async fn main() -> std::io::Result<()> {
         let permit_open = args.permit_open.clone();
         let permit_listen = args.permit_listen.clone();
         tokio::spawn(async move {
-            let config = ServerConfig { host_key };
+            let config = ServerConfig {
+                host_key,
+                host_cert,
+            };
             let mut t = match Transport::server(socket, config).await {
                 Ok(t) => t,
                 Err(e) => {

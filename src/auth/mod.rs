@@ -283,15 +283,13 @@ mod tests {
         let client_side = async move {
             let mut t = Transport::client(
                 a,
-                ClientConfig {
-                    verify_host_key: Box::new(|_| Ok(())),
-                },
+                ClientConfig::with_verifier(Box::new(|_| Ok(()))),
             )
             .await?;
             client(&mut t, user, client_key, None, |_| {}).await
         };
         let server_side = async move {
-            let mut t = Transport::server(b, ServerConfig { host_key }).await?;
+            let mut t = Transport::server(b, ServerConfig::with_host_key(host_key)).await?;
             server(&mut t, &policy).await
         };
         tokio::join!(client_side, server_side)
@@ -352,15 +350,13 @@ mod tests {
         let client_side = async move {
             let mut t = Transport::client(
                 a,
-                ClientConfig {
-                    verify_host_key: Box::new(|_| Ok(())),
-                },
+                ClientConfig::with_verifier(Box::new(|_| Ok(()))),
             )
             .await?;
             client(&mut t, &user, &client_key, cert.as_deref(), |_| {}).await
         };
         let server_side = async move {
-            let mut t = Transport::server(b, ServerConfig { host_key }).await?;
+            let mut t = Transport::server(b, ServerConfig::with_host_key(host_key)).await?;
             server(&mut t, &policy).await
         };
         tokio::join!(client_side, server_side)

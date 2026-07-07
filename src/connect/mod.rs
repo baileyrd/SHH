@@ -225,9 +225,7 @@ mod tests {
         let client_side = async move {
             let mut t = Transport::client(
                 a,
-                ClientConfig {
-                    verify_host_key: Box::new(|_| Ok(())),
-                },
+                ClientConfig::with_verifier(Box::new(|_| Ok(()))),
             )
             .await?;
             auth::client(&mut t, "tester", &user_key, None, |_| {}).await?;
@@ -236,7 +234,7 @@ mod tests {
             Ok::<_, Error>(status)
         };
         let server_side = async move {
-            let mut t = Transport::server(b, ServerConfig { host_key }).await?;
+            let mut t = Transport::server(b, ServerConfig::with_host_key(host_key)).await?;
             auth::server(&mut t, &policy).await?;
             server_session(t, None).await
         };
@@ -291,9 +289,7 @@ mod tests {
         let client_side = async move {
             let mut t = Transport::client(
                 a,
-                ClientConfig {
-                    verify_host_key: Box::new(|_| Ok(())),
-                },
+                ClientConfig::with_verifier(Box::new(|_| Ok(()))),
             )
             .await?;
             auth::client(&mut t, "tester", &user_key, None, |_| {}).await?;
@@ -319,7 +315,7 @@ mod tests {
             Ok::<_, Error>((status, out2.take()))
         };
         let server_side = async move {
-            let mut t = Transport::server(b, ServerConfig { host_key }).await?;
+            let mut t = Transport::server(b, ServerConfig::with_host_key(host_key)).await?;
             auth::server(&mut t, &policy).await?;
             server_session(t, None).await
         };

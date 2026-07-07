@@ -166,23 +166,54 @@ pub fn sign_user_cert(
     valid_after: u64,
     valid_before: u64,
 ) -> Vec<u8> {
+    sign_cert(ca, user_key, CERT_TYPE_USER, serial, key_id, principals, valid_after, valid_before)
+}
+
+/// Sign a host certificate for `host_key`. The principals are hostnames.
+#[allow(clippy::too_many_arguments)]
+pub fn sign_host_cert(
+    ca: &PrivateKey,
+    host_key: &PublicKey,
+    serial: u64,
+    key_id: &str,
+    principals: &[String],
+    valid_after: u64,
+    valid_before: u64,
+) -> Vec<u8> {
+    sign_cert(ca, host_key, CERT_TYPE_HOST, serial, key_id, principals, valid_after, valid_before)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sign_cert(
+    ca: &PrivateKey,
+    key: &PublicKey,
+    cert_type: u32,
+    serial: u64,
+    key_id: &str,
+    principals: &[String],
+    valid_after: u64,
+    valid_before: u64,
+) -> Vec<u8> {
     let mut w = Writer::new();
     w.utf8(CERT_ALGO);
     let mut nonce = [0u8; 32];
     OsRng.fill_bytes(&mut nonce);
     w.string(&nonce);
-    w.string(user_key.0.as_bytes());
+    w.string(key.0.as_bytes());
     w.u64(serial);
-    w.u32(CERT_TYPE_USER);
+    w.u32(cert_type);
     w.utf8(key_id);
     w.string(&pack_string_list(principals));
     w.u64(valid_after);
     w.u64(valid_before);
     w.string(b""); // critical options: none
+    // The permit-* extensions apply to user certs only; host certs carry none.
     let mut ext = Writer::new();
-    for name in DEFAULT_EXTENSIONS {
-        ext.utf8(name);
-        ext.string(b""); // extension data: empty
+    if cert_type == CERT_TYPE_USER {
+        for name in DEFAULT_EXTENSIONS {
+            ext.utf8(name);
+            ext.string(b""); // extension data: empty
+        }
     }
     w.string(&ext.into_bytes());
     w.string(b""); // reserved

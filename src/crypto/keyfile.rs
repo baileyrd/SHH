@@ -172,6 +172,43 @@ pub fn parse_authorized_keys(text: &str) -> Vec<PublicKey> {
         .collect()
 }
 
+// --------------------------------------------------------- known_hosts --
+
+/// The host token used in known_hosts lines: bare hostname on the default
+/// port, `[host]:port` otherwise (the OpenSSH convention).
+pub fn host_label(host: &str, port: u16) -> String {
+    if port == 22 {
+        host.to_string()
+    } else {
+        format!("[{host}]:{port}")
+    }
+}
+
+/// Find the recorded Ed25519 key for `label` in known_hosts text.
+/// Hashed (`|1|…`) and marker (`@…`) lines are skipped — we only write
+/// plain lines and only need to read our own.
+pub fn known_hosts_lookup(text: &str, label: &str) -> Option<PublicKey> {
+    for line in text.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') || line.starts_with('@') {
+            continue;
+        }
+        let Some((hosts, rest)) = line.split_once(char::is_whitespace) else {
+            continue;
+        };
+        if hosts.split(',').any(|h| h == label) {
+            if let Ok((key, _)) = decode_public(rest.trim_start()) {
+                return Some(key);
+            }
+        }
+    }
+    None
+}
+
+/// One known_hosts line for `label`.
+pub fn known_hosts_line(label: &str, key: &PublicKey) -> String {
+    format!("{label} {}", encode_public(key, ""))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -36,6 +36,17 @@ impl PublicKey {
         Ok(PublicKey(key))
     }
 
+    /// OpenSSH-style fingerprint: `SHA256:` + unpadded base64 of the
+    /// digest of the key blob.
+    pub fn fingerprint(&self) -> String {
+        use base64::prelude::{Engine as _, BASE64_STANDARD_NO_PAD};
+        use sha2::{Digest, Sha256};
+        format!(
+            "SHA256:{}",
+            BASE64_STANDARD_NO_PAD.encode(Sha256::digest(self.to_blob()))
+        )
+    }
+
     /// Verify an SSH signature blob (string "ssh-ed25519" ‖ string sig)
     /// over `message`.
     pub fn verify(&self, message: &[u8], sig_blob: &[u8]) -> Result<()> {
@@ -56,6 +67,7 @@ impl PublicKey {
 }
 
 /// A private key. The inner `SigningKey` zeroizes on drop.
+#[derive(Clone)]
 pub struct PrivateKey(pub SigningKey);
 
 impl PrivateKey {

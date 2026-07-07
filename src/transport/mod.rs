@@ -44,6 +44,15 @@ pub struct ServerConfig {
     pub host_key: PrivateKey,
 }
 
+/// Progress of an in-flight packet read. Lives in the transport so that a
+/// cancelled `recv_raw` future (e.g. the losing arm of a `select!`) resumes
+/// exactly where it stopped instead of desynchronizing the stream.
+enum ReadState {
+    Idle,
+    Header { first4: [u8; 4], got: usize },
+    Body { first4: [u8; 4], buf: Vec<u8>, got: usize },
+}
+
 /// One SSH transport over `S`, after a completed handshake. All packet
 /// I/O flows through `send`/`recv`, which handle keepalive chatter,
 /// EXT_INFO, disconnects, and transparent rekeying.
@@ -52,6 +61,7 @@ pub struct Transport<S> {
     side: Side,
     v_local: String,
     v_peer: String,
+    read_state: ReadState,
 
     tx: Box<dyn PacketCipher>,
     rx: Box<dyn PacketCipher>,
@@ -65,7 +75,7 @@ pub struct Transport<S> {
     session_id: Vec<u8>,
     /// App packets that legitimately arrived while we were waiting for the
     /// peer's KEXINIT during a rekey we initiated.
-    queued: VecDeque<Vec<u8>>,
+    pub(crate) queued: VecDeque<Vec<u8>>,
 
     // Server identity material.
     host_key: Option<PrivateKey>,      // when we are the server
@@ -102,6 +112,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Transport<S> {
             side,
             v_local: crate::IDENT.to_string(),
             v_peer: String::new(),
+            read_state: ReadState::Idle,
             tx: Box::new(PlainCipher),
             rx: Box::new(PlainCipher),
             tx_seq: 0,
@@ -206,19 +217,62 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Transport<S> {
         Ok(())
     }
 
-    async fn recv_raw(&mut self) -> Result<Vec<u8>> {
-        let mut first4 = [0u8; 4];
-        self.io.read_exact(&mut first4).await?;
-        let len = self.rx.packet_length(self.rx_seq, first4)?;
-        let mut body = vec![0u8; self.rx.body_len(len)];
-        self.io.read_exact(&mut body).await?;
-        let payload = self.rx.open(self.rx_seq, first4, &mut body)?;
-        self.rx_seq = self.rx_seq.wrapping_add(1);
-        self.traffic += (4 + body.len()) as u64;
-        if payload.is_empty() {
-            return Err(Error::proto("empty packet payload"));
+    /// Read one packet. Cancel-safe: dropping this future between polls
+    /// keeps partial progress in `self.read_state`, so the next call
+    /// resumes mid-packet. This is what makes it legal to race `recv_raw`
+    /// against other work in `select!`.
+    pub(crate) async fn recv_raw(&mut self) -> Result<Vec<u8>> {
+        loop {
+            // Split borrows: the state machine and the socket are separate
+            // fields, but the compiler needs to see that explicitly.
+            let Transport {
+                io, read_state, rx, ..
+            } = self;
+            match read_state {
+                ReadState::Idle => {
+                    *read_state = ReadState::Header {
+                        first4: [0u8; 4],
+                        got: 0,
+                    };
+                }
+                ReadState::Header { first4, got } => {
+                    if *got < 4 {
+                        let n = io.read(&mut first4[*got..]).await?;
+                        if n == 0 {
+                            return Err(Error::proto("connection closed mid-packet"));
+                        }
+                        *got += n;
+                        continue;
+                    }
+                    let len = rx.packet_length(self.rx_seq, *first4)?;
+                    *read_state = ReadState::Body {
+                        first4: *first4,
+                        buf: vec![0u8; rx.body_len(len)],
+                        got: 0,
+                    };
+                }
+                ReadState::Body { first4, buf, got } => {
+                    if *got < buf.len() {
+                        let n = io.read(&mut buf[*got..]).await?;
+                        if n == 0 {
+                            return Err(Error::proto("connection closed mid-packet"));
+                        }
+                        *got += n;
+                        continue;
+                    }
+                    let first4 = *first4;
+                    let mut buf = std::mem::take(buf);
+                    self.read_state = ReadState::Idle;
+                    let payload = self.rx.open(self.rx_seq, first4, &mut buf)?;
+                    self.rx_seq = self.rx_seq.wrapping_add(1);
+                    self.traffic += (4 + buf.len()) as u64;
+                    if payload.is_empty() {
+                        return Err(Error::proto("empty packet payload"));
+                    }
+                    return Ok(payload);
+                }
+            }
         }
-        Ok(payload)
     }
 
     // -------------------------------------------------------- public API
@@ -289,7 +343,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Transport<S> {
 
     // ------------------------------------------------------ key exchange
 
-    fn should_rekey(&self) -> bool {
+    pub(crate) fn should_rekey(&self) -> bool {
         self.traffic >= self.rekey_bytes
             || self.kexed_at.elapsed() >= self.rekey_interval
             || self.tx_seq >= REKEY_PACKETS
@@ -310,7 +364,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Transport<S> {
 
     /// We want new keys: send KEXINIT, queue in-flight app traffic until
     /// the peer's KEXINIT arrives, then run the exchange.
-    async fn rekey_initiate(&mut self) -> Result<()> {
+    pub(crate) async fn rekey_initiate(&mut self) -> Result<()> {
         tracing::debug!("initiating rekey");
         let ours = kexinit::KexInit::local(self.side);
         let ours_bytes = ours.encode();
@@ -333,7 +387,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Transport<S> {
     }
 
     /// The peer wants new keys (its KEXINIT payload is `theirs_bytes`).
-    async fn rekey_respond(&mut self, theirs_bytes: Vec<u8>) -> Result<()> {
+    pub(crate) async fn rekey_respond(&mut self, theirs_bytes: Vec<u8>) -> Result<()> {
         tracing::debug!("peer initiated rekey");
         let ours = kexinit::KexInit::local(self.side);
         let ours_bytes = ours.encode();
@@ -467,7 +521,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Transport<S> {
         Ok(())
     }
 
-    fn note_ext_info(&mut self, payload: &[u8]) -> Result<()> {
+    pub(crate) fn note_ext_info(&mut self, payload: &[u8]) -> Result<()> {
         let mut r = Reader::new(payload);
         r.byte()?;
         let count = r.u32()?;

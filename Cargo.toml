@@ -7,7 +7,7 @@ description = "A modern SSH: post-quantum hybrid KEX, Ed25519 only, AEAD only"
 rust-version = "1.85"
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time", "sync", "process", "signal", "fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "io-std", "macros", "time", "sync", "process", "signal", "fs"] }
 bytes = "1"
 thiserror = "2"
 tracing = "0.1"
@@ -42,3 +42,7 @@ path = "src/bin/shhd.rs"
 
 [profile.release]
 lto = "thin"
+
+[[bin]]
+name = "shh-keygen"
+path = "src/bin/shh_keygen.rs"

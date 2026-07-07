@@ -9,6 +9,7 @@
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncWrite};
 
+use crate::crypto::cert::{self, Certificate, CERT_ALGO, CERT_TYPE_USER};
 use crate::crypto::ed25519::{PrivateKey, PublicKey, ALGO};
 use crate::transport::Transport;
 use crate::wire::{msg, Reader, Writer};
@@ -20,8 +21,9 @@ const SERVICE_CONNECTION: &str = "ssh-connection";
 const MAX_ATTEMPTS: u32 = 16;
 
 /// The bytes an authentication signature covers: the session identifier,
-/// then the USERAUTH_REQUEST fields up to and including the public key.
-fn signed_span(session_id: &[u8], user: &str, pubkey_blob: &[u8]) -> Vec<u8> {
+/// then the USERAUTH_REQUEST fields up to and including the public-key blob
+/// (a plain key or a certificate, named by `algo`).
+fn signed_span(session_id: &[u8], user: &str, algo: &str, pubkey_blob: &[u8]) -> Vec<u8> {
     let mut w = Writer::new();
     w.string(session_id);
     w.byte(msg::USERAUTH_REQUEST);
@@ -29,19 +31,21 @@ fn signed_span(session_id: &[u8], user: &str, pubkey_blob: &[u8]) -> Vec<u8> {
     w.utf8(SERVICE_CONNECTION);
     w.utf8("publickey");
     w.boolean(true);
-    w.utf8(ALGO);
+    w.utf8(algo);
     w.string(pubkey_blob);
     w.into_bytes()
 }
 
 // ------------------------------------------------------------- client ---
 
-/// Authenticate as `user` with `key`. Banner text, if the server sends
-/// any, is handed to `on_banner`.
+/// Authenticate as `user` with `key`. If `cert` (a certificate blob whose
+/// key is `key`) is given, present the certificate instead of the bare
+/// key. Banner text, if the server sends any, is handed to `on_banner`.
 pub async fn client<S>(
     t: &mut Transport<S>,
     user: &str,
     key: &PrivateKey,
+    cert: Option<&[u8]>,
     mut on_banner: impl FnMut(&str),
 ) -> Result<()>
 where
@@ -58,18 +62,23 @@ where
         return Err(Error::proto("expected SERVICE_ACCEPT ssh-userauth"));
     }
 
-    // One key, one attempt, signature included up front. The PK_OK probe
-    // round-trip exists for clients juggling many keys; we are not one.
-    let blob = key.public().to_blob();
-    let sig = key.sign(&signed_span(t.session_id(), user, &blob));
+    // Present a certificate when we have one, otherwise the bare key. Either
+    // way the signature is made with the user private key. One attempt,
+    // signature up front — the PK_OK probe is for clients juggling many keys.
+    let key_blob = key.public().to_blob();
+    let (algo, blob): (&str, &[u8]) = match cert {
+        Some(c) => (CERT_ALGO, c),
+        None => (ALGO, &key_blob),
+    };
+    let sig = key.sign(&signed_span(t.session_id(), user, algo, blob));
     let mut w = Writer::new();
     w.byte(msg::USERAUTH_REQUEST);
     w.utf8(user);
     w.utf8(SERVICE_CONNECTION);
     w.utf8("publickey");
     w.boolean(true);
-    w.utf8(ALGO);
-    w.string(&blob);
+    w.utf8(algo);
+    w.string(blob);
     w.string(&sig);
     t.send(&w.into_bytes()).await?;
 
@@ -101,17 +110,21 @@ where
 pub struct Policy {
     /// Required username; `None` accepts any name (the key still decides).
     pub user: Option<String>,
-    /// Keys that may authenticate.
+    /// Keys that may authenticate directly.
     pub keys: Vec<PublicKey>,
+    /// Certificate authorities whose user certificates are trusted.
+    pub trusted_cas: Vec<PublicKey>,
     /// Optional banner shown before authentication.
     pub banner: Option<String>,
 }
 
+fn same_key(a: &PublicKey, b: &PublicKey) -> bool {
+    a.0.as_bytes().ct_eq(b.0.as_bytes()).unwrap_u8() == 1
+}
+
 impl Policy {
     fn key_authorized(&self, key: &PublicKey) -> bool {
-        self.keys
-            .iter()
-            .any(|k| k.0.as_bytes().ct_eq(key.0.as_bytes()).unwrap_u8() == 1)
+        self.keys.iter().any(|k| same_key(k, key))
     }
 
     fn user_allowed(&self, user: &str) -> bool {
@@ -119,6 +132,35 @@ impl Policy {
             Some(u) => u == user,
             None => true,
         }
+    }
+
+    /// Validate a presented certificate for `user` and, if it checks out,
+    /// return the certified key to verify the userauth signature against.
+    fn authorize_cert(&self, blob: &[u8], user: &str) -> Option<PublicKey> {
+        let cert = match Certificate::parse_and_verify(blob) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::info!("rejecting certificate: {e}");
+                return None;
+            }
+        };
+        if cert.cert_type != CERT_TYPE_USER {
+            tracing::info!("rejecting non-user certificate (type {})", cert.cert_type);
+            return None;
+        }
+        if !self.trusted_cas.iter().any(|ca| same_key(ca, &cert.ca_key)) {
+            tracing::info!(key_id = %cert.key_id, "certificate CA is not trusted");
+            return None;
+        }
+        if !cert.valid_at(cert::now_secs()) {
+            tracing::info!(key_id = %cert.key_id, "certificate is expired or not yet valid");
+            return None;
+        }
+        if !cert.permits_principal(user) {
+            tracing::info!(key_id = %cert.key_id, %user, "certificate does not list this principal");
+            return None;
+        }
+        Some(cert.key)
     }
 }
 
@@ -170,15 +212,23 @@ where
         let algo = r.utf8()?.to_owned();
         let blob = r.string()?.to_vec();
 
-        let acceptable = algo == ALGO
-            && policy.user_allowed(&user)
-            && PublicKey::from_blob(&blob)
-                .map(|k| policy.key_authorized(&k))
-                .unwrap_or(false);
-        if !acceptable {
+        // Derive the key whose signature we must verify: the presented key
+        // itself (plain publickey) or the key certified by a trusted CA.
+        let verify_key = if !policy.user_allowed(&user) {
+            None
+        } else if algo == ALGO {
+            PublicKey::from_blob(&blob)
+                .ok()
+                .filter(|k| policy.key_authorized(k))
+        } else if algo == CERT_ALGO {
+            policy.authorize_cert(&blob, &user)
+        } else {
+            None
+        };
+        let Some(verify_key) = verify_key else {
             reject(t).await?;
             continue;
-        }
+        };
 
         if !has_sig {
             // The client is asking "would this key be worth signing with?"
@@ -193,9 +243,8 @@ where
 
         let sig = r.string()?.to_vec();
         r.finish()?;
-        let key = PublicKey::from_blob(&blob)?;
-        let span = signed_span(t.session_id(), &user, &blob);
-        if key.verify(&span, &sig).is_err() {
+        let span = signed_span(t.session_id(), &user, &algo, &blob);
+        if verify_key.verify(&span, &sig).is_err() {
             reject(t).await?;
             continue;
         }
@@ -239,7 +288,7 @@ mod tests {
                 },
             )
             .await?;
-            client(&mut t, user, client_key, |_| {}).await
+            client(&mut t, user, client_key, None, |_| {}).await
         };
         let server_side = async move {
             let mut t = Transport::server(b, ServerConfig { host_key }).await?;
@@ -254,6 +303,7 @@ mod tests {
         let policy = Policy {
             user: Some("river".into()),
             keys: vec![key.public()],
+            trusted_cas: vec![],
             banner: Some("welcome to the test rig".into()),
         };
         let (c, s) = authed_pair(&key, policy, "river").await;
@@ -267,6 +317,7 @@ mod tests {
         let policy = Policy {
             user: None,
             keys: vec![PrivateKey::generate().public()], // someone else's
+            trusted_cas: vec![],
             banner: None,
         };
         let (c, s) = authed_pair(&key, policy, "river").await;
@@ -280,9 +331,112 @@ mod tests {
         let policy = Policy {
             user: Some("river".into()),
             keys: vec![key.public()],
+            trusted_cas: vec![],
             banner: None,
         };
         let (c, _s) = authed_pair(&key, policy, "mallory").await;
+        assert!(matches!(c, Err(Error::Auth(_))));
+    }
+
+    /// Authenticate with a CA-signed certificate instead of a listed key.
+    async fn cert_authed(
+        client_key: &PrivateKey,
+        cert: Option<Vec<u8>>,
+        policy: Policy,
+        user: &str,
+    ) -> (Result<()>, Result<String>) {
+        let (a, b) = duplex(1 << 20);
+        let host_key = PrivateKey::generate();
+        let user = user.to_owned();
+        let client_key = client_key.clone();
+        let client_side = async move {
+            let mut t = Transport::client(
+                a,
+                ClientConfig {
+                    verify_host_key: Box::new(|_| Ok(())),
+                },
+            )
+            .await?;
+            client(&mut t, &user, &client_key, cert.as_deref(), |_| {}).await
+        };
+        let server_side = async move {
+            let mut t = Transport::server(b, ServerConfig { host_key }).await?;
+            server(&mut t, &policy).await
+        };
+        tokio::join!(client_side, server_side)
+    }
+
+    #[tokio::test]
+    async fn trusted_certificate_succeeds() {
+        let ca = PrivateKey::generate();
+        let user_key = PrivateKey::generate();
+        let cert = cert::sign_user_cert(
+            &ca,
+            &user_key.public(),
+            1,
+            "id",
+            &["river".into()],
+            0,
+            u64::MAX,
+        );
+        let policy = Policy {
+            user: Some("river".into()),
+            keys: vec![], // no listed keys — the CA is the only trust
+            trusted_cas: vec![ca.public()],
+            banner: None,
+        };
+        let (c, s) = cert_authed(&user_key, Some(cert), policy, "river").await;
+        c.unwrap();
+        assert_eq!(s.unwrap(), "river");
+    }
+
+    #[tokio::test]
+    async fn certificate_from_untrusted_ca_fails() {
+        let real_ca = PrivateKey::generate();
+        let other_ca = PrivateKey::generate();
+        let user_key = PrivateKey::generate();
+        let cert =
+            cert::sign_user_cert(&real_ca, &user_key.public(), 1, "id", &["river".into()], 0, u64::MAX);
+        let policy = Policy {
+            user: Some("river".into()),
+            keys: vec![],
+            trusted_cas: vec![other_ca.public()], // trusts a different CA
+            banner: None,
+        };
+        let (c, _s) = cert_authed(&user_key, Some(cert), policy, "river").await;
+        assert!(matches!(c, Err(Error::Auth(_))));
+    }
+
+    #[tokio::test]
+    async fn certificate_wrong_principal_fails() {
+        let ca = PrivateKey::generate();
+        let user_key = PrivateKey::generate();
+        let cert =
+            cert::sign_user_cert(&ca, &user_key.public(), 1, "id", &["river".into()], 0, u64::MAX);
+        let policy = Policy {
+            user: None, // server accepts any username; the cert must gate it
+            keys: vec![],
+            trusted_cas: vec![ca.public()],
+            banner: None,
+        };
+        // Logs in as "mallory", who is not a listed principal.
+        let (c, _s) = cert_authed(&user_key, Some(cert), policy, "mallory").await;
+        assert!(matches!(c, Err(Error::Auth(_))));
+    }
+
+    #[tokio::test]
+    async fn expired_certificate_fails() {
+        let ca = PrivateKey::generate();
+        let user_key = PrivateKey::generate();
+        // Valid window entirely in the past.
+        let cert = cert::sign_user_cert(&ca, &user_key.public(), 1, "id", &["river".into()], 0, 100);
+        let policy = Policy {
+            user: Some("river".into()),
+            keys: vec![],
+            trusted_cas: vec![ca.public()],
+            banner: None,
+        };
+        let (c, _s) = cert_authed(&user_key, Some(cert), policy, "river").await;
         assert!(matches!(c, Err(Error::Auth(_))));
     }
 }

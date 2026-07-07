@@ -29,6 +29,12 @@ struct Args {
     #[arg(long, default_value_os_t = default_path("authorized_keys"))]
     authorized_keys: PathBuf,
 
+    /// Trusted user-CA public keys, one per line. Any Ed25519 user
+    /// certificate signed by one of these is accepted (subject to its
+    /// validity window and principals). Optional.
+    #[arg(long, default_value_os_t = default_path("trusted_user_ca_keys"))]
+    trusted_ca_keys: PathBuf,
+
     /// Username clients must present. Defaults to the current user;
     /// `--user '*'` accepts any name (keys still gate access).
     #[arg(long)]
@@ -102,13 +108,22 @@ async fn main() -> std::io::Result<()> {
             Vec::new()
         }
     };
-    if keys.is_empty() {
+    let trusted_cas = match std::fs::read_to_string(&args.trusted_ca_keys) {
+        Ok(text) => keyfile::parse_authorized_keys(&text),
+        Err(_) => Vec::new(),
+    };
+    if keys.is_empty() && trusted_cas.is_empty() {
         tracing::warn!(
-            "no authorized keys loaded from {} — nobody can log in",
-            args.authorized_keys.display()
+            "no authorized keys ({}) and no trusted CAs ({}) — nobody can log in",
+            args.authorized_keys.display(),
+            args.trusted_ca_keys.display(),
         );
     } else {
-        tracing::info!("{} authorized key(s) loaded", keys.len());
+        tracing::info!(
+            "{} authorized key(s), {} trusted CA(s) loaded",
+            keys.len(),
+            trusted_cas.len()
+        );
     }
 
     let user = match args.user {
@@ -157,6 +172,7 @@ async fn main() -> std::io::Result<()> {
         let policy = auth::Policy {
             user: user.clone(),
             keys: keys.clone(),
+            trusted_cas: trusted_cas.clone(),
             banner: args.banner.clone(),
         };
         let permit_open = args.permit_open.clone();

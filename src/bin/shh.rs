@@ -33,6 +33,10 @@ struct Args {
     #[arg(short = 'i', long)]
     identity: Option<PathBuf>,
 
+    /// Certificate to present (default: `<identity>-cert.pub` if present).
+    #[arg(long)]
+    certificate: Option<PathBuf>,
+
     /// Login name (overrides `user@`).
     #[arg(short = 'l', long)]
     login: Option<String>,
@@ -201,6 +205,30 @@ fn load_identity(text: &str, path: &std::path::Path) -> Result<shh::crypto::ed25
     Err("too many passphrase attempts".into())
 }
 
+/// Load a certificate blob: from `explicit` if given, else from
+/// `<identity>-cert.pub` if it happens to exist. Absent is not an error.
+fn load_certificate(
+    explicit: Option<&PathBuf>,
+    identity: &std::path::Path,
+) -> Result<Option<Vec<u8>>, String> {
+    let path = match explicit {
+        Some(p) => p.clone(),
+        None => {
+            let mut p = identity.as_os_str().to_owned();
+            p.push("-cert.pub");
+            let p = PathBuf::from(p);
+            if !p.exists() {
+                return Ok(None);
+            }
+            p
+        }
+    };
+    let line = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let blob = keyfile::decode_cert(line.trim()).map_err(|e| format!("{}: {e}", path.display()))?;
+    eprintln!("shh: presenting certificate {}", path.display());
+    Ok(Some(blob))
+}
+
 async fn run(args: Args) -> Result<i32, String> {
     let (user_at, host) = match args.dest.split_once('@') {
         Some((u, h)) => (Some(u.to_string()), h.to_string()),
@@ -232,6 +260,10 @@ async fn run(args: Args) -> Result<i32, String> {
         .map_err(|e| format!("{}: {e}", identity.display()))?;
     let key = load_identity(&text, &identity)?;
 
+    // Present a certificate if one sits next to the key (OpenSSH convention:
+    // `<identity>-cert.pub`). An explicit --certificate overrides.
+    let cert = load_certificate(args.certificate.as_ref(), &identity)?;
+
     let label = keyfile::host_label(&host, args.port);
     let known_hosts = args.known_hosts.clone();
     let accept_new = args.accept_new;
@@ -248,7 +280,7 @@ async fn run(args: Args) -> Result<i32, String> {
         .await
         .map_err(|e| e.to_string())?;
 
-    auth::client(&mut t, &user, &key, |banner| eprint!("{banner}"))
+    auth::client(&mut t, &user, &key, cert.as_deref(), |banner| eprint!("{banner}"))
         .await
         .map_err(|e| e.to_string())?;
 

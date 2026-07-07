@@ -4,6 +4,7 @@
 //! way to add an algorithm without editing this module. The negotiable
 //! surface is: two key exchanges, one signature scheme, two AEAD ciphers.
 
+pub mod cert;
 pub mod cipher;
 pub mod ed25519;
 pub mod kdf;

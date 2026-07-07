@@ -150,6 +150,9 @@ shh/                 one library crate
    issues them (`-H` for host certs), `shhd --trusted-ca-keys` / `shh
    --trusted-cas` trust user CAs, `shhd --host-cert` presents a host cert,
    and `shh` verifies it against `@cert-authority` / `--host-ca` CAs instead
-   of TOFU. Interoperable with `ssh-keygen` / OpenSSH both ways. Remaining:
-   keep-alives, `sk-ssh-ed25519` FIDO2 keys, agent protocol, hardened
-   privilege separation in `shhd`.
+   of TOFU. Interoperable with `ssh-keygen` / OpenSSH both ways.
+5. **Keep-alives (done).** Both sides send `keepalive@openssh.com` global
+   requests after a configurable idle interval and drop a peer that leaves
+   several unanswered, keeping NAT state warm and surfacing dead
+   connections instead of hanging. Remaining: `sk-ssh-ed25519` FIDO2 keys,
+   agent protocol, hardened privilege separation in `shhd`.

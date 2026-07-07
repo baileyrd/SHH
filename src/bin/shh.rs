@@ -77,6 +77,14 @@ struct Args {
     /// Do not run a remote command; hold the connection open (for -L / -R).
     #[arg(short = 'N', long = "no-command")]
     no_command: bool,
+
+    /// Seconds of silence before sending a keepalive probe (0 disables).
+    #[arg(long, default_value_t = 30)]
+    keepalive_interval: u64,
+
+    /// Unanswered keepalives before declaring the connection dead.
+    #[arg(long, default_value_t = 3)]
+    keepalive_count: u32,
 }
 
 fn default_path(name: &str) -> PathBuf {
@@ -305,7 +313,10 @@ async fn run(args: Args) -> Result<i32, String> {
 
     // One multiplexed connection carries the session (unless -N) and every
     // -L forward, concurrently.
-    let conn = connect::mux::Connection::new(t, connect::forward::Policy::DenyAll);
+    let conn = connect::mux::Connection::new(t, connect::forward::Policy::DenyAll).keepalive(
+        std::time::Duration::from_secs(args.keepalive_interval),
+        args.keepalive_count,
+    );
     let handle = conn.handle();
     for spec in &forwards {
         let listener = tokio::net::TcpListener::bind(&spec.bind)

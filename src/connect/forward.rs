@@ -128,6 +128,14 @@ pub(crate) async fn forward_task<IO>(
                         let _ = wr.shutdown().await;
                     }
                     ToTask::Close => break,
+                    // A forwarded stream has no stderr and grants no
+                    // channel requests.
+                    ToTask::Request { want_reply, .. } => {
+                        if want_reply {
+                            let _ = cmd_tx.send(Cmd::RequestReply { id, success: false });
+                        }
+                    }
+                    ToTask::ExtData(..) | ToTask::RequestReply(_) => {}
                 }
             }
         }

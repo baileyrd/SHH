@@ -129,8 +129,9 @@ shh/                 one library crate
    compatible in both directions).
 3. **Port forwarding (done).** `direct-tcpip` local (`-L`) forwarding
    through a channel multiplexer, with a default-deny server allowlist
-   (`--permit-open`) rather than RFC 4254's open-by-default posture. A
-   connection runs either a session or forwarding, chosen by the first
-   channel opened; unifying the two, and remote (`-R`) forwarding, remain.
+   (`--permit-open`) rather than RFC 4254's open-by-default posture.
+   Sessions and forwards are both multiplexer channels, so any mix of them
+   rides one connection — a foreground session tears everything down on
+   exit, matching OpenSSH. Remote (`-R`) forwarding remains.
 4. Keep-alives, `sk-ssh-ed25519` FIDO2 keys, certificates, agent protocol,
    hardened privilege separation in `shhd`.

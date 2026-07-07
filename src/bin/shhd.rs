@@ -1,0 +1,159 @@
+//! shhd — the SHH server.
+//!
+//! Serves session channels (exec/shell) to holders of authorized Ed25519
+//! keys. Runs as the invoking user with no privilege separation yet, so
+//! point it at a dedicated account or a container if exposing it beyond
+//! localhost.
+
+use std::path::PathBuf;
+
+use clap::Parser;
+use tokio::net::TcpListener;
+
+use shh::crypto::{ed25519::PrivateKey, keyfile};
+use shh::transport::{ServerConfig, Transport};
+use shh::{auth, connect};
+
+#[derive(Parser)]
+#[command(name = "shhd", about = "SHH server: modern SSH, nothing legacy")]
+struct Args {
+    /// Address to listen on.
+    #[arg(short = 'L', long, default_value = "127.0.0.1:2222")]
+    listen: String,
+
+    /// Host key file; generated on first run if absent.
+    #[arg(long, default_value_os_t = default_path("host_key"))]
+    host_key: PathBuf,
+
+    /// authorized_keys file (standard format; Ed25519 lines count).
+    #[arg(long, default_value_os_t = default_path("authorized_keys"))]
+    authorized_keys: PathBuf,
+
+    /// Username clients must present. Defaults to the current user;
+    /// `--user '*'` accepts any name (keys still gate access).
+    #[arg(long)]
+    user: Option<String>,
+
+    /// Banner text shown to clients before authentication.
+    #[arg(long)]
+    banner: Option<String>,
+}
+
+fn default_path(name: &str) -> PathBuf {
+    let home = std::env::var_os("HOME").unwrap_or_else(|| ".".into());
+    PathBuf::from(home).join(".shh").join(name)
+}
+
+fn load_or_create_host_key(path: &PathBuf) -> std::io::Result<PrivateKey> {
+    if path.exists() {
+        let text = std::fs::read_to_string(path)?;
+        let (key, _) = keyfile::decode_private(&text)
+            .map_err(|e| std::io::Error::other(format!("{}: {e}", path.display())))?;
+        return Ok(key);
+    }
+    let key = PrivateKey::generate();
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)?;
+    }
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path)?;
+    f.write_all(keyfile::encode_private(&key, "shhd host key").as_bytes())?;
+    tracing::info!("generated host key at {}", path.display());
+    Ok(key)
+}
+
+#[tokio::main]
+async fn main() -> std::io::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info".into()),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+    let args = Args::parse();
+
+    let host_key = load_or_create_host_key(&args.host_key)?;
+    tracing::info!("host key fingerprint: {}", host_key.public().fingerprint());
+
+    let keys = match std::fs::read_to_string(&args.authorized_keys) {
+        Ok(text) => keyfile::parse_authorized_keys(&text),
+        Err(e) => {
+            tracing::warn!("{}: {e}", args.authorized_keys.display());
+            Vec::new()
+        }
+    };
+    if keys.is_empty() {
+        tracing::warn!(
+            "no authorized keys loaded from {} — nobody can log in",
+            args.authorized_keys.display()
+        );
+    } else {
+        tracing::info!("{} authorized key(s) loaded", keys.len());
+    }
+
+    let user = match args.user {
+        Some(u) if u == "*" => None,
+        Some(u) if u.is_empty() => {
+            eprintln!("shhd: --user must not be empty (use '*' to accept any name)");
+            std::process::exit(2);
+        }
+        Some(u) => Some(u),
+        None => Some(
+            std::env::var("USER")
+                .or_else(|_| std::env::var("LOGNAME"))
+                .unwrap_or_else(|_| "root".into()),
+        ),
+    };
+    match &user {
+        Some(u) => tracing::info!("accepting logins for user {u:?}"),
+        None => tracing::info!("accepting any username (keys still gate access)"),
+    }
+
+    let listener = TcpListener::bind(&args.listen).await?;
+    tracing::info!("listening on {}", args.listen);
+
+    loop {
+        let (socket, addr) = listener.accept().await?;
+        socket.set_nodelay(true).ok();
+        let host_key = host_key.clone();
+        let policy = auth::Policy {
+            user: user.clone(),
+            keys: keys.clone(),
+            banner: args.banner.clone(),
+        };
+        tokio::spawn(async move {
+            let config = ServerConfig { host_key };
+            let mut t = match Transport::server(socket, config).await {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::info!(%addr, "handshake failed: {e}");
+                    return;
+                }
+            };
+            let user = match auth::server(&mut t, &policy).await {
+                Ok(u) => u,
+                Err(e) => {
+                    tracing::info!(%addr, "authentication failed: {e}");
+                    t.bail(&e).await;
+                    return;
+                }
+            };
+            tracing::info!(%addr, %user, "session started");
+            match connect::server_session(&mut t).await {
+                Ok(()) => tracing::info!(%addr, %user, "session ended"),
+                Err(e) => {
+                    tracing::info!(%addr, %user, "session error: {e}");
+                    t.bail(&e).await;
+                }
+            }
+        });
+    }
+}

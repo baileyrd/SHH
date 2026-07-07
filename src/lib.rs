@@ -9,6 +9,8 @@ pub mod auth;
 pub mod connect;
 pub mod crypto;
 pub mod transport;
+#[cfg(unix)]
+pub mod tty;
 pub mod wire;
 
 /// Protocol version string sent during the identification exchange

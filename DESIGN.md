@@ -119,9 +119,12 @@ shh/                 one library crate
 
 ## Milestones
 
-1. **End to end (this milestone).** `shh user@host cmd` against `shhd`:
+1. **End to end (done).** `shh user@host cmd` against `shhd`:
    version exchange → hybrid PQ KEX → Ed25519 host key verify → publickey
    auth → exec, stdout/stderr/exit-status back. Known-hosts pinning (TOFU).
-2. Interactive sessions (PTY), window change, signals.
+2. **Interactive sessions (done).** PTY allocation with controlling
+   terminal, raw client mode, window-change on SIGWINCH, and
+   passphrase-protected key files (bcrypt + AES-256-CTR, `ssh-keygen`
+   compatible in both directions).
 3. `direct-tcpip` forwarding with allowlists; keep-alives; `sk-ssh-ed25519`.
 4. Certificates, agent protocol, hardened privilege separation in `shhd`.

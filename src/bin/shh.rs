@@ -45,6 +45,14 @@ struct Args {
     /// Trust and record an unseen host key without prompting.
     #[arg(long)]
     accept_new: bool,
+
+    /// Force a pseudo-terminal (default: only for an interactive shell).
+    #[arg(short = 't', long)]
+    tty: bool,
+
+    /// Never allocate a pseudo-terminal.
+    #[arg(short = 'T', long, conflicts_with = "tty")]
+    no_tty: bool,
 }
 
 fn default_path(name: &str) -> PathBuf {
@@ -154,6 +162,31 @@ fn verify_host_key(
     }
 }
 
+/// Decode the identity file, prompting for its passphrase when protected.
+fn load_identity(text: &str, path: &std::path::Path) -> Result<shh::crypto::ed25519::PrivateKey, String> {
+    let protected = keyfile::needs_passphrase(text).map_err(|e| format!("{}: {e}", path.display()))?;
+    if !protected {
+        return keyfile::decode_private(text)
+            .map(|(k, _)| k)
+            .map_err(|e| format!("{}: {e}", path.display()));
+    }
+    for _ in 0..3 {
+        let pass = shh::tty::read_passphrase(&format!(
+            "Enter passphrase for {}: ",
+            path.display()
+        ))
+        .map_err(|e| format!("cannot prompt for passphrase: {e}"))?;
+        match keyfile::decode_private_protected(text, Some(&pass)) {
+            Ok((k, _)) => return Ok(k),
+            Err(e) if e.to_string().contains("wrong passphrase") => {
+                eprintln!("shh: wrong passphrase, try again");
+            }
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        }
+    }
+    Err("too many passphrase attempts".into())
+}
+
 async fn run(args: Args) -> Result<i32, String> {
     let (user_at, host) = match args.dest.split_once('@') {
         Some((u, h)) => (Some(u.to_string()), h.to_string()),
@@ -168,8 +201,7 @@ async fn run(args: Args) -> Result<i32, String> {
     let identity = find_identity(args.identity)?;
     let text = std::fs::read_to_string(&identity)
         .map_err(|e| format!("{}: {e}", identity.display()))?;
-    let (key, _) =
-        keyfile::decode_private(&text).map_err(|e| format!("{}: {e}", identity.display()))?;
+    let key = load_identity(&text, &identity)?;
 
     let label = keyfile::host_label(&host, args.port);
     let known_hosts = args.known_hosts.clone();
@@ -197,9 +229,47 @@ async fn run(args: Args) -> Result<i32, String> {
         Some(args.command.join(" "))
     };
 
+    // A pty when forced with -t, or by default for an interactive shell.
+    let want_tty = !args.no_tty
+        && (args.tty || (command.is_none() && std::io::stdin().is_terminal()));
+    let (pty_req, resize_rx, _raw) = if want_tty {
+        let (cols, rows, xpix, ypix) = shh::tty::winsize().unwrap_or((80, 24, 0, 0));
+        let req = connect::PtyRequest {
+            term: std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into()),
+            cols,
+            rows,
+            xpix,
+            ypix,
+        };
+        // SIGWINCH → window-change requests.
+        let (tx, rx) = tokio::sync::mpsc::channel::<connect::WindowChange>(4);
+        tokio::spawn(async move {
+            let Ok(mut winch) =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
+            else {
+                return;
+            };
+            while winch.recv().await.is_some() {
+                if let Some(ws) = shh::tty::winsize() {
+                    if tx.send(ws).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        // Raw mode for the duration of the session; restored on drop.
+        let raw = shh::tty::RawMode::enable()
+            .map_err(|e| format!("cannot set raw terminal mode: {e}"))?;
+        (Some(req), Some(rx), raw)
+    } else {
+        (None, None, None)
+    };
+
     let status = connect::client_session(
         &mut t,
         command.as_deref(),
+        pty_req.as_ref(),
+        resize_rx,
         tokio::io::stdin(),
         tokio::io::stdout(),
         tokio::io::stderr(),

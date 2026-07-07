@@ -40,8 +40,13 @@ $ shh -p 2222 you@127.0.0.1 'uname -a'
 
 `shh host cmd` behaves like `ssh`: stdin is forwarded, stdout/stderr come
 back separated, and the remote exit status becomes `shh`'s exit status.
+`shh host` with a terminal opens an interactive shell on a real
+pseudo-terminal (raw mode locally, `TERM` and window size propagated,
+resizes forwarded); `-t` forces a pty for commands, `-T` disables it.
 Host keys are pinned in `~/.shh/known_hosts` — first contact prompts on the
 terminal (or use `--accept-new`), and a changed key is a hard error.
+Keys may be passphrase-protected (`shh-keygen -N`, prompted otherwise);
+the format matches `ssh-keygen` (bcrypt + AES-256-CTR).
 
 ## Interoperability
 
@@ -55,9 +60,10 @@ readable (unencrypted keys for now).
 
 ## Status
 
-Milestone 1: transport, auth, and exec sessions are complete and tested
-(`cargo test`). Not yet implemented: PTY/interactive terminals, TCP
-forwarding (planned with an explicit allowlist model), FIDO2 `sk-ssh-ed25519`
-keys, certificates, encrypted key files, sshd-style privilege separation.
+Milestones 1–2: transport, auth, exec sessions, interactive PTY sessions
+(pty-req, window-change, controlling terminal), and encrypted key files
+are complete and tested (`cargo test`). Not yet implemented: TCP
+forwarding (planned with an explicit allowlist model), FIDO2
+`sk-ssh-ed25519` keys, certificates, sshd-style privilege separation.
 Treat it as a working protocol implementation, not a hardened production
 daemon.

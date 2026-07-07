@@ -51,28 +51,35 @@ the format matches `ssh-keygen` (bcrypt + AES-256-CTR).
 ### Port forwarding
 
 Local (`-L`) forwarding tunnels a local port to a target reachable from the
-server. It runs alongside a session on the same connection, or on its own
-with `-N`:
+server; remote (`-R`) forwarding is the reverse — the server listens and
+forwards connections back to a target reachable from the client. Either
+runs alongside a session on the same connection, or on its own with `-N`:
 
 ```console
-# a dedicated tunnel (no remote command)
+# local: localhost:8080 -> db:5432 (reachable from the server)
 $ shh -N -L 8080:db.internal:5432 you@gateway
+
+# remote: gateway:9000 -> localhost:3000 (reachable from here)
+$ shh -N -R 9000:localhost:3000 you@gateway
 
 # a session and a tunnel over one connection, like OpenSSH
 $ shh -L 8080:db.internal:5432 you@gateway 'tail -f /var/log/app.log'
 ```
 
-The server refuses forwarding by default; an operator opts targets in
-explicitly (the opposite of OpenSSH's default-open posture):
+The server refuses forwarding by default; an operator opts in explicitly
+(the opposite of OpenSSH's default-open posture) — `--permit-open` for `-L`
+targets, `--permit-listen` for `-R` binds:
 
 ```console
-$ shhd -L 0.0.0.0:2222 --permit-open db.internal:5432 --permit-open 127.0.0.1:*
-# or --permit-open any to allow everything (trusted networks only)
+$ shhd -L 0.0.0.0:2222 \
+       --permit-open db.internal:5432 --permit-open 127.0.0.1:* \
+       --permit-listen 127.0.0.1:9000
+# `any` on either flag allows everything (trusted networks only)
 ```
 
-Interoperates with OpenSSH both ways (`ssh -L … host cmd` through `shhd`,
-`shh -L … host cmd` through `sshd`), session and forwards multiplexed on
-one connection. Remote (`-R`) forwarding is not yet supported.
+Interoperates with OpenSSH both ways for `-L` and `-R` (`ssh -L/-R … host`
+through `shhd`, `shh -L/-R … host` through `sshd`), sessions and forwards
+multiplexed on one connection.
 
 ## Interoperability
 
@@ -87,10 +94,10 @@ readable (unencrypted keys for now).
 ## Status
 
 Transport, auth, exec sessions, interactive PTY sessions (pty-req,
-window-change, controlling terminal), encrypted key files, and
-`direct-tcpip` local (`-L`) port forwarding with a server-side allowlist —
-all multiplexed so a session and any number of forwards share one
-connection — are complete and tested (`cargo test`). Not yet implemented:
-remote (`-R`) forwarding, FIDO2 `sk-ssh-ed25519` keys, certificates,
-sshd-style privilege separation. Treat it as a working protocol
-implementation, not a hardened production daemon.
+window-change, controlling terminal), encrypted key files, and local
+(`-L`) and remote (`-R`) TCP forwarding with server-side allowlists — all
+multiplexed so a session and any number of forwards share one connection —
+are complete and tested (`cargo test`). Not yet implemented: FIDO2
+`sk-ssh-ed25519` keys, certificates, sshd-style privilege separation.
+Treat it as a working protocol implementation, not a hardened production
+daemon.

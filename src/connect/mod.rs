@@ -24,7 +24,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::sync::mpsc;
 
 use crate::transport::Transport;
-use crate::wire::{msg, Reader, Writer};
+use crate::wire::{msg, Writer};
 use crate::{Error, Result};
 
 /// Receive window we grant the peer, and the largest data chunk we send.
@@ -109,21 +109,6 @@ pub(crate) fn window_adjust(peer: u32, add: u32) -> Vec<u8> {
 
 pub(crate) fn simple(byte: u8, peer: u32) -> Vec<u8> {
     chan(byte, peer).into_bytes()
-}
-
-/// Reply to a GLOBAL_REQUEST we don't serve (they're all optional
-/// extensions; OpenSSH sends `hostkeys-00@openssh.com` routinely).
-pub(crate) async fn refuse_global_request<S>(t: &mut Transport<S>, payload: &[u8]) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send,
-{
-    let mut r = Reader::new(payload);
-    r.byte()?;
-    let _name = r.utf8()?;
-    if r.boolean()? {
-        t.send(&[msg::REQUEST_FAILURE]).await?;
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------- session convenience --

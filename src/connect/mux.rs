@@ -1329,6 +1329,7 @@ mod tests {
         let (exit_tx, exit_rx) = oneshot::channel();
         handle.open_session(SessionSpec {
             command: Some("head -c 5".into()),
+            subsystem: None,
             pty: None,
             resize: None,
             stdin: Box::new(&b"hello world"[..]),
@@ -1508,6 +1509,7 @@ mod tests {
         let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
         handle.open_session(SessionSpec {
             command: Some(r#"printf '%s\n' "$SSH_AUTH_SOCK"; sleep 30"#.into()),
+            subsystem: None,
             pty: None,
             resize: None,
             stdin: Box::new(tokio::io::empty()),

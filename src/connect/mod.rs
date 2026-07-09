@@ -176,6 +176,7 @@ where
     let (tx, rx) = oneshot::channel();
     handle.open_session(session::SessionSpec {
         command: command.map(str::to_owned),
+        subsystem: None,
         pty: pty.cloned(),
         resize,
         stdin: Box::new(stdin),
@@ -188,6 +189,51 @@ where
     conn.run(None).await?;
     rx.await
         .map_err(|_| Error::Channel("session ended without an exit status".into()))
+}
+
+/// A subsystem channel on a fresh connection: byte streams to write requests
+/// to and read replies from, plus the connection task pumping them. Drop the
+/// whole thing to close the channel, then await `conn` for the final result.
+pub struct SubsystemChannel {
+    pub reader: tokio::io::DuplexStream,
+    pub writer: tokio::io::DuplexStream,
+    pub conn: tokio::task::JoinHandle<Result<()>>,
+}
+
+/// Open a session channel, request the named `subsystem` (e.g. `sftp`), and
+/// return byte streams to talk to it over. Consumes the transport like
+/// [`client_session`]: the connection runs in a spawned task until the
+/// subsystem channel closes.
+pub async fn client_subsystem<S>(t: Transport<S>, subsystem: &str) -> Result<SubsystemChannel>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let conn = mux::Connection::new(t, forward::Policy::DenyAll);
+    let handle = conn.handle();
+    // Two pipes: we write requests into `to_srv_ours` (the session reads its
+    // twin as stdin); the session writes replies into `from_srv_theirs` and we
+    // read them from its twin.
+    let (to_srv_ours, to_srv_theirs) = tokio::io::duplex(1 << 16);
+    let (from_srv_theirs, from_srv_ours) = tokio::io::duplex(1 << 16);
+    let (exit_tx, _exit_rx) = oneshot::channel();
+    handle.open_session(session::SessionSpec {
+        command: None,
+        subsystem: Some(subsystem.to_owned()),
+        pty: None,
+        resize: None,
+        stdin: Box::new(to_srv_theirs),
+        stdout: Box::new(from_srv_theirs),
+        stderr: Box::new(tokio::io::sink()),
+        exit: exit_tx,
+        forward_agent: false,
+        end_connection_on_close: true,
+    });
+    let conn = tokio::spawn(async move { conn.run(None).await });
+    Ok(SubsystemChannel {
+        reader: from_srv_ours,
+        writer: to_srv_ours,
+        conn,
+    })
 }
 
 /// Serve a single connection that carries only a session (no forwarding).

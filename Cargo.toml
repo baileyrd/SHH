@@ -58,3 +58,7 @@ path = "src/bin/shh_keygen.rs"
 [[bin]]
 name = "shh-agent"
 path = "src/bin/shh_agent.rs"
+
+[[bin]]
+name = "shh-sftp"
+path = "src/bin/shh_sftp.rs"

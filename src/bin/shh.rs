@@ -4,24 +4,12 @@
 //! server, speaking only the modern subset: hybrid PQ key exchange,
 //! Ed25519 keys, AEAD ciphers, public-key auth.
 
-use std::io::{IsTerminal, Read, Write};
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use clap::Parser;
-use tokio::net::TcpStream;
 
-use shh::crypto::ed25519::{PrivateKey, PublicKey};
-use shh::crypto::keyfile;
-use shh::crypto::sk::SoftwareKey;
-use shh::transport::{ClientConfig, Transport};
-use shh::{auth, connect, Error};
-
-/// How a key-file identity authenticates: a plain Ed25519 key or a security
-/// key, either optionally accompanied by a certificate to present.
-enum FileAuth {
-    Ed25519(PrivateKey, Option<Vec<u8>>),
-    SecurityKey(SoftwareKey, Option<Vec<u8>>),
-}
+use shh::connect;
 
 #[derive(Parser)]
 #[command(name = "shh", about = "SHH client: modern SSH, nothing legacy")]
@@ -110,175 +98,6 @@ fn default_path(name: &str) -> PathBuf {
     PathBuf::from(home).join(".shh").join(name)
 }
 
-fn find_identity(explicit: Option<PathBuf>) -> Result<PathBuf, String> {
-    if let Some(p) = explicit {
-        return Ok(p);
-    }
-    let candidates = [default_path("id_ed25519"), {
-        let home = std::env::var_os("HOME").unwrap_or_else(|| ".".into());
-        PathBuf::from(home).join(".ssh").join("id_ed25519")
-    }];
-    candidates
-        .iter()
-        .find(|p| p.exists())
-        .cloned()
-        .ok_or_else(|| {
-            format!(
-                "no identity found (tried {}); generate one with \
-                 `shh-keygen -f {}`",
-                candidates
-                    .iter()
-                    .map(|p| p.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                candidates[0].display(),
-            )
-        })
-}
-
-/// Ask on the controlling terminal, so piped stdin/stdout stay clean.
-fn ask_tty(prompt: &str) -> bool {
-    let Ok(mut tty) = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/tty")
-    else {
-        return false;
-    };
-    let _ = write!(tty, "{prompt} [yes/no] ");
-    let _ = tty.flush();
-    let mut answer = String::new();
-    let mut byte = [0u8; 1];
-    while tty.read(&mut byte).map(|n| n == 1).unwrap_or(false) && byte[0] != b'\n' {
-        answer.push(byte[0] as char);
-    }
-    answer.trim() == "yes"
-}
-
-/// The trust decision for a presented host key: known-good, first contact
-/// (TOFU), or mismatch.
-fn verify_host_key(
-    key: &PublicKey,
-    label: &str,
-    path: &PathBuf,
-    accept_new: bool,
-) -> shh::Result<()> {
-    let recorded = std::fs::read_to_string(path)
-        .ok()
-        .and_then(|text| keyfile::known_hosts_lookup(&text, label));
-
-    match recorded {
-        Some(known) if &known == key => Ok(()),
-        Some(known) => Err(Error::HostKey(format!(
-            "HOST KEY MISMATCH for {label}!\n\
-             recorded: {}\n\
-             presented: {}\n\
-             Someone could be intercepting this connection. If the host\n\
-             key really changed, remove the old line from {}.",
-            known.fingerprint(),
-            key.fingerprint(),
-            path.display(),
-        ))),
-        None => {
-            let fp = key.fingerprint();
-            let accept = accept_new || {
-                std::io::stderr().is_terminal()
-                    && ask_tty(&format!(
-                        "The authenticity of host '{label}' can't be established.\n\
-                         Ed25519 key fingerprint is {fp}.\n\
-                         Continue connecting?"
-                    ))
-            };
-            if !accept {
-                return Err(Error::HostKey(format!(
-                    "unknown host {label} (fingerprint {fp}); \
-                     rerun with --accept-new to trust it"
-                )));
-            }
-            if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-                std::fs::create_dir_all(dir).ok();
-            }
-            let line = keyfile::known_hosts_line(label, key);
-            let mut f = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .map_err(|e| Error::HostKey(format!("cannot record host key: {e}")))?;
-            f.write_all(line.as_bytes())
-                .map_err(|e| Error::HostKey(format!("cannot record host key: {e}")))?;
-            eprintln!("shh: permanently added '{label}' ({fp}) to {}", path.display());
-            Ok(())
-        }
-    }
-}
-
-/// Decode the identity file (Ed25519 or security key), prompting for its
-/// passphrase when protected.
-fn load_identity(
-    text: &str,
-    path: &std::path::Path,
-) -> Result<keyfile::PrivateIdentity, String> {
-    let protected = keyfile::needs_passphrase(text).map_err(|e| format!("{}: {e}", path.display()))?;
-    if !protected {
-        return keyfile::decode_private_identity(text, None)
-            .map(|(id, _)| id)
-            .map_err(|e| format!("{}: {e}", path.display()));
-    }
-    for _ in 0..3 {
-        let pass = shh::tty::read_passphrase(&format!(
-            "Enter passphrase for {}: ",
-            path.display()
-        ))
-        .map_err(|e| format!("cannot prompt for passphrase: {e}"))?;
-        match keyfile::decode_private_identity(text, Some(&pass)) {
-            Ok((id, _)) => return Ok(id),
-            Err(e) if e.to_string().contains("wrong passphrase") => {
-                eprintln!("shh: wrong passphrase, try again");
-            }
-            Err(e) => return Err(format!("{}: {e}", path.display())),
-        }
-    }
-    Err("too many passphrase attempts".into())
-}
-
-/// Confirm user presence for a (software) security key. A real token would
-/// blink for a touch; here we ask on the terminal, and proceed automatically
-/// when there is none (scripts, tests).
-fn confirm_presence() {
-    use std::io::{BufRead, Write};
-    let Ok(mut tty) = std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty") else {
-        return; // no terminal — treat as present
-    };
-    let _ = write!(tty, "shh: confirm presence for the security key (press Enter): ");
-    let _ = tty.flush();
-    let mut line = String::new();
-    let mut reader = std::io::BufReader::new(tty);
-    let _ = reader.read_line(&mut line);
-}
-
-/// Load a certificate blob: from `explicit` if given, else from
-/// `<identity>-cert.pub` if it happens to exist. Absent is not an error.
-fn load_certificate(
-    explicit: Option<&PathBuf>,
-    identity: &std::path::Path,
-) -> Result<Option<Vec<u8>>, String> {
-    let path = match explicit {
-        Some(p) => p.clone(),
-        None => {
-            let mut p = identity.as_os_str().to_owned();
-            p.push("-cert.pub");
-            let p = PathBuf::from(p);
-            if !p.exists() {
-                return Ok(None);
-            }
-            p
-        }
-    };
-    let line = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let blob = keyfile::decode_cert(line.trim()).map_err(|e| format!("{}: {e}", path.display()))?;
-    eprintln!("shh: presenting certificate {}", path.display());
-    Ok(Some(blob))
-}
 
 async fn run(args: Args) -> Result<i32, String> {
     let (user_at, host) = match args.dest.split_once('@') {
@@ -306,110 +125,20 @@ async fn run(args: Args) -> Result<i32, String> {
         return Err("-N does not take a remote command".into());
     }
 
-    // How to authenticate: an agent holding usable identities (when
-    // SSH_AUTH_SOCK is set and no -i pins a file), else a key file. Decided
-    // before dialing, so passphrase prompts never race the handshake.
-    let mut agent: Option<(shh::agent::Client, Vec<shh::agent::Identity>)> = None;
-    if !args.no_agent && args.identity.is_none() && std::env::var_os("SSH_AUTH_SOCK").is_some() {
-        match shh::agent::Client::from_env().await {
-            Ok(mut c) => match c.identities().await {
-                Ok(ids) => {
-                    use shh::crypto::{cert::CERT_ALGO, ed25519::ALGO};
-                    let usable = ids
-                        .iter()
-                        .filter(|i| {
-                            matches!(i.algo().as_deref(), Some(ALGO) | Some(CERT_ALGO))
-                        })
-                        .count();
-                    if usable > 0 {
-                        agent = Some((c, ids));
-                    } // an empty agent is no agent: quietly use key files
-                }
-                Err(e) => eprintln!("shh: agent: {e}; falling back to key files"),
-            },
-            Err(e) => eprintln!("shh: agent: {e}; falling back to key files"),
-        }
-    }
-
-    // Without an agent, a key file. An Ed25519 identity may present a
-    // certificate beside it (OpenSSH convention `<identity>-cert.pub`; an
-    // explicit --certificate overrides); a security key presents itself.
-    let file_key = match &agent {
-        Some(_) => None,
-        None => {
-            let identity = find_identity(args.identity)?;
-            let text = std::fs::read_to_string(&identity)
-                .map_err(|e| format!("{}: {e}", identity.display()))?;
-            Some(match load_identity(&text, &identity)? {
-                keyfile::PrivateIdentity::Ed25519(key) => {
-                    let cert = load_certificate(args.certificate.as_ref(), &identity)?;
-                    FileAuth::Ed25519(key, cert)
-                }
-                keyfile::PrivateIdentity::SecurityKey(sk) => {
-                    let cert = load_certificate(args.certificate.as_ref(), &identity)?;
-                    FileAuth::SecurityKey(sk, cert)
-                }
-            })
-        }
+    // Dial and authenticate — the shared client flow (agent or key file,
+    // host-key verification, userauth). It hands back the ready transport.
+    let opts = shh::client::Options {
+        host: host.clone(),
+        port: args.port,
+        user: user.clone(),
+        known_hosts: args.known_hosts.clone(),
+        accept_new: args.accept_new,
+        host_ca: args.host_ca.clone(),
+        identity: args.identity.clone(),
+        certificate: args.certificate.clone(),
+        no_agent: args.no_agent,
     };
-
-    let label = keyfile::host_label(&host, args.port);
-    let known_hosts = args.known_hosts.clone();
-    let accept_new = args.accept_new;
-
-    // Trusted host-certificate CAs: from --host-ca and from `@cert-authority`
-    // lines in known_hosts. With any, a valid host cert skips the TOFU prompt.
-    let mut host_cas = Vec::new();
-    if let Some(path) = &args.host_ca {
-        let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        host_cas.extend(keyfile::parse_authorized_keys(&text));
-    }
-    if let Ok(text) = std::fs::read_to_string(&args.known_hosts) {
-        host_cas.extend(keyfile::known_hosts_cert_authorities(&text));
-    }
-
-    let socket = TcpStream::connect((host.as_str(), args.port))
-        .await
-        .map_err(|e| format!("connect to {label}: {e}"))?;
-    socket.set_nodelay(true).ok();
-
-    let config = ClientConfig {
-        verify_host_key: Box::new(move |k| verify_host_key(k, &label, &known_hosts, accept_new)),
-        host_cas,
-        hostname: host.clone(),
-    };
-    let mut t = Transport::client(socket, config)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    // Bind the agent connection to this host before using it, matching
-    // OpenSSH: it proves to the agent (via the host's signature over the
-    // session id) which host we reached, so a destination-constrained key
-    // can decide whether to sign. Best-effort — an agent that doesn't
-    // support it just means such keys won't be usable here.
-    if let Some((client, _)) = &mut agent {
-        let (blob, sig) = t.host_binding();
-        if !blob.is_empty() {
-            if let Err(e) = client.session_bind(blob, t.session_id(), sig, false).await {
-                eprintln!("shh: agent session-bind failed ({e}); destination-constrained keys may be refused");
-            }
-        }
-    }
-
-    match (&mut agent, &file_key) {
-        (Some((client, ids)), _) => {
-            auth::client_agent(&mut t, &user, client, ids, |banner| eprint!("{banner}")).await
-        }
-        (None, Some(FileAuth::Ed25519(key, cert))) => {
-            auth::client(&mut t, &user, key, cert.as_deref(), |banner| eprint!("{banner}")).await
-        }
-        (None, Some(FileAuth::SecurityKey(sk, cert))) => {
-            confirm_presence();
-            auth::client_sk(&mut t, &user, sk, cert.as_deref(), |banner| eprint!("{banner}")).await
-        }
-        (None, None) => unreachable!("one auth source is always chosen"),
-    }
-    .map_err(|e| e.to_string())?;
+    let t = shh::client::connect(&opts).await?;
 
     // -A: forward whatever agent SSH_AUTH_SOCK names. Auth may have used
     // key files; forwarding is an independent choice.
@@ -537,6 +266,7 @@ async fn run(args: Args) -> Result<i32, String> {
     let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
     handle.open_session(connect::session::SessionSpec {
         command,
+        subsystem: None,
         pty: pty_req,
         resize: resize_rx,
         stdin: Box::new(tokio::io::stdin()),

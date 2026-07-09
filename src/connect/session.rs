@@ -25,6 +25,9 @@ use crate::wire::{Reader, Writer};
 /// multiplexer's command enum stays free of type parameters.
 pub struct SessionSpec {
     pub command: Option<String>,
+    /// Request a subsystem (e.g. `sftp`) instead of exec/shell. Takes
+    /// precedence over `command` when set.
+    pub subsystem: Option<String>,
     pub pty: Option<PtyRequest>,
     pub resize: Option<mpsc::Receiver<WindowChange>>,
     pub stdin: Box<dyn AsyncRead + Unpin + Send>,
@@ -71,6 +74,15 @@ fn exec_or_shell_body(command: &Option<String>) -> Vec<u8> {
             w.boolean(true);
         }
     }
+    w.into_bytes()
+}
+
+/// The `subsystem` channel request: `string("subsystem") ‖ bool ‖ string(name)`.
+fn subsystem_body(name: &str) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.utf8("subsystem");
+    w.boolean(true);
+    w.utf8(name);
     w.into_bytes()
 }
 
@@ -171,6 +183,7 @@ pub(crate) async fn session_client_task(
 ) {
     let SessionSpec {
         command,
+        subsystem,
         pty,
         mut resize,
         mut stdin,
@@ -208,7 +221,10 @@ pub(crate) async fn session_client_task(
     }
     let _ = cmd_tx.send(Cmd::ChannelRequest {
         id,
-        body: exec_or_shell_body(&command),
+        body: match &subsystem {
+            Some(name) => subsystem_body(name),
+            None => exec_or_shell_body(&command),
+        },
     });
     if !await_reply(&mut to_task).await {
         give_up(exit);

@@ -347,6 +347,20 @@ async fn run(args: Args) -> Result<i32, String> {
         .await
         .map_err(|e| e.to_string())?;
 
+    // Bind the agent connection to this host before using it, matching
+    // OpenSSH: it proves to the agent (via the host's signature over the
+    // session id) which host we reached, so a destination-constrained key
+    // can decide whether to sign. Best-effort — an agent that doesn't
+    // support it just means such keys won't be usable here.
+    if let Some((client, _)) = &mut agent {
+        let (blob, sig) = t.host_binding();
+        if !blob.is_empty() {
+            if let Err(e) = client.session_bind(blob, t.session_id(), sig, false).await {
+                eprintln!("shh: agent session-bind failed ({e}); destination-constrained keys may be refused");
+            }
+        }
+    }
+
     match (&mut agent, &file_key) {
         (Some((client, ids)), _) => {
             auth::client_agent(&mut t, &user, client, ids, |banner| eprint!("{banner}")).await

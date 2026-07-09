@@ -326,6 +326,39 @@ pub fn known_hosts_line(label: &str, key: &PublicKey) -> String {
     format!("{label} {}", encode_public(key, ""))
 }
 
+/// The bare hostname of a known_hosts host pattern: strips a `[host]:port`
+/// wrapper or a trailing `:port`, leaving `host`.
+fn label_host(pattern: &str) -> &str {
+    if let Some(inner) = pattern.strip_prefix('[').and_then(|s| s.split_once(']')) {
+        return inner.0;
+    }
+    match pattern.rsplit_once(':') {
+        Some((h, _)) => h,
+        None => pattern,
+    }
+}
+
+/// Every recorded Ed25519 host key for `host` in known_hosts, matching on the
+/// bare hostname so `[host]:port` and `host` entries both count. Used to fill
+/// in a destination constraint's allowed host keys.
+pub fn known_hosts_keys_for(text: &str, host: &str) -> Vec<PublicKey> {
+    let mut out = Vec::new();
+    for line in text.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') || line.starts_with('@') {
+            continue;
+        }
+        let Some((hosts, rest)) = line.split_once(char::is_whitespace) else {
+            continue;
+        };
+        if hosts.split(',').any(|h| label_host(h) == host) {
+            if let Ok((key, _)) = decode_public(rest.trim_start()) {
+                out.push(key);
+            }
+        }
+    }
+    out
+}
+
 /// Collect the trusted host-certificate CA keys from `@cert-authority` lines
 /// in known_hosts. The host pattern is not matched (we trust the CA for any
 /// host it certifies); only Ed25519 CA keys are returned.
@@ -402,5 +435,23 @@ mod tests {
     fn garbage_rejected() {
         assert!(decode_private("not a key").is_err());
         assert!(decode_public("ecdsa-sha2-nistp256 AAAA...").is_err());
+    }
+
+    #[test]
+    fn known_hosts_keys_for_matches_bare_host() {
+        let k1 = PrivateKey::generate().public();
+        let k2 = PrivateKey::generate().public();
+        let stranger = PrivateKey::generate().public();
+        let text = format!(
+            "{}{}{}",
+            known_hosts_line("[gw]:2222", &k1),
+            known_hosts_line("gw", &k2),
+            known_hosts_line("elsewhere", &stranger),
+        );
+        let found = known_hosts_keys_for(&text, "gw");
+        assert_eq!(found.len(), 2, "both gw entries, regardless of port");
+        assert!(found.contains(&k1) && found.contains(&k2));
+        assert!(!found.contains(&stranger));
+        assert!(known_hosts_keys_for(&text, "unknown").is_empty());
     }
 }

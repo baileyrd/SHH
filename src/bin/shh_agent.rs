@@ -44,6 +44,15 @@ enum Cmd {
         /// Forget the key after this many seconds.
         #[arg(short = 't', long, value_name = "seconds")]
         lifetime: Option<u32>,
+        /// Restrict the key to authenticating to this destination
+        /// (`[user@]host`, repeatable). The host's key must be in
+        /// known_hosts. The agent then refuses to sign toward any other
+        /// host, even through forwarding.
+        #[arg(short = 'H', long = "destination", value_name = "[user@]host")]
+        destination: Vec<String>,
+        /// known_hosts file used to resolve `--destination` host keys.
+        #[arg(long, default_value_os_t = default_path("known_hosts"))]
+        known_hosts: PathBuf,
     },
     /// List held identities (fingerprints; --public for full key lines).
     List {
@@ -162,7 +171,12 @@ async fn run_client(socket: PathBuf, cmd: Cmd) -> Result<(), String> {
         )
     })?;
     match cmd {
-        Cmd::Add { files, lifetime } => add(&mut client, files, lifetime).await,
+        Cmd::Add {
+            files,
+            lifetime,
+            destination,
+            known_hosts,
+        } => add(&mut client, files, lifetime, destination, known_hosts).await,
         Cmd::List { public } => list(&mut client, public).await,
         Cmd::Remove { files, all } => remove(&mut client, files, all).await,
         Cmd::Lock => {
@@ -231,7 +245,43 @@ fn cert_path(identity: &std::path::Path) -> PathBuf {
     PathBuf::from(p)
 }
 
-async fn add(client: &mut Client, files: Vec<PathBuf>, lifetime: Option<u32>) -> Result<(), String> {
+/// Resolve `--destination` specs into the constraint payload, looking each
+/// host's key up in known_hosts.
+fn build_destinations(
+    specs: &[String],
+    known_hosts: &std::path::Path,
+) -> Result<Option<Vec<u8>>, String> {
+    if specs.is_empty() {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(known_hosts)
+        .map_err(|e| format!("{}: {e}", known_hosts.display()))?;
+    let mut dests = Vec::new();
+    for spec in specs {
+        let (user, host) = match spec.split_once('@') {
+            Some((u, h)) => (u.to_string(), h.to_string()),
+            None => (String::new(), spec.clone()),
+        };
+        let keys = keyfile::known_hosts_keys_for(&text, &host);
+        if keys.is_empty() {
+            return Err(format!(
+                "no host key for {host:?} in {} — connect once (or add it) before restricting to it",
+                known_hosts.display()
+            ));
+        }
+        dests.push((user, host, keys.iter().map(|k| k.to_blob()).collect()));
+    }
+    Ok(Some(shh::agent::encode_destinations(&dests)))
+}
+
+async fn add(
+    client: &mut Client,
+    files: Vec<PathBuf>,
+    lifetime: Option<u32>,
+    destination: Vec<String>,
+    known_hosts: PathBuf,
+) -> Result<(), String> {
+    let destinations = build_destinations(&destination, &known_hosts)?;
     let files = if files.is_empty() {
         let found = default_identities();
         if found.is_empty() {
@@ -249,13 +299,18 @@ async fn add(client: &mut Client, files: Vec<PathBuf>, lifetime: Option<u32>) ->
             comment
         };
         client
-            .add(&key, None, &comment, lifetime)
+            .add_constrained(&key, None, &comment, lifetime, destinations.as_deref())
             .await
             .map_err(|e| e.to_string())?;
         eprintln!(
-            "added {} ({})",
+            "added {} ({}){}",
             path.display(),
-            key.public().fingerprint()
+            key.public().fingerprint(),
+            if destination.is_empty() {
+                String::new()
+            } else {
+                format!(" restricted to {}", destination.join(", "))
+            }
         );
         let cp = cert_path(path);
         if cp.exists() {
@@ -264,7 +319,7 @@ async fn add(client: &mut Client, files: Vec<PathBuf>, lifetime: Option<u32>) ->
             let cert = keyfile::decode_cert(line.trim())
                 .map_err(|e| format!("{}: {e}", cp.display()))?;
             client
-                .add(&key, Some(&cert), &comment, lifetime)
+                .add_constrained(&key, Some(&cert), &comment, lifetime, destinations.as_deref())
                 .await
                 .map_err(|e| e.to_string())?;
             eprintln!("added certificate {}", cp.display());

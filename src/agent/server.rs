@@ -16,9 +16,27 @@ use zeroize::Zeroizing;
 
 use super::{num, read_frame, write_frame};
 use crate::crypto::cert::{Certificate, CERT_ALGO};
-use crate::crypto::ed25519::{PrivateKey, ALGO};
+use crate::crypto::ed25519::{PrivateKey, PublicKey, ALGO};
 use crate::wire::{Reader, Writer};
 use crate::Result;
+
+/// OpenSSH agent extension names we speak.
+const EXT_SESSION_BIND: &str = "session-bind@openssh.com";
+const EXT_RESTRICT_DESTINATION: &str = "restrict-destination-v00@openssh.com";
+
+/// One end of a destination-constraint hop: the host keys (or CA keys) that
+/// identify a host. A hop with no keys is the local origin. Enforcement is by
+/// key — matching OpenSSH, which passes a NULL user at sign time — so the
+/// username and hostname the wire also carries are parsed and discarded.
+struct Hop {
+    keys: Vec<(Vec<u8>, bool)>, // (host-key blob, is_ca)
+}
+
+/// A permitted hop `from` → `to` in a destination constraint.
+struct DestConstraint {
+    from: Hop,
+    to: Hop,
+}
 
 struct Stored {
     /// The public blob the identity is named by: a plain key blob or a
@@ -27,6 +45,27 @@ struct Stored {
     key: PrivateKey,
     comment: String,
     expires: Option<tokio::time::Instant>,
+    /// Destination constraints (`restrict-destination-v00@openssh.com`).
+    /// Empty means the key is unconstrained.
+    constraints: Vec<DestConstraint>,
+}
+
+/// One `session-bind@openssh.com` binding recorded on a connection: the host
+/// the client proved (by a host signature over the session id) it exchanged
+/// keys with, in the order the connection traversed them.
+struct Binding {
+    host_key: Vec<u8>,
+    session_id: Vec<u8>,
+    #[allow(dead_code)]
+    is_forwarding: bool,
+}
+
+/// Per-connection agent state: the chain of verified session bindings. Lives
+/// on the socket connection, not the shared store, so destination
+/// constraints are judged against the path *this* client actually took.
+#[derive(Default)]
+pub struct ConnState {
+    bindings: Vec<Binding>,
 }
 
 #[derive(Default)]
@@ -56,9 +95,9 @@ impl Keyring {
         Self::default()
     }
 
-    /// Answer one request frame. Malformed input earns FAILURE, never a
-    /// panic and never a half-applied mutation.
-    pub fn handle(&self, req: &[u8]) -> Vec<u8> {
+    /// Answer one request frame on connection `conn`. Malformed input earns
+    /// FAILURE, never a panic and never a half-applied mutation.
+    pub fn handle(&self, conn: &mut ConnState, req: &[u8]) -> Vec<u8> {
         let mut state = self.state.lock().expect("keyring lock poisoned");
         state.purge_expired();
         let Some((&op, body)) = req.split_first() else {
@@ -68,7 +107,7 @@ impl Keyring {
         match op {
             num::REQUEST_IDENTITIES => state.list(locked),
             _ if locked && op != num::UNLOCK => failure(),
-            num::SIGN_REQUEST => state.sign(body).unwrap_or_else(failure),
+            num::SIGN_REQUEST => state.sign(body, &conn.bindings).unwrap_or_else(failure),
             num::ADD_IDENTITY => state.add(body, false).unwrap_or_else(failure),
             num::ADD_ID_CONSTRAINED => state.add(body, true).unwrap_or_else(failure),
             num::REMOVE_IDENTITY => state.remove(body).unwrap_or_else(failure),
@@ -78,10 +117,21 @@ impl Keyring {
             }
             num::LOCK => state.set_lock(body).unwrap_or_else(failure),
             num::UNLOCK => state.unset_lock(body).unwrap_or_else(failure),
-            // Extensions (session-bind@openssh.com and friends): the draft
-            // says unsupported extensions get plain FAILURE, and OpenSSH
-            // clients treat that as "no extension support" and move on.
-            num::EXTENSION => failure(),
+            num::EXTENSION => {
+                let mut r = Reader::new(body);
+                let name = r.utf8().map(str::to_owned).ok();
+                let rest = r.rest();
+                match name.as_deref() {
+                    // Bind this connection to a verified host: the client
+                    // proves it exchanged keys with the host by a signature
+                    // over the session id. This is what lets destination
+                    // constraints trust the path the connection took.
+                    Some(EXT_SESSION_BIND) => conn.session_bind(rest).unwrap_or_else(failure),
+                    // Any other extension: plain FAILURE, which OpenSSH reads
+                    // as "unsupported" and moves past.
+                    _ => failure(),
+                }
+            }
             _ => failure(),
         }
     }
@@ -96,6 +146,122 @@ impl Keyring {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+}
+
+/// The underlying Ed25519 public key of a host-key blob — the key itself,
+/// or the key a certificate certifies.
+fn underlying_key(blob: &[u8]) -> Option<PublicKey> {
+    match Reader::new(blob).utf8().ok()? {
+        CERT_ALGO => Certificate::parse_and_verify(blob).ok().map(|c| c.key),
+        _ => PublicKey::from_blob(blob).ok(),
+    }
+}
+
+impl ConnState {
+    /// Handle `session-bind@openssh.com`: verify the host signature over the
+    /// session id, then record the binding. Verification is the whole point
+    /// — it stops a malicious host from claiming a path it never took.
+    fn session_bind(&mut self, body: &[u8]) -> Option<Vec<u8>> {
+        let mut r = Reader::new(body);
+        let host_blob = r.string().ok()?;
+        let session_id = r.string().ok()?;
+        let sig = r.string().ok()?;
+        let is_forwarding = r.boolean().ok()?;
+        r.finish().ok()?;
+
+        // The signature must be a real host signature over the session id.
+        underlying_key(host_blob)?.verify(session_id, sig).ok()?;
+
+        // Reject a replayed session id (loop / double-bind), as OpenSSH does.
+        if self.bindings.iter().any(|b| b.session_id == session_id) {
+            return None;
+        }
+        self.bindings.push(Binding {
+            host_key: host_blob.to_vec(),
+            session_id: session_id.to_vec(),
+            is_forwarding,
+        });
+        Some(success())
+    }
+}
+
+/// Does a host-key `blob` match one of a hop's key entries — either equal to
+/// a listed key, or (for a CA entry) a certificate that CA signed?
+fn hop_lists_key(hop: &Hop, blob: &[u8]) -> bool {
+    let target = underlying_key(blob);
+    hop.keys.iter().any(|(entry, is_ca)| {
+        if *is_ca {
+            // The bound host presented a certificate signed by this CA.
+            Certificate::parse_and_verify(blob)
+                .ok()
+                .zip(underlying_key(entry))
+                .map(|(c, ca)| ca.0 == c.ca_key.0)
+                .unwrap_or(false)
+        } else {
+            match (&target, underlying_key(entry)) {
+                (Some(a), Some(b)) => a.0 == b.0,
+                _ => false,
+            }
+        }
+    })
+}
+
+/// Is the whole binding chain permitted by `constraints`? Each hop must be
+/// reachable `from` the previous host `to` the current one; the first hop's
+/// `from` is the local origin (a constraint hop with no keys).
+fn destinations_permit(constraints: &[DestConstraint], bindings: &[Binding]) -> bool {
+    if constraints.is_empty() {
+        return true; // unconstrained key
+    }
+    if bindings.is_empty() {
+        return false; // a constrained key needs a proven path
+    }
+    bindings.iter().enumerate().all(|(i, b)| {
+        let from: Option<&[u8]> = (i > 0).then(|| bindings[i - 1].host_key.as_slice());
+        constraints.iter().any(|c| {
+            let from_ok = match from {
+                None => c.from.keys.is_empty(), // origin hop
+                Some(k) => hop_lists_key(&c.from, k),
+            };
+            from_ok && hop_lists_key(&c.to, &b.host_key)
+        })
+    })
+}
+
+/// Parse one hop of a destination constraint: user, host, reserved, then a
+/// run of `(host-key blob, is_ca)` entries.
+fn parse_hop(bytes: &[u8]) -> Option<Hop> {
+    let mut r = Reader::new(bytes);
+    let _user = r.string().ok()?;
+    let _host = r.string().ok()?;
+    let _reserved = r.string().ok()?;
+    let mut keys = Vec::new();
+    while r.remaining() > 0 {
+        let kb = r.string().ok()?.to_vec();
+        let is_ca = r.boolean().ok()?;
+        keys.push((kb, is_ca));
+    }
+    Some(Hop { keys })
+}
+
+/// Parse a `restrict-destination-v00@openssh.com` payload: a run of
+/// constraints, each a string wrapping `(string from-hop, string to-hop,
+/// string reserved)`.
+fn parse_dest_constraints(blob: &[u8]) -> Option<Vec<DestConstraint>> {
+    let mut r = Reader::new(blob);
+    let mut out = Vec::new();
+    while r.remaining() > 0 {
+        let mut c = Reader::new(r.string().ok()?);
+        let from = c.string().ok()?;
+        let to = c.string().ok()?;
+        let _reserved = c.string().ok()?;
+        c.finish().ok()?;
+        out.push(DestConstraint {
+            from: parse_hop(from)?,
+            to: parse_hop(to)?,
+        });
+    }
+    Some(out)
 }
 
 impl State {
@@ -161,6 +327,7 @@ impl State {
         }
 
         let mut expires = None;
+        let mut constraints = Vec::new();
         if constrained {
             while r.remaining() > 0 {
                 match r.byte().ok()? {
@@ -173,8 +340,20 @@ impl State {
                             tokio::time::Instant::now() + std::time::Duration::from_secs(secs.into()),
                         );
                     }
-                    // Confirm-per-use and constraint extensions: we cannot
-                    // honor them, so we refuse the add outright.
+                    num::CONSTRAIN_EXTENSION => {
+                        // The only key-constraint extension we honor pins the
+                        // key to a set of destinations; the payload wraps the
+                        // constraint list in one string.
+                        match r.utf8().ok()? {
+                            EXT_RESTRICT_DESTINATION => {
+                                let blob = r.string().ok()?;
+                                constraints.extend(parse_dest_constraints(blob)?);
+                            }
+                            _ => return None, // unknown extension: refuse
+                        }
+                    }
+                    // Confirm-per-use and anything else we cannot honor: we
+                    // refuse the add outright rather than silently drop it.
                     _ => return None,
                 }
             }
@@ -185,24 +364,31 @@ impl State {
             Some(c) => c,
             None => public.to_blob(),
         };
-        // Re-adding an identity replaces it (fresh comment and lifetime).
+        // Re-adding an identity replaces it (fresh comment, lifetime, constraints).
         self.keys.retain(|k| k.blob != blob);
         self.keys.push(Stored {
             blob,
             key,
             comment,
             expires,
+            constraints,
         });
         Some(success())
     }
 
-    fn sign(&self, body: &[u8]) -> Option<Vec<u8>> {
+    fn sign(&self, body: &[u8], bindings: &[Binding]) -> Option<Vec<u8>> {
         let mut r = Reader::new(body);
         let blob = r.string().ok()?;
         let data = r.string().ok()?;
         let _flags = r.u32().ok()?; // RSA hash selection; meaningless here
         r.finish().ok()?;
         let stored = self.find(blob)?;
+        // A destination-constrained key signs only for a proven path that its
+        // constraints allow. Fail closed: no bindings, no signature.
+        if !destinations_permit(&stored.constraints, bindings) {
+            tracing::info!("refusing to sign: destination not permitted for this key");
+            return None;
+        }
         let mut w = Writer::new();
         w.byte(num::SIGN_RESPONSE);
         w.string(&stored.key.sign(data));
@@ -251,8 +437,10 @@ pub async fn serve_conn<S>(mut io: S, keyring: &Keyring) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    // Session bindings accumulate for the life of this connection.
+    let mut conn = ConnState::default();
     while let Some(req) = read_frame(&mut io).await? {
-        let resp = keyring.handle(&req);
+        let resp = keyring.handle(&mut conn, &req);
         write_frame(&mut io, &resp).await?;
     }
     Ok(())
@@ -296,13 +484,20 @@ mod tests {
     /// A live agent on an in-memory pipe: the `Client` is the API under
     /// test, the `Keyring` handle lets tests inspect the store directly.
     fn spawn_agent() -> (Client, Arc<Keyring>) {
-        let (a, b) = tokio::io::duplex(1 << 16);
         let keyring = Arc::new(Keyring::new());
+        let client = client_for(&keyring);
+        (client, keyring)
+    }
+
+    /// Another client on its own connection (its own binding chain) against
+    /// an existing keyring.
+    fn client_for(keyring: &Arc<Keyring>) -> Client {
+        let (a, b) = tokio::io::duplex(1 << 16);
         let kr = keyring.clone();
         tokio::spawn(async move {
             let _ = serve_conn(b, &kr).await;
         });
-        (Client::from_stream(a), keyring)
+        Client::from_stream(a)
     }
 
     #[tokio::test]
@@ -409,7 +604,7 @@ mod tests {
         w.string(&[3, 1, 0, 1]);
         w.string(&[0u8; 256]);
         w.utf8("rsa key");
-        assert_eq!(kr.handle(&w.into_bytes()), vec![num::FAILURE]);
+        assert_eq!(kr.handle(&mut ConnState::default(), &w.into_bytes()), vec![num::FAILURE]);
         assert!(kr.is_empty());
     }
 
@@ -428,7 +623,7 @@ mod tests {
         w.string(other.public().0.as_bytes());
         w.string(&sk);
         w.utf8("liar");
-        assert_eq!(kr.handle(&w.into_bytes()), vec![num::FAILURE]);
+        assert_eq!(kr.handle(&mut ConnState::default(), &w.into_bytes()), vec![num::FAILURE]);
         assert!(kr.is_empty());
     }
 
@@ -447,22 +642,154 @@ mod tests {
         w.utf8("wants confirmation");
         w.byte(num::CONSTRAIN_CONFIRM);
         // We cannot prompt per use, so we must not pretend we will.
-        assert_eq!(kr.handle(&w.into_bytes()), vec![num::FAILURE]);
+        assert_eq!(kr.handle(&mut ConnState::default(), &w.into_bytes()), vec![num::FAILURE]);
         assert!(kr.is_empty());
     }
 
     #[tokio::test]
     async fn garbage_frames_are_refused_not_fatal() {
         let kr = Keyring::new();
-        assert_eq!(kr.handle(&[]), vec![num::FAILURE]);
-        assert_eq!(kr.handle(&[199]), vec![num::FAILURE]);
-        assert_eq!(kr.handle(&[num::ADD_IDENTITY, 0xff, 0xff]), vec![num::FAILURE]);
-        assert_eq!(kr.handle(&[num::SIGN_REQUEST]), vec![num::FAILURE]);
+        assert_eq!(kr.handle(&mut ConnState::default(), &[]), vec![num::FAILURE]);
+        assert_eq!(kr.handle(&mut ConnState::default(), &[199]), vec![num::FAILURE]);
+        assert_eq!(kr.handle(&mut ConnState::default(), &[num::ADD_IDENTITY, 0xff, 0xff]), vec![num::FAILURE]);
+        assert_eq!(kr.handle(&mut ConnState::default(), &[num::SIGN_REQUEST]), vec![num::FAILURE]);
         // Unknown extensions get a plain FAILURE (draft §4.7), which OpenSSH
         // clients read as "no extension support" and carry on.
         let mut w = Writer::new();
         w.byte(num::EXTENSION);
-        w.utf8("session-bind@openssh.com");
-        assert_eq!(kr.handle(&w.into_bytes()), vec![num::FAILURE]);
+        w.utf8("nonexistent-extension@example.com");
+        assert_eq!(kr.handle(&mut ConnState::default(), &w.into_bytes()), vec![num::FAILURE]);
+    }
+
+    // ----------------------------------------- session-bind + restriction ---
+
+    #[tokio::test]
+    async fn session_bind_requires_a_valid_host_signature() {
+        let (mut c, _kr) = spawn_agent();
+        let host = PrivateKey::generate();
+        let sessid = [7u8; 32];
+
+        // A genuine host signature over the session id binds.
+        c.session_bind(&host.public().to_blob(), &sessid, &host.sign(&sessid), false)
+            .await
+            .unwrap();
+
+        // A signature by some other key does not.
+        let liar = PrivateKey::generate();
+        assert!(c
+            .session_bind(&host.public().to_blob(), &sessid, &liar.sign(&sessid), false)
+            .await
+            .is_err());
+    }
+
+    /// Build the destination-constraint payload allowing exactly `host`.
+    fn only(host: &PrivateKey) -> Vec<u8> {
+        crate::agent::encode_destinations(&[(
+            String::new(),
+            "h".into(),
+            vec![host.public().to_blob()],
+        )])
+    }
+
+    #[tokio::test]
+    async fn destination_constrained_key_signs_only_for_the_bound_host() {
+        let (mut adder, kr) = spawn_agent();
+        let user = PrivateKey::generate();
+        let host = PrivateKey::generate();
+        adder
+            .add_constrained(&user, None, "k", None, Some(&only(&host)))
+            .await
+            .unwrap();
+        let blob = user.public().to_blob();
+
+        // A connection that never bound a host: the key is unusable.
+        let mut bare = client_for(&kr);
+        assert!(bare.sign(&blob, b"data").await.is_err());
+
+        // Bind the permitted host, then signing works and verifies.
+        let mut ok = client_for(&kr);
+        let sid = [9u8; 32];
+        ok.session_bind(&host.public().to_blob(), &sid, &host.sign(&sid), false)
+            .await
+            .unwrap();
+        let sig = ok.sign(&blob, b"data").await.unwrap();
+        user.public().verify(b"data", &sig).unwrap();
+
+        // Bind a *different* host: the same key refuses to sign.
+        let other = PrivateKey::generate();
+        let mut wrong = client_for(&kr);
+        let sid2 = [11u8; 32];
+        wrong
+            .session_bind(&other.public().to_blob(), &sid2, &other.sign(&sid2), false)
+            .await
+            .unwrap();
+        assert!(wrong.sign(&blob, b"data").await.is_err());
+    }
+
+    #[test]
+    fn restrict_destination_encoding_has_the_openssh_nesting() {
+        // OpenSSH's `restrict-destination-v00@openssh.com` payload is a run of
+        // constraints, each a string wrapping `string(from) string(to)
+        // string(reserved)`, where a hop is `string(user) string(host)
+        // string(reserved) (string(keyblob) byte(is_ca))*`. This asserts our
+        // encoder produces exactly that shape — the byte-level match with real
+        // OpenSSH is covered by the interop script. (Verified by round-trip
+        // through the very parser that accepts `ssh-add -h` bytes.)
+        let host = PrivateKey::generate();
+        let hk = host.public().to_blob();
+        let payload = crate::agent::encode_destinations(&[(
+            "deploy".into(),
+            "gw".into(),
+            vec![hk.clone()],
+        )]);
+
+        // Outer list: exactly one string-wrapped constraint, nothing trailing.
+        let mut list = Reader::new(&payload);
+        let constraint = list.string().unwrap();
+        assert_eq!(list.remaining(), 0);
+
+        // Constraint: from-hop, to-hop, reserved.
+        let mut c = Reader::new(constraint);
+        let from = c.string().unwrap();
+        let to = c.string().unwrap();
+        assert!(c.string().unwrap().is_empty(), "reserved is empty");
+        c.finish().unwrap();
+
+        // from is the local origin: user, host, reserved all empty, no keys.
+        let mut f = Reader::new(from);
+        assert!(f.string().unwrap().is_empty());
+        assert!(f.string().unwrap().is_empty());
+        assert!(f.string().unwrap().is_empty());
+        assert_eq!(f.remaining(), 0, "origin hop carries no keys");
+
+        // to names the destination and its host key with is_ca = 0.
+        let mut t = Reader::new(to);
+        assert_eq!(t.utf8().unwrap(), "deploy");
+        assert_eq!(t.utf8().unwrap(), "gw");
+        assert!(t.string().unwrap().is_empty());
+        assert_eq!(t.string().unwrap(), hk.as_slice());
+        assert_eq!(t.byte().unwrap(), 0);
+        t.finish().unwrap();
+
+        // And it parses + enforces: the named host is permitted, others not.
+        let constraints = parse_dest_constraints(&payload).unwrap();
+        let bound = |blob: &[u8]| Binding {
+            host_key: blob.to_vec(),
+            session_id: vec![1],
+            is_forwarding: false,
+        };
+        assert!(destinations_permit(&constraints, &[bound(&hk)]));
+        let stranger = PrivateKey::generate().public().to_blob();
+        assert!(!destinations_permit(&constraints, &[bound(&stranger)]));
+    }
+
+    #[tokio::test]
+    async fn unconstrained_key_still_signs_without_any_binding() {
+        // The restriction must not leak to ordinary keys.
+        let (mut c, _kr) = spawn_agent();
+        let user = PrivateKey::generate();
+        c.add(&user, None, "plain", None).await.unwrap();
+        let sig = c.sign(&user.public().to_blob(), b"data").await.unwrap();
+        user.public().verify(b"data", &sig).unwrap();
     }
 }

@@ -144,29 +144,50 @@ fn encode_add(key: &PrivateKey, cert: Option<&[u8]>, comment: &str) -> Writer {
 pub fn encode_destinations(dests: &[(String, String, Vec<Vec<u8>>)]) -> Vec<u8> {
     let mut list = Writer::new();
     for (user, host, keys) in dests {
-        // The origin hop: empty user, host, reserved, and no keys.
-        let mut from = Writer::new();
-        from.utf8("");
-        from.utf8("");
-        from.string(&[]);
-        // The destination hop, identified by its host key(s).
-        let mut to = Writer::new();
-        to.utf8(user);
-        to.utf8(host);
-        to.string(&[]);
-        for k in keys {
-            to.string(k);
-            to.byte(0); // is_ca = false
-        }
-        // Each constraint is `from ‖ to ‖ reserved`, itself wrapped in a
-        // string so the list can be walked without knowing hop sizes.
-        let mut c = Writer::new();
-        c.string(&from.into_bytes());
-        c.string(&to.into_bytes());
-        c.string(&[]); // per-constraint reserved
-        list.string(&c.into_bytes());
+        push_constraint(&mut list, &encode_hop("", "", &[]), &encode_hop(user, host, keys));
     }
     list.into_bytes()
+}
+
+/// Build a `restrict-destination-v00@openssh.com` payload for a *path*: the
+/// key may be used only along `hops` in order (`local → hop0 → hop1 → …`).
+/// Each constraint links the previous host to the next, so the agent — fed a
+/// session-bind for every hop the request traversed — permits a signature
+/// only when the whole path is present and in order. A single hop is the
+/// same as one entry of [`encode_destinations`] (an endpoint pin).
+pub fn encode_path(hops: &[(String, String, Vec<Vec<u8>>)]) -> Vec<u8> {
+    let mut list = Writer::new();
+    let mut from = encode_hop("", "", &[]); // the local origin
+    for (user, host, keys) in hops {
+        let to = encode_hop(user, host, keys);
+        push_constraint(&mut list, &from, &to);
+        from = to; // the next hop starts where this one ended
+    }
+    list.into_bytes()
+}
+
+/// One destination-constraint hop: `string user, string host, string
+/// reserved, then (string keyblob, byte is_ca)*`.
+fn encode_hop(user: &str, host: &str, keys: &[Vec<u8>]) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.utf8(user);
+    w.utf8(host);
+    w.string(&[]);
+    for k in keys {
+        w.string(k);
+        w.byte(0); // is_ca = false
+    }
+    w.into_bytes()
+}
+
+/// Append `string(from ‖ to ‖ reserved)` — one constraint, itself wrapped in
+/// a string so the list can be walked without knowing hop sizes.
+fn push_constraint(list: &mut Writer, from: &[u8], to: &[u8]) {
+    let mut c = Writer::new();
+    c.string(from);
+    c.string(to);
+    c.string(&[]); // per-constraint reserved
+    list.string(&c.into_bytes());
 }
 
 /// Something we can read and write frames over. Boxed so `Client` needs no

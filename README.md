@@ -137,10 +137,23 @@ The client binds each agent connection to the host it reached
 signature over the session id — and the agent signs with a
 destination-constrained key only when the proven path is allowed. So a
 forwarded agent is no longer a blank cheque: a compromised intermediate
-can use a pinned key toward its permitted host and nowhere else. The
+can use a pinned key toward its permitted host and nowhere else.
+
+Chain hops with `>` to pin a **path** — the key reaches the far host only
+*through* the named route, never directly:
+
+```console
+$ shh-agent add -H 'gateway>prod' ~/.shh/id_ed25519
+$ shh -A you@gateway
+gateway$ shh you@prod          # OK — reached prod via gateway
+gateway$ shh you@other         # REFUSED — off the pinned path
+```
+
+For the path to be provable across a hop, `shh -A` replays its own binding
+onto each relayed agent connection, so the agent sees the whole route. The
 constraint is OpenSSH's `restrict-destination-v00@openssh.com`, so
-`ssh-add -h` writes constraints `shh-agent` enforces and vice versa.
-(Endpoint pins are enforced; multi-hop *path* constraints are not yet.)
+`ssh-add -h` writes constraints `shh-agent` enforces and vice versa —
+endpoint pins and multi-hop paths alike.
 
 `shh host cmd` behaves like `ssh`: stdin is forwarded, stdout/stderr come
 back separated, and the remote exit status becomes `shh`'s exit status.
@@ -212,9 +225,9 @@ the account that logged in; an unknown login name is refused. `shh-agent`
 is a drop-in, Ed25519-only `ssh-agent` (interop verified with `ssh-add`
 and `ssh` both ways), agent forwarding (`-A`, server default-deny via
 `--permit-agent-forwarding`) relays it across hops, and agent keys can be
-pinned to specific destination hosts (`shh-agent add -H host`, enforced
-via `session-bind@openssh.com` / `restrict-destination-v00`). Not yet
-implemented: FIDO2 `sk-ssh-ed25519` keys, multi-hop agent *path*
-constraints, and a sandboxed pre-auth process (privilege *separation*,
-distinct from the privilege *drop* above). Treat it as a working protocol
+pinned to specific destination hosts or whole paths (`shh-agent add -H
+gw>prod`, enforced via `session-bind@openssh.com` /
+`restrict-destination-v00`). Not yet implemented: FIDO2 `sk-ssh-ed25519`
+keys and a sandboxed pre-auth process (privilege *separation*, distinct
+from the privilege *drop* above). Treat it as a working protocol
 implementation, not a hardened production daemon.

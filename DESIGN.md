@@ -223,10 +223,16 @@ shh/                 one library crate
    binding before it uses any agent, so the restriction works whether the
    agent is ours or OpenSSH's, and our agent enforces constraints written
    by OpenSSH's `ssh-add -h` (verified against the captured wire format).
-   Scope: endpoint (destination) constraints are enforced; multi-hop
-   *path* constraints — which need the forwarder to replay its own binding
-   onto each relayed connection — are not yet built, and CA (`is_ca`)
-   host-key entries are matched but untested against OpenSSH. Remaining:
-   `sk-ssh-ed25519` FIDO2 keys, path constraints, and a sandboxed pre-auth
-   process (privilege *separation*, a further step beyond milestone 6's
-   privilege *drop*).
+   Both endpoint pins (`local → host`) and multi-hop *paths*
+   (`local → gw → prod`, so a key reaches `prod` only *through* `gw`,
+   never directly) are enforced: the agent checks every hop of the
+   connection's binding chain against the constraint list, each hop
+   reachable only from the one before it. For the chain to form through
+   forwarding, the forwarder replays its own binding onto each relayed
+   agent connection (`shh -A` does this), so the agent sees the whole
+   route the request travelled. `shh-agent add -H gw>prod` expresses a
+   path; repeating `-H` allows several destinations, matching `ssh-add
+   -h`. Remaining: `sk-ssh-ed25519` FIDO2 keys, CA (`is_ca`) host-key
+   constraint entries (matched but untested against OpenSSH), and a
+   sandboxed pre-auth process (privilege *separation*, a further step
+   beyond milestone 6's privilege *drop*).

@@ -79,9 +79,14 @@ over the session identifier exactly per RFC 4252 §7, binding auth to the
 channel. Both bare keys and OpenSSH-style Ed25519 user certificates
 (`ssh-ed25519-cert-v01@openssh.com`) are accepted: a server may trust a CA
 (`--trusted-ca-keys`) and admit any certificate it signed whose validity
-window covers now and whose principals include the login name. We fail
-closed on unrecognized critical options, and host certificates plus
-`force-command` / `source-address` are not yet honored. FIDO2 security
+window covers now and whose principals include the login name. Two critical
+options are enforced: `force-command` pins the session to a fixed command
+regardless of what the client asks (the client's request survives only as
+`SSH_ORIGINAL_COMMAND`), and `source-address` refuses the certificate from a
+client whose address falls outside its CIDR list — an unknown client address
+fails that check closed. We still fail closed on *any other* critical option
+(an unknown one denies the cert), and host certificates are not honored.
+FIDO2 security
 keys (`sk-ssh-ed25519@openssh.com`) are supported both ways: the server
 verifies the authenticator's assertion — an Ed25519 signature over
 `SHA256(application) ‖ flags ‖ counter ‖ SHA256(signed-data)` — and
@@ -303,3 +308,18 @@ shh/                 one library crate
     with `TrustedUserCAKeys` accepts a cert we minted over an assertion our
     client produced. Real hardware belongs behind an external authenticator
     helper, which is not yet built.
+12. **Certificate critical options (done).** Two of OpenSSH's user-cert
+    critical options are now enforced, not just tolerated. `force-command`
+    pins every session to a fixed command whatever the client requested —
+    the client's own command survives only as `SSH_ORIGINAL_COMMAND`, the way
+    OpenSSH exposes it — so a certificate can grant "this key may only run the
+    backup script." `source-address` scopes a certificate to a CIDR list: a
+    client whose address is outside the ranges is refused at authentication,
+    and an *unknown* client address (no peer info) fails the check closed
+    rather than being waved through. Negated entries (`!10.9.9.9`) and
+    IPv4-mapped IPv6 peers are handled as OpenSSH's `addr_match_cidr_list`
+    does. `shh-keygen -O force-command=… -O source-address=…` mints them,
+    mirroring `ssh-keygen -O`, and any *other* critical option still fails
+    closed. Verified against OpenSSH both ways: `ssh-keygen -L` prints our
+    options, OpenSSH `sshd` runs a `force-command` from a cert we signed, and
+    our `shhd` honors a `force-command` cert `ssh-keygen -s` signed.

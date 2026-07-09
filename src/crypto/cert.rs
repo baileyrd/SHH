@@ -6,8 +6,10 @@
 //! at more than one host.
 //!
 //! We implement *user* certificates only, and we fail closed: any critical
-//! option we don't understand rejects the certificate. Host certificates,
-//! `force-command`, and `source-address` are deliberately not honored yet.
+//! option we don't understand rejects the certificate. Two critical options
+//! *are* honored — `force-command` (the session runs this command whatever
+//! the client asked for) and `source-address` (the cert is refused from a
+//! client IP outside the listed CIDR ranges). Host certificates are not.
 
 use ed25519_dalek::VerifyingKey;
 use rand_core::{OsRng, RngCore};
@@ -58,10 +60,133 @@ pub struct Certificate {
     pub principals: Vec<String>,
     pub valid_after: u64,
     pub valid_before: u64,
+    /// `force-command` critical option: when set, the server runs this
+    /// command instead of whatever the client requested (exec or shell).
+    pub force_command: Option<String>,
+    /// `source-address` critical option: a comma-separated CIDR list the
+    /// client's address must fall within, or the cert is refused.
+    pub source_address: Option<String>,
     /// The CA whose signature was verified.
     pub ca_key: PublicKey,
     /// The full certificate blob, for re-presentation in userauth.
     blob: Vec<u8>,
+}
+
+/// The critical options a signer can put on a user certificate. Both are
+/// `None` by default; see [`Certificate::force_command`] and
+/// [`Certificate::source_address`] for what they mean at the server.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CertOptions {
+    pub force_command: Option<String>,
+    pub source_address: Option<String>,
+}
+
+/// Parse the certificate's critical-options buffer. Each entry is
+/// `string name ‖ string data`, where `data` wraps a single SSH string value.
+/// We recognize `force-command` and `source-address`; any other name rejects
+/// the certificate (fail-closed). OpenSSH requires the names to be strictly
+/// ascending and unique, and so do we.
+fn parse_critical_options(bytes: &[u8]) -> Result<(Option<String>, Option<String>)> {
+    let mut r = Reader::new(bytes);
+    let mut force_command = None;
+    let mut source_address = None;
+    let mut last: Option<String> = None;
+    while r.remaining() > 0 {
+        let name = r.utf8()?.to_owned();
+        if let Some(prev) = &last {
+            if name.as_str() <= prev.as_str() {
+                return Err(Error::Auth(
+                    "certificate critical options are not sorted and unique".into(),
+                ));
+            }
+        }
+        let data = r.string()?;
+        // Reject unknown options by name before interpreting their data, so a
+        // valueless unknown option still fails as "unsupported", not "malformed".
+        match name.as_str() {
+            "force-command" => force_command = Some(read_option_value(data)?),
+            "source-address" => source_address = Some(read_option_value(data)?),
+            other => {
+                return Err(Error::Auth(format!(
+                    "certificate carries unsupported critical option: {other}"
+                )))
+            }
+        }
+        last = Some(name);
+    }
+    Ok((force_command, source_address))
+}
+
+/// A known critical option's value is a single SSH string nested inside its
+/// data buffer (and nothing more).
+fn read_option_value(data: &[u8]) -> Result<String> {
+    let mut r = Reader::new(data);
+    let value = r.utf8()?.to_owned();
+    r.finish()?;
+    Ok(value)
+}
+
+/// Does `ip` satisfy an OpenSSH-style `source-address` CIDR list? Entries are
+/// comma-separated `addr` or `addr/bits`, optionally negated with a leading
+/// `!`. A negated match denies outright; otherwise the address must match at
+/// least one positive entry — mirroring OpenSSH's `addr_match_cidr_list`.
+pub fn source_address_permits(list: &str, ip: std::net::IpAddr) -> bool {
+    // Fold an IPv4-mapped IPv6 address back to plain IPv4 so a v4 CIDR still
+    // matches a peer that arrived on a dual-stack socket.
+    let ip = ip.to_canonical();
+    let mut matched = false;
+    for raw in list.split(',') {
+        let entry = raw.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let (negated, spec) = match entry.strip_prefix('!') {
+            Some(rest) => (true, rest.trim()),
+            None => (false, entry),
+        };
+        if cidr_contains(spec, ip) {
+            if negated {
+                return false;
+            }
+            matched = true;
+        }
+    }
+    matched
+}
+
+/// Is `ip` inside the single CIDR (or bare address) `spec`? A malformed spec
+/// or a family mismatch (v4 spec vs v6 peer) simply does not match.
+fn cidr_contains(spec: &str, ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    let (addr_str, bits) = match spec.split_once('/') {
+        Some((a, b)) => (a, Some(b)),
+        None => (spec, None),
+    };
+    match (addr_str.parse::<IpAddr>(), ip) {
+        (Ok(IpAddr::V4(net)), IpAddr::V4(ip)) => {
+            let bits = match bits {
+                Some(b) => match b.parse::<u32>() {
+                    Ok(n) if n <= 32 => n,
+                    _ => return false,
+                },
+                None => 32,
+            };
+            let mask = if bits == 0 { 0 } else { u32::MAX << (32 - bits) };
+            (u32::from(net) & mask) == (u32::from(ip) & mask)
+        }
+        (Ok(IpAddr::V6(net)), IpAddr::V6(ip)) => {
+            let bits = match bits {
+                Some(b) => match b.parse::<u32>() {
+                    Ok(n) if n <= 128 => n,
+                    _ => return false,
+                },
+                None => 128,
+            };
+            let mask = if bits == 0 { 0 } else { u128::MAX << (128 - bits) };
+            (u128::from(net) & mask) == (u128::from(ip) & mask)
+        }
+        _ => false,
+    }
 }
 
 /// Read a packed list of SSH strings (principals, option names).
@@ -126,19 +251,15 @@ impl Certificate {
         let signature = r.string()?.to_vec();
         r.finish()?;
 
-        // Fail closed on any critical option we don't implement.
-        if !critical.is_empty() {
-            let names = read_string_list(&critical).unwrap_or_default();
-            return Err(Error::Auth(format!(
-                "certificate carries unsupported critical option(s): {}",
-                names.join(", ")
-            )));
-        }
-
         let ca_key = PublicKey::from_blob(&sig_key_blob)?;
         ca_key
             .verify(&blob[..signed_len], &signature)
             .map_err(|_| Error::Auth("certificate signature is invalid".into()))?;
+
+        // Only interpret the (CA-signed) critical options now the signature
+        // has checked out. Known options are captured; any other rejects the
+        // cert (fail-closed).
+        let (force_command, source_address) = parse_critical_options(&critical)?;
 
         Ok(Certificate {
             key,
@@ -149,6 +270,8 @@ impl Certificate {
             principals,
             valid_after,
             valid_before,
+            force_command,
+            source_address,
             ca_key,
             blob: blob.to_vec(),
         })
@@ -181,6 +304,20 @@ impl Certificate {
     pub fn permits_principal(&self, principal: &str) -> bool {
         self.principals.is_empty() || self.principals.iter().any(|p| p == principal)
     }
+
+    /// Does this cert's `source-address` option (if any) admit a client at
+    /// `peer`? A cert without the option admits anyone; a cert *with* it
+    /// needs a known peer address inside its ranges — an unknown address
+    /// (`None`) is refused rather than waved through.
+    pub fn permits_source(&self, peer: Option<std::net::IpAddr>) -> bool {
+        match &self.source_address {
+            None => true,
+            Some(list) => match peer {
+                Some(ip) => source_address_permits(list, ip),
+                None => false,
+            },
+        }
+    }
 }
 
 /// The current time in seconds since the Unix epoch (for validity checks).
@@ -202,7 +339,23 @@ pub fn sign_user_cert(
     valid_after: u64,
     valid_before: u64,
 ) -> Vec<u8> {
-    sign_cert(ca, user_key.0.as_bytes(), None, CERT_TYPE_USER, serial, key_id, principals, valid_after, valid_before)
+    sign_user_cert_with(ca, user_key, &CertOptions::default(), serial, key_id, principals, valid_after, valid_before)
+}
+
+/// Sign a user certificate carrying critical options (`force-command` /
+/// `source-address`).
+#[allow(clippy::too_many_arguments)]
+pub fn sign_user_cert_with(
+    ca: &PrivateKey,
+    user_key: &PublicKey,
+    options: &CertOptions,
+    serial: u64,
+    key_id: &str,
+    principals: &[String],
+    valid_after: u64,
+    valid_before: u64,
+) -> Vec<u8> {
+    sign_cert(ca, user_key.0.as_bytes(), None, CERT_TYPE_USER, options, serial, key_id, principals, valid_after, valid_before)
 }
 
 /// Sign a host certificate for `host_key`. The principals are hostnames.
@@ -216,7 +369,7 @@ pub fn sign_host_cert(
     valid_after: u64,
     valid_before: u64,
 ) -> Vec<u8> {
-    sign_cert(ca, host_key.0.as_bytes(), None, CERT_TYPE_HOST, serial, key_id, principals, valid_after, valid_before)
+    sign_cert(ca, host_key.0.as_bytes(), None, CERT_TYPE_HOST, &CertOptions::default(), serial, key_id, principals, valid_after, valid_before)
 }
 
 /// Sign a user certificate for a FIDO2 security key (`sk_key`).
@@ -230,11 +383,27 @@ pub fn sign_sk_user_cert(
     valid_after: u64,
     valid_before: u64,
 ) -> Vec<u8> {
+    sign_sk_user_cert_with(ca, sk_key, &CertOptions::default(), serial, key_id, principals, valid_after, valid_before)
+}
+
+/// Sign a security-key user certificate carrying critical options.
+#[allow(clippy::too_many_arguments)]
+pub fn sign_sk_user_cert_with(
+    ca: &PrivateKey,
+    sk_key: &SkPublicKey,
+    options: &CertOptions,
+    serial: u64,
+    key_id: &str,
+    principals: &[String],
+    valid_after: u64,
+    valid_before: u64,
+) -> Vec<u8> {
     sign_cert(
         ca,
         &sk_key.ed25519_bytes(),
         Some(sk_key.application()),
         CERT_TYPE_USER,
+        options,
         serial,
         key_id,
         principals,
@@ -249,6 +418,7 @@ fn sign_cert(
     key_point: &[u8],
     sk_application: Option<&str>,
     cert_type: u32,
+    options: &CertOptions,
     serial: u64,
     key_id: &str,
     principals: &[String],
@@ -274,7 +444,22 @@ fn sign_cert(
     w.string(&pack_string_list(principals));
     w.u64(valid_after);
     w.u64(valid_before);
-    w.string(b""); // critical options: none
+    // Critical options, written in ascending name order (force-command <
+    // source-address). Each value is an SSH string nested in the data string.
+    let mut crit = Writer::new();
+    if let Some(cmd) = &options.force_command {
+        crit.utf8("force-command");
+        let mut d = Writer::new();
+        d.utf8(cmd);
+        crit.string(&d.into_bytes());
+    }
+    if let Some(src) = &options.source_address {
+        crit.utf8("source-address");
+        let mut d = Writer::new();
+        d.utf8(src);
+        crit.string(&d.into_bytes());
+    }
+    w.string(&crit.into_bytes());
     // The permit-* extensions apply to user certs only; host certs carry none.
     let mut ext = Writer::new();
     if cert_type == CERT_TYPE_USER {
@@ -404,5 +589,124 @@ mod tests {
         let cert = Certificate::parse_and_verify(&blob).unwrap();
         assert!(cert.sk_application.is_none());
         assert!(matches!(cert.certified_user_key(), UserKey::Ed25519(_)));
+    }
+
+    // ------------------------------------------------ critical options ---
+
+    #[test]
+    fn force_command_round_trips() {
+        let ca = PrivateKey::generate();
+        let user = PrivateKey::generate();
+        let opts = CertOptions {
+            force_command: Some("/usr/bin/backup --nightly".into()),
+            ..Default::default()
+        };
+        let blob = sign_user_cert_with(&ca, &user.public(), &opts, 1, "id", &["river".into()], 0, u64::MAX);
+        let cert = Certificate::parse_and_verify(&blob).unwrap();
+        assert_eq!(cert.force_command.as_deref(), Some("/usr/bin/backup --nightly"));
+        assert!(cert.source_address.is_none());
+    }
+
+    #[test]
+    fn source_address_round_trips_and_matches() {
+        use std::net::IpAddr;
+        let ca = PrivateKey::generate();
+        let user = PrivateKey::generate();
+        let opts = CertOptions {
+            source_address: Some("192.0.2.0/24,203.0.113.5".into()),
+            ..Default::default()
+        };
+        let blob = sign_user_cert_with(&ca, &user.public(), &opts, 1, "id", &[], 0, u64::MAX);
+        let cert = Certificate::parse_and_verify(&blob).unwrap();
+        assert_eq!(cert.source_address.as_deref(), Some("192.0.2.0/24,203.0.113.5"));
+
+        // Inside the /24, and the exact single host: admitted.
+        assert!(cert.permits_source(Some("192.0.2.77".parse::<IpAddr>().unwrap())));
+        assert!(cert.permits_source(Some("203.0.113.5".parse::<IpAddr>().unwrap())));
+        // Outside every range: refused. Unknown address: refused (fail-closed).
+        assert!(!cert.permits_source(Some("198.51.100.1".parse::<IpAddr>().unwrap())));
+        assert!(!cert.permits_source(None));
+    }
+
+    #[test]
+    fn no_source_address_admits_anyone() {
+        use std::net::IpAddr;
+        let (_ca, _user, blob) = user_cert(&["x"], 0, u64::MAX);
+        let cert = Certificate::parse_and_verify(&blob).unwrap();
+        assert!(cert.permits_source(Some("10.0.0.1".parse::<IpAddr>().unwrap())));
+        assert!(cert.permits_source(None));
+    }
+
+    #[test]
+    fn source_address_cidr_edges_and_negation() {
+        use std::net::IpAddr;
+        let v4 = |s: &str| s.parse::<IpAddr>().unwrap();
+        // /32 is a single host.
+        assert!(source_address_permits("10.1.2.3/32", v4("10.1.2.3")));
+        assert!(!source_address_permits("10.1.2.3/32", v4("10.1.2.4")));
+        // /0 matches everything.
+        assert!(source_address_permits("0.0.0.0/0", v4("8.8.8.8")));
+        // A v4 rule never admits a v6 peer.
+        assert!(!source_address_permits("10.0.0.0/8", "::1".parse::<IpAddr>().unwrap()));
+        // IPv6 prefix matching.
+        assert!(source_address_permits("2001:db8::/32", "2001:db8::dead".parse::<IpAddr>().unwrap()));
+        assert!(!source_address_permits("2001:db8::/32", "2001:dba::1".parse::<IpAddr>().unwrap()));
+        // An IPv4-mapped v6 peer is folded to plain v4 and matches a v4 rule.
+        assert!(source_address_permits("192.0.2.0/24", "::ffff:192.0.2.9".parse::<IpAddr>().unwrap()));
+        // Negation: in the subnet but explicitly excluded → denied.
+        assert!(!source_address_permits("10.0.0.0/8,!10.9.9.9", v4("10.9.9.9")));
+        assert!(source_address_permits("10.0.0.0/8,!10.9.9.9", v4("10.1.1.1")));
+    }
+
+    #[test]
+    fn both_options_present_are_ordered() {
+        // force-command sorts before source-address; a cert with both must
+        // parse (the parser rejects unsorted/duplicate option names).
+        let ca = PrivateKey::generate();
+        let user = PrivateKey::generate();
+        let opts = CertOptions {
+            force_command: Some("id".into()),
+            source_address: Some("127.0.0.1/32".into()),
+        };
+        let blob = sign_user_cert_with(&ca, &user.public(), &opts, 1, "id", &[], 0, u64::MAX);
+        let cert = Certificate::parse_and_verify(&blob).unwrap();
+        assert_eq!(cert.force_command.as_deref(), Some("id"));
+        assert_eq!(cert.source_address.as_deref(), Some("127.0.0.1/32"));
+    }
+
+    #[test]
+    fn unknown_critical_option_still_rejected() {
+        // Hand-build a cert body with an unsupported critical option and a
+        // valid CA signature; parse must reject it (fail-closed).
+        let ca = PrivateKey::generate();
+        let user = PrivateKey::generate();
+        let mut w = Writer::new();
+        w.utf8(CERT_ALGO);
+        w.string(&[0u8; 32]); // nonce
+        w.string(user.public().0.as_bytes());
+        w.u64(1);
+        w.u32(CERT_TYPE_USER);
+        w.utf8("id");
+        w.string(&pack_string_list(&[]));
+        w.u64(0);
+        w.u64(u64::MAX);
+        let mut crit = Writer::new();
+        crit.utf8("verify-required"); // an option we do not implement
+        crit.string(b"");
+        w.string(&crit.into_bytes());
+        w.string(b""); // extensions
+        w.string(b""); // reserved
+        w.string(&ca.public().to_blob());
+        let body = w.into_bytes();
+        let sig = ca.sign(&body);
+        let mut full = body;
+        let mut sw = Writer::new();
+        sw.string(&sig);
+        full.extend_from_slice(&sw.into_bytes());
+
+        match Certificate::parse_and_verify(&full) {
+            Err(e) => assert!(format!("{e}").contains("unsupported critical option")),
+            Ok(_) => panic!("expected an unsupported-critical-option error"),
+        }
     }
 }

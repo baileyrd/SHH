@@ -63,6 +63,13 @@ struct Args {
     /// Certificate serial number.
     #[arg(long = "serial", default_value_t = 0)]
     serial: u64,
+
+    /// Certificate critical option, `key=value`, repeatable. Supported on
+    /// user certs: `force-command=<cmd>` (the session runs this whatever the
+    /// client asked) and `source-address=<cidr[,cidr...]>` (the cert is
+    /// refused from a client outside those ranges). Mirrors `ssh-keygen -O`.
+    #[arg(short = 'O', long = "option", value_name = "KEY=VALUE")]
+    options: Vec<String>,
 }
 
 /// Resolve the passphrase for a freshly generated key: flag wins; otherwise
@@ -138,13 +145,19 @@ fn sign_certificate(args: &Args, ca_path: &Path) -> std::io::Result<()> {
     let valid_after = now.saturating_sub(60); // small clock-skew grace
     let valid_before = now + args.days.saturating_mul(86_400);
 
+    let options = parse_cert_options(&args.options);
+    if args.host && options != cert::CertOptions::default() {
+        eprintln!("shh-keygen: critical options (-O) apply to user certificates only");
+        std::process::exit(1);
+    }
+
     let (blob, algo) = match &user_key {
         UserKey::Ed25519(key) if args.host => (
             cert::sign_host_cert(&ca, key, args.serial, &args.cert_id, &principals, valid_after, valid_before),
             cert::CERT_ALGO,
         ),
         UserKey::Ed25519(key) => (
-            cert::sign_user_cert(&ca, key, args.serial, &args.cert_id, &principals, valid_after, valid_before),
+            cert::sign_user_cert_with(&ca, key, &options, args.serial, &args.cert_id, &principals, valid_after, valid_before),
             cert::CERT_ALGO,
         ),
         UserKey::Sk(_) if args.host => {
@@ -152,7 +165,7 @@ fn sign_certificate(args: &Args, ca_path: &Path) -> std::io::Result<()> {
             std::process::exit(1);
         }
         UserKey::Sk(sk) => (
-            cert::sign_sk_user_cert(&ca, sk, args.serial, &args.cert_id, &principals, valid_after, valid_before),
+            cert::sign_sk_user_cert_with(&ca, sk, &options, args.serial, &args.cert_id, &principals, valid_after, valid_before),
             cert::SK_CERT_ALGO,
         ),
     };
@@ -177,7 +190,40 @@ fn sign_certificate(args: &Args, ca_path: &Path) -> std::io::Result<()> {
     println!("{kind} certificate: {}", cert_path.display());
     println!("  signed by CA {}", ca.public().fingerprint());
     println!("  id {:?}, serial {}, valid for {} day(s), principals: {who}", args.cert_id, args.serial, args.days);
+    if let Some(cmd) = &options.force_command {
+        println!("  force-command: {cmd:?}");
+    }
+    if let Some(src) = &options.source_address {
+        println!("  source-address: {src}");
+    }
     Ok(())
+}
+
+/// Turn `-O key=value` flags into [`cert::CertOptions`]. Unknown keys are a
+/// hard error rather than a silent no-op.
+fn parse_cert_options(raw: &[String]) -> cert::CertOptions {
+    let mut opts = cert::CertOptions::default();
+    for item in raw {
+        let (key, value) = match item.split_once('=') {
+            Some(kv) => kv,
+            None => {
+                eprintln!("shh-keygen: -O expects key=value, got {item:?}");
+                std::process::exit(2);
+            }
+        };
+        match key {
+            "force-command" => opts.force_command = Some(value.to_owned()),
+            "source-address" => opts.source_address = Some(value.to_owned()),
+            other => {
+                eprintln!(
+                    "shh-keygen: unsupported certificate option {other:?} \
+                     (force-command, source-address)"
+                );
+                std::process::exit(2);
+            }
+        }
+    }
+    opts
 }
 
 fn generate_key(args: &Args) -> std::io::Result<()> {

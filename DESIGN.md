@@ -192,8 +192,21 @@ shh/                 one library crate
    hides identities behind a constant-time passphrase check; the lifetime
    constraint expires keys server-side. Connections are accepted only
    from the agent's own uid (`SO_PEERCRED`), the socket is 0600 inside a
-   0700 directory, and seeds are zeroized wherever they pass. Remaining:
-   `sk-ssh-ed25519` FIDO2 keys, agent *forwarding* (with
-   `session-bind@openssh.com` destination restriction), and a sandboxed
-   pre-auth process (privilege *separation*, a further step beyond
-   milestone 6's privilege *drop*).
+   0700 directory, and seeds are zeroized wherever they pass.
+8. **Agent forwarding (done).** `shh -A` asks the server to relay agent
+   connections back over the connection (`auth-agent-req@openssh.com` /
+   `auth-agent@openssh.com`, the OpenSSH extension). Both defaults are
+   *off*: the client never offers its agent unasked, and `shhd` refuses
+   the request without `--permit-agent-forwarding` — agent forwarding is
+   a third forwarding kind behind the same default-deny posture as `-L`
+   and `-R`. Server-side, each session gets a fresh socket in a 0700
+   directory owned by the session user, guarded by an `SO_PEERCRED` uid
+   check (not just file modes), torn down with the session. A client that
+   did not send `-A` refuses `auth-agent` channel opens outright, and the
+   daemon scrubs its own inherited `SSH_AUTH_SOCK` from session
+   environments so an operator's agent can never leak into sessions.
+   Remaining: `sk-ssh-ed25519` FIDO2 keys, `session-bind@openssh.com`
+   destination restriction (our agent currently answers the extension
+   with FAILURE, so restricted-use bindings are not enforced), and a
+   sandboxed pre-auth process (privilege *separation*, a further step
+   beyond milestone 6's privilege *drop*).

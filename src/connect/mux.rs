@@ -34,18 +34,29 @@ use crate::transport::Transport;
 use crate::wire::{disconnect, msg, Reader, Writer};
 use crate::{Error, Result};
 
+/// The channel type for forwarded agent connections (OpenSSH extension).
+/// Its CHANNEL_OPEN carries no type-specific fields.
+pub(crate) const AGENT_CHANNEL: &str = "auth-agent@openssh.com";
+
+/// Any byte stream a tunnel channel can splice — a TCP socket for the
+/// `-L`/`-R` forwards, a Unix socket for a forwarded agent.
+pub(crate) trait TunnelIo: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> TunnelIo for T {}
+pub(crate) type BoxedIo = Box<dyn TunnelIo>;
+
 /// Commands from channel tasks and forward acceptors to the loop.
 pub(crate) enum Cmd {
     /// An acceptor asks to open a tunnel channel (`direct-tcpip` for `-L`,
-    /// `forwarded-tcpip` for `-R`) carrying an accepted socket. `addr`/`port`
-    /// are the open's address fields.
+    /// `forwarded-tcpip` for `-R`, [`AGENT_CHANNEL`] for agent forwarding)
+    /// carrying an accepted socket. `addr`/`port` are the open's address
+    /// fields; the agent channel type has none and ignores them.
     OpenTunnel {
         channel_type: &'static str,
         addr: String,
         port: u16,
         orig_host: String,
         orig_port: u16,
-        stream: TcpStream,
+        stream: BoxedIo,
     },
     /// A client asks the server to listen and forward back (`tcpip-forward`).
     RemoteForward {
@@ -56,12 +67,13 @@ pub(crate) enum Cmd {
     },
     /// A client asks a session channel.
     OpenSession(Box<SessionSpec>),
-    /// Result of a server-side connect for an incoming direct-tcpip open.
+    /// Result of a local connect for an incoming tunnel open (the server's
+    /// direct-tcpip target, or the client's agent socket).
     Connected {
         peer_id: u32,
         peer_window: u32,
         peer_max: u32,
-        stream: std::io::Result<TcpStream>,
+        stream: std::io::Result<BoxedIo>,
     },
     /// Channel data cleared to send (send-window credit already spent).
     Data { id: u32, bytes: Vec<u8> },
@@ -118,7 +130,7 @@ impl Handle {
             port: target_port,
             orig_host,
             orig_port,
-            stream,
+            stream: Box::new(stream),
         });
     }
 
@@ -138,7 +150,7 @@ impl Handle {
             port,
             orig_host,
             orig_port,
-            stream,
+            stream: Box::new(stream),
         });
     }
 
@@ -183,7 +195,7 @@ struct Chan {
 }
 
 enum Pending {
-    Direct(TcpStream),
+    Direct(BoxedIo),
     Session(Box<SessionSpec>),
 }
 
@@ -229,6 +241,11 @@ pub struct Connection<S> {
     recv_since_tick: bool,
     /// The account server-side sessions run as (privilege drop when root).
     session_user: Option<super::UserContext>,
+    /// Client role: the local agent socket to splice [`AGENT_CHANNEL`]
+    /// opens to (`-A`). `None` refuses such opens.
+    agent_path: Option<std::path::PathBuf>,
+    /// Server role: whether sessions may request agent forwarding.
+    permit_agent: bool,
     next_id: u32,
     cmd_tx: mpsc::UnboundedSender<Cmd>,
     cmd_rx: mpsc::UnboundedReceiver<Cmd>,
@@ -284,6 +301,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
             keepalive_outstanding: 0,
             recv_since_tick: true,
             session_user: None,
+            agent_path: None,
+            permit_agent: false,
             next_id: 0,
             cmd_tx,
             cmd_rx,
@@ -309,6 +328,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
     /// Run server-side sessions as this account (privilege drop when root).
     pub fn session_user(mut self, user: Option<super::UserContext>) -> Self {
         self.session_user = user;
+        self
+    }
+
+    /// Client role: splice server-opened agent channels to the agent socket
+    /// at `path` (`-A`). Without this, such opens are refused.
+    pub fn agent_forward(mut self, path: Option<std::path::PathBuf>) -> Self {
+        self.agent_path = path;
+        self
+    }
+
+    /// Server role: allow sessions to request agent forwarding (default:
+    /// refused, consistent with the tcpip forwarding allowlists).
+    pub fn permit_agent_forward(mut self, permit: bool) -> Self {
+        self.permit_agent = permit;
         self
     }
 
@@ -483,6 +516,26 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
                     }
                 }
             }
+            // Client side of `-A`: the server relays a connection from a
+            // remote process back to our local agent.
+            AGENT_CHANNEL => {
+                r.finish()?;
+                match self.agent_path.clone() {
+                    Some(path) => {
+                        self.spawn_connect_agent(sender, window, max, path);
+                        Ok(())
+                    }
+                    None => {
+                        tracing::info!("agent channel refused (forwarding not requested)");
+                        self.reject_open(
+                            sender,
+                            open_failure::ADMINISTRATIVELY_PROHIBITED,
+                            "agent forwarding was not requested",
+                        )
+                        .await
+                    }
+                }
+            }
             _ => {
                 self.reject_open(sender, open_failure::UNKNOWN_CHANNEL_TYPE, "unsupported channel type")
                     .await
@@ -503,7 +556,27 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
                 peer_id,
                 peer_window,
                 peer_max,
-                stream,
+                stream: stream.map(|s| Box::new(s) as BoxedIo),
+            });
+        });
+    }
+
+    /// Connect to the local agent socket for an accepted agent channel.
+    fn spawn_connect_agent(
+        &self,
+        peer_id: u32,
+        peer_window: u32,
+        peer_max: u32,
+        path: std::path::PathBuf,
+    ) {
+        let cmd_tx = self.cmd_tx.clone();
+        tokio::spawn(async move {
+            let stream = tokio::net::UnixStream::connect(&path).await;
+            let _ = cmd_tx.send(Cmd::Connected {
+                peer_id,
+                peer_window,
+                peer_max,
+                stream: stream.map(|s| Box::new(s) as BoxedIo),
             });
         });
     }
@@ -799,10 +872,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
                 w.u32(id);
                 w.u32(LOCAL_WINDOW);
                 w.u32(MAX_CHUNK);
-                w.utf8(&addr);
-                w.u32(port as u32);
-                w.utf8(&orig_host);
-                w.u32(orig_port as u32);
+                // The agent channel type carries no type-specific fields.
+                if channel_type != AGENT_CHANNEL {
+                    w.utf8(&addr);
+                    w.u32(port as u32);
+                    w.utf8(&orig_host);
+                    w.u32(orig_port as u32);
+                }
                 self.t.send(&w.into_bytes()).await?;
             }
             Cmd::RemoteForward {
@@ -953,7 +1029,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         (credit, peer_window, to_task_rx)
     }
 
-    fn spawn_forward(&mut self, id: u32, peer_id: u32, peer_window: u32, peer_max: u32, stream: TcpStream) {
+    fn spawn_forward(&mut self, id: u32, peer_id: u32, peer_window: u32, peer_max: u32, stream: BoxedIo) {
         let (credit, _, rx) = self.insert_chan(id, peer_id, peer_window, false, false);
         let remote_max = peer_max.clamp(1, MAX_CHUNK);
         tokio::spawn(forward::forward_task(
@@ -976,6 +1052,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
             rx,
             self.cmd_tx.clone(),
             self.session_user.clone(),
+            self.permit_agent,
         ));
     }
 
@@ -1109,36 +1186,51 @@ mod tests {
         drop(server);
     }
 
+    /// A shareable stdout sink for session tests.
+    #[derive(Clone, Default)]
+    struct VecSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl AsyncWrite for VecSink {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            b: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            std::task::Poll::Ready(Ok(b.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Wait for the session to print a full line, then return it.
+    async fn wait_for_line(out: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>) -> String {
+        for _ in 0..500 {
+            {
+                let v = out.lock().unwrap();
+                if let Some(pos) = v.iter().position(|&b| b == b'\n') {
+                    return String::from_utf8_lossy(&v[..pos]).into_owned();
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("session never printed its line");
+    }
+
     #[tokio::test]
     async fn session_and_forward_share_one_connection() {
         use super::super::session::SessionSpec;
-        use std::pin::Pin;
         use std::sync::{Arc, Mutex};
-        use std::task::{Context, Poll};
         use tokio::sync::oneshot;
-
-        // A shareable stdout sink for the session.
-        #[derive(Clone)]
-        struct VecSink(Arc<Mutex<Vec<u8>>>);
-        impl AsyncWrite for VecSink {
-            fn poll_write(
-                self: Pin<&mut Self>,
-                _: &mut Context<'_>,
-                b: &[u8],
-            ) -> Poll<std::io::Result<usize>> {
-                self.0.lock().unwrap().extend_from_slice(b);
-                Poll::Ready(Ok(b.len()))
-            }
-            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-                Poll::Ready(Ok(()))
-            }
-            fn poll_shutdown(
-                self: Pin<&mut Self>,
-                _: &mut Context<'_>,
-            ) -> Poll<std::io::Result<()>> {
-                Poll::Ready(Ok(()))
-            }
-        }
 
         let target = echo_server().await;
         let (client_t, server_t) = transport_pair().await;
@@ -1170,6 +1262,7 @@ mod tests {
             stdout: Box::new(VecSink(out.clone())),
             stderr: Box::new(tokio::io::sink()),
             exit: exit_tx,
+            forward_agent: false,
             end_connection_on_close: false,
         });
         let client = tokio::spawn(async move { client_conn.run(None).await });
@@ -1304,5 +1397,139 @@ mod tests {
         assert_eq!(n, 0, "denied forward must not echo data");
 
         drop(server);
+    }
+
+    // ------------------------------------------------- agent forwarding ---
+
+    /// A keyring behind a real Unix socket, standing in for the user's
+    /// local agent. Returns the socket path (the tempdir rides along so it
+    /// lives as long as the test).
+    async fn local_agent(
+        keyring: std::sync::Arc<crate::agent::server::Keyring>,
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("agent.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((s, _)) = listener.accept().await else {
+                    break;
+                };
+                let kr = keyring.clone();
+                tokio::spawn(async move {
+                    let _ = crate::agent::server::serve_conn(s, &kr).await;
+                });
+            }
+        });
+        (dir, sock)
+    }
+
+    /// Open a session that prints its SSH_AUTH_SOCK and stays alive, and
+    /// return the printed line (empty when the server granted nothing).
+    async fn session_reporting_agent_sock(
+        handle: &Handle,
+        forward_agent: bool,
+    ) -> (String, tokio::sync::oneshot::Receiver<super::super::ExitStatus>) {
+        use super::super::session::SessionSpec;
+        let out = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
+        handle.open_session(SessionSpec {
+            command: Some(r#"printf '%s\n' "$SSH_AUTH_SOCK"; sleep 30"#.into()),
+            pty: None,
+            resize: None,
+            stdin: Box::new(tokio::io::empty()),
+            stdout: Box::new(VecSink(out.clone())),
+            stderr: Box::new(tokio::io::sink()),
+            exit: exit_tx,
+            forward_agent,
+            end_connection_on_close: false,
+        });
+        (wait_for_line(&out).await, exit_rx)
+    }
+
+    #[tokio::test]
+    async fn agent_forwarding_relays_to_the_local_agent() {
+        // The "local" agent holds one key.
+        let keyring = std::sync::Arc::new(crate::agent::server::Keyring::new());
+        let (_dir, local_sock) = local_agent(keyring).await;
+        let key = PrivateKey::generate();
+        let mut direct = crate::agent::Client::connect(&local_sock).await.unwrap();
+        direct.add(&key, None, "forwarded", None).await.unwrap();
+
+        let (client_t, server_t) = transport_pair().await;
+        let server = tokio::spawn(async move {
+            Connection::new(server_t, Policy::DenyAll)
+                .permit_agent_forward(true)
+                .run(None)
+                .await
+        });
+        let client_conn =
+            Connection::new(client_t, Policy::DenyAll).agent_forward(Some(local_sock));
+        let handle = client_conn.handle();
+        let client = tokio::spawn(async move { client_conn.run(None).await });
+
+        // The session's SSH_AUTH_SOCK names the server-side relay socket.
+        let (path, _exit_rx) = session_reporting_agent_sock(&handle, true).await;
+        assert!(!path.is_empty(), "session should see an SSH_AUTH_SOCK");
+
+        // Drive the real agent protocol through the whole relay: server
+        // socket -> channel -> client -> local socket -> keyring.
+        let mut relayed = crate::agent::Client::connect(&path).await.unwrap();
+        let ids = relayed.identities().await.unwrap();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0].comment, "forwarded");
+        let sig = relayed.sign(&ids[0].blob, b"signed across the wire").await.unwrap();
+        key.public().verify(b"signed across the wire", &sig).unwrap();
+
+        client.abort();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn agent_forwarding_refused_without_server_permit() {
+        let (client_t, server_t) = transport_pair().await;
+        // Server default: no permit.
+        let server =
+            tokio::spawn(async move { Connection::new(server_t, Policy::DenyAll).run(None).await });
+        let client_conn = Connection::new(client_t, Policy::DenyAll)
+            .agent_forward(Some(std::path::PathBuf::from("/nonexistent")));
+        let handle = client_conn.handle();
+        let client = tokio::spawn(async move { client_conn.run(None).await });
+
+        // The request is silently refused: the session simply has no
+        // SSH_AUTH_SOCK, and nothing else about it breaks.
+        let (path, _exit_rx) = session_reporting_agent_sock(&handle, true).await;
+        assert!(path.is_empty(), "refused forwarding must not set SSH_AUTH_SOCK, got {path:?}");
+
+        client.abort();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn client_refuses_agent_channels_it_did_not_request() {
+        // The server permits and sets up its socket, but this client never
+        // offered an agent (`agent_forward(None)`) — a malicious or confused
+        // server-side process must find a dead end, not a fallback.
+        let (client_t, server_t) = transport_pair().await;
+        let server = tokio::spawn(async move {
+            Connection::new(server_t, Policy::DenyAll)
+                .permit_agent_forward(true)
+                .run(None)
+                .await
+        });
+        let client_conn = Connection::new(client_t, Policy::DenyAll); // no agent
+        let handle = client_conn.handle();
+        let client = tokio::spawn(async move { client_conn.run(None).await });
+
+        let (path, _exit_rx) = session_reporting_agent_sock(&handle, true).await;
+        assert!(!path.is_empty(), "server set up its side of the relay");
+
+        // The relay socket exists, but every channel through it is refused
+        // by the client, so the agent conversation dies at the first query.
+        let mut relayed = crate::agent::Client::connect(&path).await.unwrap();
+        assert!(relayed.identities().await.is_err());
+
+        client.abort();
+        server.abort();
     }
 }

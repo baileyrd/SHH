@@ -106,6 +106,22 @@ legacy key types, confirm-per-use, unknown constraints or extensions — is
 refused, never silently ignored. Connections from other uids are dropped,
 and `shh --no-agent` forces key files even when an agent is running.
 
+**Agent forwarding** (`-A`) relays agent connections from the server back
+to the local agent, so a session can hop onward (`ssh`/`shh` from the
+remote host) without any key ever leaving this machine:
+
+```console
+$ shh -A you@bastion            # remote processes see an SSH_AUTH_SOCK
+bastion$ shh you@internal-host  # signs via YOUR local agent
+```
+
+Unlike OpenSSH, the server default is deny: `shhd` honors the request only
+with `--permit-agent-forwarding`, the same posture as the `-L`/`-R`
+allowlists. The per-session relay socket is owned by the session user and
+checked by peer uid, a client that didn't pass `-A` refuses relay channels
+outright, and forward it only to servers you trust — root there can use
+(though never read) your keys while the session lasts.
+
 `shh host cmd` behaves like `ssh`: stdin is forwarded, stdout/stderr come
 back separated, and the remote exit status becomes `shh`'s exit status.
 `shh host` with a terminal opens an interactive shell on a real
@@ -174,7 +190,9 @@ authenticated user's account — uid, gid, supplementary groups, home
 directory, and login shell — so a session is never more privileged than
 the account that logged in; an unknown login name is refused. `shh-agent`
 is a drop-in, Ed25519-only `ssh-agent` (interop verified with `ssh-add`
-and `ssh` both ways). Not yet implemented: FIDO2 `sk-ssh-ed25519` keys,
-agent *forwarding*, and a sandboxed pre-auth process (privilege
-*separation*, distinct from the privilege *drop* above). Treat it as a
-working protocol implementation, not a hardened production daemon.
+and `ssh` both ways), and agent forwarding (`-A`, server default-deny via
+`--permit-agent-forwarding`) relays it across hops. Not yet implemented:
+FIDO2 `sk-ssh-ed25519` keys, `session-bind@openssh.com` agent
+restriction, and a sandboxed pre-auth process (privilege *separation*,
+distinct from the privilege *drop* above). Treat it as a working protocol
+implementation, not a hardened production daemon.

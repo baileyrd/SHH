@@ -17,7 +17,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot, Semaphore};
 
-use super::mux::{Cmd, ToTask};
+use super::mux::{Cmd, ToTask, AGENT_CHANNEL};
 use super::{maybe_read, maybe_recv, pty, ExitStatus, PtyRequest, WindowChange, MAX_CHUNK, STDERR};
 use crate::wire::{Reader, Writer};
 
@@ -32,6 +32,10 @@ pub struct SessionSpec {
     pub stderr: Box<dyn AsyncWrite + Unpin + Send>,
     /// Delivered the remote exit status when the channel closes.
     pub exit: oneshot::Sender<ExitStatus>,
+
+    /// Ask the server to forward our agent (`-A`): processes it runs can
+    /// reach back through the connection to the local `SSH_AUTH_SOCK`.
+    pub forward_agent: bool,
     /// End the whole connection when this channel closes (foreground
     /// `shh host cmd`); false when forwards should outlive the session.
     pub end_connection_on_close: bool,
@@ -173,14 +177,25 @@ pub(crate) async fn session_client_task(
         mut stdout,
         mut stderr,
         exit,
+        forward_agent,
         ..
     } = spec;
 
-    // Requests: optional pty, then exec/shell — each awaits its reply.
+    // Requests: agent forwarding (fire-and-forget, as OpenSSH sends it —
+    // refusal just means no forwarding), optional pty, then exec/shell.
     let give_up = |exit: oneshot::Sender<ExitStatus>| {
         let _ = exit.send(ExitStatus { code: None, signal: None });
         let _ = cmd_tx.send(Cmd::Close { id });
     };
+    if forward_agent {
+        let mut w = Writer::new();
+        w.utf8("auth-agent-req@openssh.com");
+        w.boolean(false);
+        let _ = cmd_tx.send(Cmd::ChannelRequest {
+            id,
+            body: w.into_bytes(),
+        });
+    }
     if let Some(req) = &pty {
         let _ = cmd_tx.send(Cmd::ChannelRequest {
             id,
@@ -277,10 +292,14 @@ pub(crate) async fn session_server_task(
     mut to_task: mpsc::UnboundedReceiver<ToTask>,
     cmd_tx: mpsc::UnboundedSender<Cmd>,
     user: Option<super::UserContext>,
+    permit_agent: bool,
 ) {
     let mut allocated: Option<pty::Pty> = None;
     let mut early_stdin: Vec<u8> = Vec::new();
     let mut stdin_eof = false;
+    // Lives as long as the session: dropping it (any exit path) stops the
+    // acceptor and removes the socket.
+    let mut agent_fwd: Option<AgentListener> = None;
 
     // Phase 1: wait for exec/shell, honoring pty-req and early stdin.
     let mut child = loop {
@@ -317,6 +336,20 @@ pub(crate) async fn session_server_task(
                         let _ = cmd_tx.send(Cmd::RequestReply { id, success: true });
                     }
                 }
+                "auth-agent-req@openssh.com" => {
+                    let ok = if !permit_agent {
+                        tracing::info!("agent forwarding refused (no --permit-agent-forwarding)");
+                        false
+                    } else if agent_fwd.is_some() {
+                        true // one socket per session; a repeat is harmless
+                    } else {
+                        agent_fwd = start_agent_listener(&cmd_tx, user.as_ref());
+                        agent_fwd.is_some()
+                    };
+                    if want_reply {
+                        let _ = cmd_tx.send(Cmd::RequestReply { id, success: ok });
+                    }
+                }
                 "exec" | "shell" => {
                     // The login shell: the account's shell when we know it,
                     // else $SHELL / /bin/sh.
@@ -331,6 +364,13 @@ pub(crate) async fn session_server_task(
                         cmd.arg("-c").arg(line);
                     }
                     cmd.kill_on_drop(true);
+                    // The child sees an SSH_AUTH_SOCK only when the client
+                    // forwarded an agent — never the daemon's own, which
+                    // would hand every session the operator's keys.
+                    cmd.env_remove("SSH_AUTH_SOCK");
+                    if let Some(fwd) = &agent_fwd {
+                        cmd.env("SSH_AUTH_SOCK", &fwd.sock);
+                    }
                     match spawn_child(&mut cmd, allocated.as_mut(), user.as_ref()) {
                         Ok(c) => {
                             if want_reply {
@@ -498,6 +538,113 @@ fn allocate_pty(data: &[u8], slot: &mut Option<pty::Pty>) -> bool {
 /// `pre_exec` hook — become a session leader with the pty as controlling
 /// terminal and, when running as root, drop to the target user's
 /// credentials before exec.
+/// A per-session agent socket whose connections become agent channels back
+/// to the client. Dropping it stops the acceptor and removes the socket.
+struct AgentListener {
+    sock: std::path::PathBuf,
+    dir: std::path::PathBuf,
+    abort: tokio::task::AbortHandle,
+}
+
+impl Drop for AgentListener {
+    fn drop(&mut self) {
+        self.abort.abort();
+        std::fs::remove_file(&self.sock).ok();
+        std::fs::remove_dir(&self.dir).ok();
+    }
+}
+
+/// Bind the session's agent socket and relay every connection to it as an
+/// agent channel. The socket sits in a fresh 0700 directory owned by the
+/// session user, and connections are accepted only from that user (or
+/// ourselves, when not dropping privileges) — checked by peer credentials,
+/// not just file modes.
+fn start_agent_listener(
+    cmd_tx: &mpsc::UnboundedSender<Cmd>,
+    user: Option<&super::UserContext>,
+) -> Option<AgentListener> {
+    use rand_core::{OsRng, RngCore};
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+    let mut rnd = [0u8; 8];
+    OsRng.fill_bytes(&mut rnd);
+    let name: String = rnd.iter().map(|b| format!("{b:02x}")).collect();
+    let dir = std::env::temp_dir().join(format!("shh-{name}"));
+    if let Err(e) = std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+        tracing::warn!("agent socket dir: {e}");
+        return None;
+    }
+    let sock = dir.join(format!("agent.{}", std::process::id()));
+    let cleanup_dir = || {
+        std::fs::remove_dir(&dir).ok();
+    };
+    let listener = match tokio::net::UnixListener::bind(&sock) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!("agent socket bind: {e}");
+            cleanup_dir();
+            return None;
+        }
+    };
+    std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600)).ok();
+
+    // When we will drop privileges, the child runs as the session user —
+    // the socket must be theirs to connect to.
+    let ours = nix::unistd::geteuid();
+    let expect_uid = match user.filter(|_| ours.is_root()) {
+        Some(u) => {
+            let uid = nix::unistd::Uid::from_raw(u.uid);
+            let gid = nix::unistd::Gid::from_raw(u.gid);
+            if let Err(e) = nix::unistd::chown(&dir, Some(uid), Some(gid))
+                .and_then(|()| nix::unistd::chown(&sock, Some(uid), Some(gid)))
+            {
+                tracing::warn!("agent socket chown: {e}");
+                std::fs::remove_file(&sock).ok();
+                cleanup_dir();
+                return None;
+            }
+            u.uid
+        }
+        None => ours.as_raw(),
+    };
+
+    let cmd_tx = cmd_tx.clone();
+    let ours = ours.as_raw();
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            match stream.peer_cred() {
+                Ok(c) if c.uid() == expect_uid || c.uid() == ours => {}
+                Ok(c) => {
+                    tracing::warn!(uid = c.uid(), "refusing agent connection from another uid");
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!("cannot identify agent socket peer: {e}");
+                    continue;
+                }
+            }
+            let _ = cmd_tx.send(Cmd::OpenTunnel {
+                channel_type: AGENT_CHANNEL,
+                addr: String::new(),
+                port: 0,
+                orig_host: String::new(),
+                orig_port: 0,
+                stream: Box::new(stream),
+            });
+        }
+    });
+
+    tracing::info!(sock = %sock.display(), "agent forwarding socket ready");
+    Some(AgentListener {
+        sock,
+        dir,
+        abort: task.abort_handle(),
+    })
+}
+
 fn spawn_child(
     cmd: &mut Command,
     pty: Option<&mut pty::Pty>,

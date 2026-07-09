@@ -818,7 +818,10 @@ mod tests {
 
     /// Echo everything back until the peer disconnects. Runs in its own
     /// task: a rekey needs both ends of the pipe making progress.
-    fn echo_server(mut s: Transport<tokio::io::DuplexStream>) -> tokio::task::JoinHandle<()> {
+    fn echo_server<S>(mut s: Transport<S>) -> tokio::task::JoinHandle<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         tokio::spawn(async move {
             while let Ok(p) = s.recv().await {
                 s.send(&p).await.unwrap();
@@ -881,5 +884,246 @@ mod tests {
         };
         let (c, ()) = tokio::join!(client, feeder);
         assert!(c.is_err());
+    }
+
+    // ---------------------------------------------------------------------
+    // Transport chaos: byte-fragmentation / cancel-safety of the reader.
+    //
+    // TCP gives no message boundaries; a real network can split any packet
+    // across arbitrarily many segments and hand them over a few bytes at a
+    // time. The incremental reader (`recv_raw` + `ReadState`) is built to
+    // survive that and to be cancel-safe under `select!`. These tests model
+    // the pathological case directly rather than hoping the OS produces it.
+    // ---------------------------------------------------------------------
+
+    /// An `AsyncRead`/`AsyncWrite` shim that moves at most `chunk` bytes per
+    /// poll in each direction — a stand-in for a network that fragments the
+    /// stream into tiny segments. Every SSH packet must be reassembled across
+    /// many partial reads without the reader losing sync.
+    struct Dribble<S> {
+        inner: S,
+        chunk: usize,
+    }
+
+    impl<S> Dribble<S> {
+        fn new(inner: S, chunk: usize) -> Self {
+            Dribble {
+                inner,
+                chunk: chunk.max(1),
+            }
+        }
+    }
+
+    impl<S: AsyncRead + Unpin> AsyncRead for Dribble<S> {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let me = self.get_mut();
+            let cap = buf.remaining().min(me.chunk);
+            if cap == 0 {
+                return std::task::Poll::Ready(Ok(()));
+            }
+            let mut tmp = vec![0u8; cap];
+            let mut rb = tokio::io::ReadBuf::new(&mut tmp);
+            match std::pin::Pin::new(&mut me.inner).poll_read(cx, &mut rb) {
+                std::task::Poll::Ready(Ok(())) => {
+                    let n = rb.filled().len();
+                    buf.put_slice(&tmp[..n]);
+                    std::task::Poll::Ready(Ok(()))
+                }
+                other => other,
+            }
+        }
+    }
+
+    impl<S: AsyncWrite + Unpin> AsyncWrite for Dribble<S> {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            data: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let me = self.get_mut();
+            let n = data.len().min(me.chunk);
+            std::pin::Pin::new(&mut me.inner).poll_write(cx, &data[..n])
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        }
+    }
+
+    /// A full handshake through `Dribble` on both ends, `chunk` bytes/poll.
+    async fn dribble_pair(
+        chunk: usize,
+    ) -> (
+        Transport<Dribble<tokio::io::DuplexStream>>,
+        Transport<Dribble<tokio::io::DuplexStream>>,
+    ) {
+        let (a, b) = duplex(1 << 20);
+        let host_key = PrivateKey::generate();
+        let (c, s) = tokio::join!(
+            Transport::client(Dribble::new(a, chunk), trusting_client()),
+            Transport::server(Dribble::new(b, chunk), ServerConfig::with_host_key(host_key)),
+        );
+        (c.unwrap(), s.unwrap())
+    }
+
+    #[tokio::test]
+    async fn handshake_survives_one_byte_at_a_time() {
+        // One byte per poll in both directions: the whole handshake — idents,
+        // KEXINIT, the large hybrid-KEX reply (host key + KEM + signature),
+        // NEWKEYS — must reassemble from single-byte reads.
+        let (mut c, mut s) = dribble_pair(1).await;
+        assert_eq!(c.session_id(), s.session_id());
+        assert!(c.peer_host_key().is_some());
+        c.send(&[42, 1, 2, 3]).await.unwrap();
+        assert_eq!(s.recv().await.unwrap(), vec![42, 1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn echo_and_rekey_survive_fragmentation() {
+        // Fragment every segment, force frequent rekeys, and push a large
+        // payload that spans hundreds of single-byte reads on its own.
+        let (mut c, s) = dribble_pair(1).await;
+        c.tighten_rekey_limits(1024, Duration::from_secs(3600));
+        let server = echo_server(s);
+        for i in 0..48u32 {
+            let payload = vec![0xA5u8, (i & 0xff) as u8, 1, 2, 3, 4, 5];
+            c.send(&payload).await.unwrap();
+            assert_eq!(c.recv().await.unwrap(), payload);
+        }
+        // A packet far larger than any single segment.
+        let big: Vec<u8> = (0..5000u32).map(|i| (i & 0xff) as u8).collect();
+        c.send(&big).await.unwrap();
+        assert_eq!(c.recv().await.unwrap(), big);
+        // Rekeys fired along the way (the counter resets at each).
+        assert!(c.traffic < 40_000);
+        drop(c);
+        server.await.unwrap();
+    }
+
+    /// Like `Dribble`, but the read direction obeys a shared byte budget: it
+    /// hands out at most `budget` bytes total, then returns `Pending`. Lets a
+    /// test freeze a `recv_raw` exactly mid-packet. Writes pass through.
+    struct Gate<S> {
+        inner: S,
+        budget: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl<S: AsyncRead + Unpin> AsyncRead for Gate<S> {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            use std::sync::atomic::Ordering::Relaxed;
+            let me = self.get_mut();
+            let cap = buf.remaining().min(me.budget.load(Relaxed));
+            if cap == 0 {
+                // Out of budget: suspend. The test raises the budget and
+                // re-polls by hand (noop waker), so no wake is needed here.
+                return std::task::Poll::Pending;
+            }
+            let mut tmp = vec![0u8; cap];
+            let mut rb = tokio::io::ReadBuf::new(&mut tmp);
+            match std::pin::Pin::new(&mut me.inner).poll_read(cx, &mut rb) {
+                std::task::Poll::Ready(Ok(())) => {
+                    let n = rb.filled().len();
+                    me.budget.fetch_sub(n, Relaxed);
+                    buf.put_slice(&tmp[..n]);
+                    std::task::Poll::Ready(Ok(()))
+                }
+                other => other,
+            }
+        }
+    }
+
+    impl<S: AsyncWrite + Unpin> AsyncWrite for Gate<S> {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            data: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::pin::Pin::new(&mut self.get_mut().inner).poll_write(cx, data)
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        }
+    }
+
+    #[tokio::test]
+    async fn recv_raw_resumes_after_mid_packet_drop() {
+        use std::future::Future;
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        use std::sync::Arc;
+
+        // Client reads through a Gate so we can meter its input to the byte.
+        let (a, b) = duplex(1 << 20);
+        let budget = Arc::new(AtomicUsize::new(usize::MAX)); // unrestricted for the handshake
+        let host_key = PrivateKey::generate();
+        let (c, s) = tokio::join!(
+            Transport::client(
+                Gate {
+                    inner: a,
+                    budget: budget.clone()
+                },
+                trusting_client()
+            ),
+            Transport::server(b, ServerConfig::with_host_key(host_key)),
+        );
+        let (mut c, mut s) = (c.unwrap(), s.unwrap());
+
+        // The server emitted EXT_INFO during the handshake; `recv_raw` is the
+        // raw primitive (unlike `recv`, it does not swallow transport
+        // chatter), so drain that packet before metering our own.
+        assert_eq!(c.recv_raw().await.unwrap()[0], msg::EXT_INFO);
+
+        let payload = vec![0x5Au8, 1, 2, 3, 4, 5, 6, 7];
+        s.send(&payload).await.unwrap(); // all sealed bytes now buffered in the pipe
+
+        // Let the client read only 5 bytes: enough for the 4-byte length
+        // header plus one body byte, then starve it. `recv_raw` must return
+        // `Pending` with its partial progress parked in `self.read_state`.
+        budget.store(5, Relaxed);
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        {
+            // Poll once (starves mid-packet), then drop the in-flight future
+            // at the end of this block — exactly as a lost `select!` arm would.
+            let mut fut = std::pin::pin!(c.recv_raw());
+            assert!(
+                fut.as_mut().poll(&mut cx).is_pending(),
+                "reader should starve mid-packet at a 5-byte budget"
+            );
+        }
+
+        // A brand-new `recv_raw` must resume from the parked state and return
+        // the whole packet, intact and in order — nothing lost, no desync.
+        budget.store(usize::MAX, Relaxed);
+        let got = c.recv_raw().await.unwrap();
+        assert_eq!(got, payload);
+
+        // And the stream is still healthy for the next packet.
+        s.send(&[9, 9]).await.unwrap();
+        assert_eq!(c.recv_raw().await.unwrap(), vec![9, 9]);
     }
 }

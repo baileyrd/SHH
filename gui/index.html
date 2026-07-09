@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SHH</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <div id="app">
+      <nav id="sidebar">
+        <div id="brand">
+          <span id="brand-glyph">&gt;_</span>
+          <span id="brand-name">SHH</span>
+        </div>
+
+        <div class="sidebar-section">
+          <div class="sidebar-section-head">
+            <span>Hosts</span>
+            <button id="add-host-btn" class="icon-btn" title="Add host">+</button>
+          </div>
+          <ul id="host-list"></ul>
+        </div>
+
+        <div class="sidebar-section">
+          <div class="sidebar-section-head">
+            <span>Identities</span>
+            <button id="add-identity-btn" class="icon-btn" title="Generate key">+</button>
+          </div>
+          <ul id="identity-list"></ul>
+        </div>
+      </nav>
+
+      <main id="workspace">
+        <div id="tab-bar"></div>
+        <div id="term-stack"></div>
+        <div id="empty-state">
+          <div id="empty-glyph">&gt;_</div>
+          <p>No open sessions</p>
+          <button id="empty-add-host-btn" class="primary-btn">Add a host</button>
+        </div>
+      </main>
+    </div>
+
+    <div id="overlay-root"></div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

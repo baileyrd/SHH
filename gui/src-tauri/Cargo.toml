@@ -1,0 +1,27 @@
+[package]
+name = "shh-gui"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Desktop UI for SHH: a Termius-style host manager and terminal"
+license = "MIT OR Apache-2.0"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+shh = { path = "../.." }
+tauri = { version = "2", features = ["custom-protocol"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "macros", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+thiserror = "2"
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+[[bin]]
+name = "shh-gui"
+path = "src/main.rs"
+
+[profile.release]
+lto = "thin"

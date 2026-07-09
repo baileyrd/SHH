@@ -7,7 +7,7 @@
 //! that flow lives here and [`connect`] hands back an authenticated
 //! [`Transport`], leaving each binary to open whatever channels it wants.
 
-use std::io::{IsTerminal, Read, Write};
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use tokio::net::TcpStream;
@@ -36,9 +36,12 @@ pub struct Options {
     pub no_agent: bool,
 }
 
-/// The default location for one of our dotfiles (`~/.shh/<name>`).
+/// The default location for one of our dotfiles (`~/.shh/<name>`). Uses
+/// `HOME`, falling back to `USERPROFILE` (Windows) and then the CWD.
 pub fn default_path(name: &str) -> PathBuf {
-    let home = std::env::var_os("HOME").unwrap_or_else(|| ".".into());
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .unwrap_or_else(|| ".".into());
     PathBuf::from(home).join(".shh").join(name)
 }
 
@@ -56,6 +59,9 @@ pub async fn connect(opts: &Options) -> Result<Transport<TcpStream>, String> {
     // SSH_AUTH_SOCK is set and no -i pins a file), else a key file. Decided
     // before dialing, so passphrase prompts never race the handshake.
     let mut agent: Option<(crate::agent::Client, Vec<crate::agent::Identity>)> = None;
+    // The agent is reached over a Unix socket named by SSH_AUTH_SOCK; on
+    // Windows (no named-pipe agent yet) auth uses key files only.
+    #[cfg(unix)]
     if !opts.no_agent && opts.identity.is_none() && std::env::var_os("SSH_AUTH_SOCK").is_some() {
         match crate::agent::Client::from_env().await {
             Ok(mut c) => match c.identities().await {
@@ -232,30 +238,14 @@ fn load_certificate(explicit: Option<&PathBuf>, identity: &Path) -> Result<Optio
 /// blink for a touch; here we ask on the terminal, and proceed automatically
 /// when there is none (scripts, tests).
 fn confirm_presence() {
-    use std::io::BufRead;
-    let Ok(mut tty) = std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty") else {
-        return; // no terminal — treat as present
-    };
-    let _ = write!(tty, "shh: confirm presence for the security key (press Enter): ");
-    let _ = tty.flush();
-    let mut line = String::new();
-    let mut reader = std::io::BufReader::new(tty);
-    let _ = reader.read_line(&mut line);
+    let _ = crate::tty::prompt_line("shh: confirm presence for the security key (press Enter): ");
 }
 
-/// Ask on the controlling terminal, so piped stdin/stdout stay clean.
+/// Ask a yes/no question on the controlling terminal.
 fn ask_tty(prompt: &str) -> bool {
-    let Ok(mut tty) = std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty") else {
-        return false;
-    };
-    let _ = write!(tty, "{prompt} [yes/no] ");
-    let _ = tty.flush();
-    let mut answer = String::new();
-    let mut byte = [0u8; 1];
-    while tty.read(&mut byte).map(|n| n == 1).unwrap_or(false) && byte[0] != b'\n' {
-        answer.push(byte[0] as char);
-    }
-    answer.trim() == "yes"
+    crate::tty::prompt_line(&format!("{prompt} [yes/no] "))
+        .map(|a| a.trim() == "yes")
+        .unwrap_or(false)
 }
 
 /// The trust decision for a presented host key: known-good, first contact

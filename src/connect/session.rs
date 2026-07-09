@@ -10,15 +10,23 @@
 //! Unix-only, like the rest of the daemon (the pty and process handling
 //! depend on it).
 
+// The server half — child processes, ptys, the per-session agent socket —
+// is Unix machinery; only the client half compiles elsewhere (Windows).
+#[cfg(unix)]
 use std::process::Stdio;
 use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+#[cfg(unix)]
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot, Semaphore};
 
-use super::mux::{Cmd, ToTask, AGENT_CHANNEL};
-use super::{maybe_read, maybe_recv, pty, ExitStatus, PtyRequest, WindowChange, MAX_CHUNK, STDERR};
+#[cfg(unix)]
+use super::mux::AGENT_CHANNEL;
+use super::mux::{Cmd, ToTask};
+#[cfg(unix)]
+use super::{maybe_read, pty};
+use super::{maybe_recv, ExitStatus, PtyRequest, WindowChange, MAX_CHUNK, STDERR};
 use crate::wire::{Reader, Writer};
 
 /// What a client wants from a session channel. Stdio is boxed so the
@@ -97,6 +105,7 @@ fn window_change_body((cols, rows, xpix, ypix): WindowChange) -> Vec<u8> {
     w.into_bytes()
 }
 
+#[cfg(unix)]
 fn exit_request_body(status: std::process::ExitStatus) -> Vec<u8> {
     use std::os::unix::process::ExitStatusExt;
     let mut w = Writer::new();
@@ -301,6 +310,7 @@ pub(crate) async fn session_client_task(
 
 // ------------------------------------------------------------- server ----
 
+#[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn session_server_task(
     id: u32,
@@ -602,6 +612,7 @@ pub(crate) async fn session_server_task(
     }
 }
 
+#[cfg(unix)]
 fn allocate_pty(data: &[u8], slot: &mut Option<pty::Pty>) -> bool {
     let mut r = Reader::new(data);
     let parsed = (|| -> Result<_, crate::wire::WireError> {
@@ -629,12 +640,14 @@ fn allocate_pty(data: &[u8], slot: &mut Option<pty::Pty>) -> bool {
 /// credentials before exec.
 /// A per-session agent socket whose connections become agent channels back
 /// to the client. Dropping it stops the acceptor and removes the socket.
+#[cfg(unix)]
 struct AgentListener {
     sock: std::path::PathBuf,
     dir: std::path::PathBuf,
     abort: tokio::task::AbortHandle,
 }
 
+#[cfg(unix)]
 impl Drop for AgentListener {
     fn drop(&mut self) {
         self.abort.abort();
@@ -648,6 +661,7 @@ impl Drop for AgentListener {
 /// session user, and connections are accepted only from that user (or
 /// ourselves, when not dropping privileges) — checked by peer credentials,
 /// not just file modes.
+#[cfg(unix)]
 fn start_agent_listener(
     cmd_tx: &mpsc::UnboundedSender<Cmd>,
     user: Option<&super::UserContext>,
@@ -734,6 +748,7 @@ fn start_agent_listener(
     })
 }
 
+#[cfg(unix)]
 fn spawn_child(
     cmd: &mut Command,
     pty: Option<&mut pty::Pty>,
@@ -804,6 +819,7 @@ fn spawn_child(
 }
 
 /// Read from an optional split-read half (the pty master).
+#[cfg(unix)]
 async fn read_opt<R: AsyncRead + Unpin>(
     r: Option<&mut R>,
     buf: &mut [u8],
@@ -816,6 +832,7 @@ async fn read_opt<R: AsyncRead + Unpin>(
 
 /// A synthetic non-zero status for the rare case that reaping the child
 /// fails; the client still gets a definite exit.
+#[cfg(unix)]
 fn dummy_failure() -> std::process::ExitStatus {
     use std::os::unix::process::ExitStatusExt;
     std::process::ExitStatus::from_raw(1 << 8)

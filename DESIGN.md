@@ -184,6 +184,19 @@ shh/                 one library crate
 └── fuzz/            cargo-fuzz targets for the peer-controlled parsers
 ```
 
+### Portability
+
+The protocol core — `crypto`, `transport`, `wire`, `auth`, `agent`, and the
+channel `connect` machinery — is platform-neutral Rust. Platform-specific
+code is confined and cfg-gated: `tty` has a Unix (`/dev/tty` + termios) and a
+Windows (console API) backend behind one facade; `sftp::server`, `privsep`,
+and the session server (fork/setuid/ptys) are `#[cfg(unix)]`; the agent's
+Unix-socket transport is gated while its protocol is shared. So the **client**
+binaries (`shh`, `shh-sftp`, `shh-keygen`) compile and run on Windows, macOS,
+and Linux, while the **server** and **agent** are Unix, building as explicit
+stubs elsewhere. The Windows client is cross-built and exercised under Wine
+against a native Linux `shhd`.
+
 ## Milestones
 
 1. **End to end (done).** `shh user@host cmd` against `shhd`:

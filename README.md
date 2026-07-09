@@ -42,6 +42,24 @@ $ shhd -L 127.0.0.1:2222        # host key generated on first run
 $ shh -p 2222 you@127.0.0.1 'uname -a'
 ```
 
+### Platform support
+
+The **clients** — `shh`, `shh-sftp`, `shh-keygen` — build and run on
+**Windows, macOS, and Linux**: the protocol core is portable Rust, and the
+console handling (no-echo passphrase entry, raw mode, terminal size) has a
+native backend per platform. The **server** `shhd` and the key agent
+`shh-agent` are **Unix only** — their session model (fork/setuid, ptys, a
+Unix-socket agent with peer-credential checks) has no Windows equivalent
+short of a ConPTY + named-pipe rewrite; on Windows they build as honest
+"not supported here" stubs, not broken binaries. Agent auth on the Windows
+client (OpenSSH's `\\.\pipe\openssh-ssh-agent`) is a planned follow-up; today
+the Windows client uses key files.
+
+The Windows client is cross-compiled (`--target x86_64-pc-windows-gnu`) and
+verified end to end under Wine against a native Linux `shhd`: `shh.exe` runs
+remote commands and `shh-sftp.exe` transfers files, over the full
+post-quantum handshake.
+
 ### Certificates
 
 Instead of listing every key in `authorized_keys`, a server can trust a

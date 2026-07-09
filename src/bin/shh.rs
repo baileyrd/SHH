@@ -237,8 +237,10 @@ async fn run(args: Args) -> Result<i32, String> {
             xpix,
             ypix,
         };
-        // SIGWINCH → window-change requests.
+        // SIGWINCH → window-change requests. Unix only; on Windows the
+        // session just keeps the initial size (no console-resize signal here).
         let (tx, rx) = tokio::sync::mpsc::channel::<connect::WindowChange>(4);
+        #[cfg(unix)]
         tokio::spawn(async move {
             let Ok(mut winch) =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
@@ -253,6 +255,8 @@ async fn run(args: Args) -> Result<i32, String> {
                 }
             }
         });
+        #[cfg(not(unix))]
+        let _ = &tx;
         // Raw mode for the duration of the session; restored on drop.
         let raw = shh::tty::RawMode::enable()
             .map_err(|e| format!("cannot set raw terminal mode: {e}"))?;

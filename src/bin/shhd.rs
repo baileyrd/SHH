@@ -12,15 +12,27 @@
 //! sandboxed parser with per-user session handoff (OpenSSH's full monitor)
 //! is not built yet, so still prefer a container when exposing broadly.
 
+// shhd is a Unix daemon: the session model needs fork/setuid, ptys, and (for
+// privsep) a single-threaded fork at startup. On non-Unix it builds as an
+// honest stub (see the bottom of the file) rather than a broken binary.
+#![cfg_attr(not(unix), allow(unused))]
+
+#[cfg(unix)]
 use std::path::PathBuf;
 
+#[cfg(unix)]
 use clap::Parser;
+#[cfg(unix)]
 use tokio::net::TcpListener;
 
+#[cfg(unix)]
 use shh::crypto::{ed25519::PrivateKey, keyfile};
+#[cfg(unix)]
 use shh::transport::{ServerConfig, Transport};
+#[cfg(unix)]
 use shh::{auth, connect};
 
+#[cfg(unix)]
 #[derive(Parser)]
 #[command(name = "shhd", about = "SHH server: modern SSH, nothing legacy")]
 struct Args {
@@ -109,6 +121,7 @@ struct Args {
     sandbox: bool,
 }
 
+#[cfg(unix)]
 fn default_path(name: &str) -> PathBuf {
     let home = std::env::var_os("HOME").unwrap_or_else(|| ".".into());
     PathBuf::from(home).join(".shh").join(name)
@@ -116,12 +129,14 @@ fn default_path(name: &str) -> PathBuf {
 
 /// Where host-key signatures come from: the private key held in this process,
 /// or a separate privilege-separation signer that holds it for us.
+#[cfg(unix)]
 #[derive(Clone)]
 enum HostAuth {
     Local(PrivateKey),
     Monitor(shh::privsep::MonitorSigner),
 }
 
+#[cfg(unix)]
 fn load_or_create_host_key(path: &PathBuf) -> std::io::Result<PrivateKey> {
     if path.exists() {
         let text = std::fs::read_to_string(path)?;
@@ -150,6 +165,7 @@ fn load_or_create_host_key(path: &PathBuf) -> std::io::Result<PrivateKey> {
 /// Serve one SFTP client on stdin/stdout and exit. The daemon re-execs this
 /// binary in `--internal-sftp` mode as the `sftp` subsystem child, already
 /// dropped to the session user — the same model as OpenSSH's `sftp-server`.
+#[cfg(unix)]
 fn run_internal_sftp() -> std::io::Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -159,6 +175,17 @@ fn run_internal_sftp() -> std::io::Result<()> {
     })
 }
 
+/// Honest stub on non-Unix: the server has no Windows session model.
+#[cfg(not(unix))]
+fn main() {
+    eprintln!(
+        "shhd (the SHH server) runs only on Unix — its session model needs \
+         fork/setuid and pseudo-terminals. Use shh / shh-sftp on this platform."
+    );
+    std::process::exit(1);
+}
+
+#[cfg(unix)]
 fn main() -> std::io::Result<()> {
     // Subsystem mode is dispatched before the normal CLI so `--internal-sftp`
     // (an internal re-exec flag, not a user-facing option) never reaches clap.
@@ -308,6 +335,7 @@ fn main() -> std::io::Result<()> {
     ))
 }
 
+#[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
 async fn serve(
     args: Args,

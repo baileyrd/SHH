@@ -165,7 +165,7 @@ fn main() -> std::io::Result<()> {
     };
 
     let keys = match std::fs::read_to_string(&args.authorized_keys) {
-        Ok(text) => keyfile::parse_authorized_keys(&text),
+        Ok(text) => keyfile::parse_authorized_user_keys(&text),
         Err(e) => {
             tracing::warn!("{}: {e}", args.authorized_keys.display());
             Vec::new()
@@ -259,7 +259,7 @@ async fn serve(
     args: Args,
     host_auth: HostAuth,
     host_cert: Option<Vec<u8>>,
-    keys: Vec<shh::crypto::ed25519::PublicKey>,
+    keys: Vec<shh::crypto::userkey::UserKey>,
     trusted_cas: Vec<shh::crypto::ed25519::PublicKey>,
     user: Option<String>,
     is_root: bool,

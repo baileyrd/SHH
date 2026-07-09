@@ -43,7 +43,7 @@ async fn attempt(
     let (a, b) = tokio::io::duplex(1 << 20);
     let policy = Policy {
         user: Some("river".into()),
-        keys: vec![authorized.public()],
+        keys: vec![authorized.public().into()],
         trusted_cas: vec![],
         banner: None,
     };

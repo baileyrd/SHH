@@ -10,7 +10,9 @@ deviation and its rationale):
 
 - **Post-quantum by default** — hybrid ML-KEM-768 + X25519 key exchange
   (`mlkem768x25519-sha256`), with `curve25519-sha256` as the only fallback.
-- **Ed25519 only** for host keys and user keys. No RSA, no ECDSA, no DSA.
+- **Ed25519 only** for host keys and user keys. No RSA, no ECDSA, no DSA —
+  plus FIDO2 hardware security keys (`sk-ssh-ed25519@openssh.com`) for
+  login.
 - **AEAD only** — `chacha20-poly1305@openssh.com` and
   `aes256-gcm@openssh.com`. No CBC, no CTR+HMAC, no encrypt-and-MAC.
 - **Strict KEX required** (the Terrapin countermeasure) — a peer without
@@ -80,6 +82,18 @@ $ shh you@gateway.corp uptime
 
 When no host certificate or CA is configured, host identity falls back to
 `known_hosts` TOFU pinning, exactly as before.
+
+### Security keys (FIDO2)
+
+`shhd` accepts FIDO2 hardware security keys — put an
+`sk-ssh-ed25519@openssh.com` line in `authorized_keys` and a user logs in
+with their key (e.g. OpenSSH's `ssh -i ~/.ssh/id_ed25519_sk`). The server
+verifies the authenticator's assertion and **requires user presence** (a
+physical touch); an assertion without it is refused. The public-key
+encoding is byte-identical to OpenSSH's (verified against `ssh-keygen`).
+Producing assertions needs the physical key, so *presenting* an sk key is
+a client-side concern — the `shh` client does not yet drive an
+authenticator; `shhd` implements the server verification.
 
 ### Key agent
 
@@ -257,7 +271,9 @@ pinned to specific hosts, whole paths, or a certificate authority
 (`shh-agent add -H gw>prod`, enforced via `session-bind@openssh.com` /
 `restrict-destination-v00`). Privilege separation (`shhd --privsep`) holds
 the host key in a separate signer subprocess, out of the pre-auth parser's
-reach. Not yet implemented: FIDO2 `sk-ssh-ed25519` keys and the fuller
-privsep model that also sandboxes the pre-auth *parsing* in its own
-unprivileged process. Treat it as a working protocol implementation, not a
-hardened production daemon.
+reach. FIDO2 security keys (`sk-ssh-ed25519@openssh.com`) authenticate to
+`shhd` (server-side verification). Not yet implemented: client-side FIDO2
+signing (needs a physical authenticator) and the fuller privsep model that
+also sandboxes the pre-auth *parsing* in its own unprivileged process.
+Treat it as a working protocol implementation, not a hardened production
+daemon.

@@ -272,6 +272,28 @@ pub fn parse_authorized_keys(text: &str) -> Vec<PublicKey> {
         .collect()
 }
 
+/// Decode one authorized-key line as a [`UserKey`]: a plain Ed25519 key or a
+/// FIDO2 security-key credential (`sk-ssh-ed25519@openssh.com`).
+pub fn decode_user_key(line: &str) -> Result<crate::crypto::userkey::UserKey> {
+    let mut parts = line.split_whitespace();
+    let _algo = parts.next().ok_or_else(|| bad("empty public key line"))?;
+    let b64 = parts.next().ok_or_else(|| bad("missing key material"))?;
+    let blob = BASE64_STANDARD
+        .decode(b64)
+        .map_err(|e| bad(format!("base64: {e}")))?;
+    crate::crypto::userkey::UserKey::from_blob(&blob)
+}
+
+/// Parse an authorized_keys file into [`UserKey`]s — Ed25519 and security-key
+/// lines both count; anything else is skipped.
+pub fn parse_authorized_user_keys(text: &str) -> Vec<crate::crypto::userkey::UserKey> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|l| decode_user_key(l).ok())
+        .collect()
+}
+
 // -------------------------------------------------------- certificates --
 
 /// Parse a certificate line (`ssh-ed25519-cert-v01@openssh.com AAAA... id`)

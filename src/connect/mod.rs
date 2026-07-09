@@ -256,7 +256,7 @@ mod tests {
         let host_key = PrivateKey::generate();
         let policy = auth::Policy {
             user: Some("tester".into()),
-            keys: vec![user_key.public()],
+            keys: vec![user_key.public().into()],
             trusted_cas: vec![],
             banner: None,
         };
@@ -325,7 +325,7 @@ mod tests {
         let host_key = PrivateKey::generate();
         let policy = auth::Policy {
             user: None,
-            keys: vec![user_key.public()],
+            keys: vec![user_key.public().into()],
             trusted_cas: vec![],
             banner: None,
         };

@@ -11,6 +11,8 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::crypto::cert::{self, Certificate, CERT_ALGO, CERT_TYPE_USER};
 use crate::crypto::ed25519::{PrivateKey, PublicKey, ALGO};
+use crate::crypto::sk::SK_ALGO;
+use crate::crypto::userkey::UserKey;
 use crate::transport::Transport;
 use crate::wire::{msg, Reader, Writer};
 use crate::{Error, Result};
@@ -174,8 +176,9 @@ where
 pub struct Policy {
     /// Required username; `None` accepts any name (the key still decides).
     pub user: Option<String>,
-    /// Keys that may authenticate directly.
-    pub keys: Vec<PublicKey>,
+    /// Keys that may authenticate directly — Ed25519 or security-key
+    /// (`sk-ssh-ed25519@openssh.com`) credentials.
+    pub keys: Vec<UserKey>,
     /// Certificate authorities whose user certificates are trusted.
     pub trusted_cas: Vec<PublicKey>,
     /// Optional banner shown before authentication.
@@ -187,8 +190,8 @@ fn same_key(a: &PublicKey, b: &PublicKey) -> bool {
 }
 
 impl Policy {
-    fn key_authorized(&self, key: &PublicKey) -> bool {
-        self.keys.iter().any(|k| same_key(k, key))
+    fn key_authorized(&self, key: &UserKey) -> bool {
+        self.keys.iter().any(|k| k.matches(key))
     }
 
     fn user_allowed(&self, user: &str) -> bool {
@@ -200,7 +203,7 @@ impl Policy {
 
     /// Validate a presented certificate for `user` and, if it checks out,
     /// return the certified key to verify the userauth signature against.
-    fn authorize_cert(&self, blob: &[u8], user: &str) -> Option<PublicKey> {
+    fn authorize_cert(&self, blob: &[u8], user: &str) -> Option<UserKey> {
         let cert = match Certificate::parse_and_verify(blob) {
             Ok(c) => c,
             Err(e) => {
@@ -224,7 +227,7 @@ impl Policy {
             tracing::info!(key_id = %cert.key_id, %user, "certificate does not list this principal");
             return None;
         }
-        Some(cert.key)
+        Some(UserKey::Ed25519(cert.key))
     }
 }
 
@@ -280,8 +283,9 @@ where
         // itself (plain publickey) or the key certified by a trusted CA.
         let verify_key = if !policy.user_allowed(&user) {
             None
-        } else if algo == ALGO {
-            PublicKey::from_blob(&blob)
+        } else if algo == ALGO || algo == SK_ALGO {
+            // A bare key or a security-key credential: it must be listed.
+            UserKey::from_blob(&blob)
                 .ok()
                 .filter(|k| policy.key_authorized(k))
         } else if algo == CERT_ALGO {
@@ -364,7 +368,7 @@ mod tests {
         let key = PrivateKey::generate();
         let policy = Policy {
             user: Some("river".into()),
-            keys: vec![key.public()],
+            keys: vec![key.public().into()],
             trusted_cas: vec![],
             banner: Some("welcome to the test rig".into()),
         };
@@ -378,7 +382,7 @@ mod tests {
         let key = PrivateKey::generate();
         let policy = Policy {
             user: None,
-            keys: vec![PrivateKey::generate().public()], // someone else's
+            keys: vec![PrivateKey::generate().public().into()], // someone else's
             trusted_cas: vec![],
             banner: None,
         };
@@ -392,7 +396,7 @@ mod tests {
         let key = PrivateKey::generate();
         let policy = Policy {
             user: Some("river".into()),
-            keys: vec![key.public()],
+            keys: vec![key.public().into()],
             trusted_cas: vec![],
             banner: None,
         };
@@ -494,7 +498,7 @@ mod tests {
             cert::sign_user_cert(&ca, &key.public(), 1, "id", &["river".into()], 0, u64::MAX);
         let policy = Policy {
             user: Some("river".into()),
-            keys: vec![key.public()],
+            keys: vec![key.public().into()],
             trusted_cas: vec![], // nobody trusts the CA
             banner: None,
         };
@@ -546,7 +550,7 @@ mod tests {
         let key = PrivateKey::generate();
         let policy = Policy {
             user: Some("river".into()),
-            keys: vec![key.public()],
+            keys: vec![key.public().into()],
             trusted_cas: vec![],
             banner: None,
         };
@@ -563,7 +567,7 @@ mod tests {
         let key = PrivateKey::generate();
         let policy = Policy {
             user: Some("river".into()),
-            keys: vec![key.public()],
+            keys: vec![key.public().into()],
             trusted_cas: vec![],
             banner: None,
         };
@@ -594,7 +598,7 @@ mod tests {
         let key = PrivateKey::generate();
         let policy = Policy {
             user: Some("river".into()),
-            keys: vec![PrivateKey::generate().public()],
+            keys: vec![PrivateKey::generate().public().into()],
             trusted_cas: vec![],
             banner: None,
         };
@@ -617,5 +621,94 @@ mod tests {
         };
         let (c, _s) = cert_authed(&user_key, Some(cert), policy, "river").await;
         assert!(matches!(c, Err(Error::Auth(_))));
+    }
+
+    // --------------------------------------------- security keys (FIDO2) ---
+
+    /// Drive a userauth exchange presenting a security-key assertion built by
+    /// a software authenticator. `touch` models the user-presence flag.
+    /// Returns the server's reply byte and the server-side auth result.
+    async fn sk_authed(
+        mut dev: crate::crypto::sk::SoftAuthenticator,
+        policy: Policy,
+        user: &str,
+        touch: bool,
+    ) -> (Result<u8>, Result<String>) {
+        let (a, b) = duplex(1 << 20);
+        let host_key = PrivateKey::generate();
+        let blob = dev.public().to_blob();
+        let user = user.to_owned();
+        let client_side = async move {
+            let mut t =
+                Transport::client(a, ClientConfig::with_verifier(Box::new(|_| Ok(())))).await?;
+            let mut w = Writer::new();
+            w.byte(msg::SERVICE_REQUEST);
+            w.utf8(SERVICE_USERAUTH);
+            t.send(&w.into_bytes()).await?;
+            let _accept = t.recv().await?;
+
+            let span = signed_span(t.session_id(), &user, SK_ALGO, &blob);
+            let sig = dev.sign(&span, touch);
+            let mut w = Writer::new();
+            w.byte(msg::USERAUTH_REQUEST);
+            w.utf8(&user);
+            w.utf8(SERVICE_CONNECTION);
+            w.utf8("publickey");
+            w.boolean(true);
+            w.utf8(SK_ALGO);
+            w.string(&blob);
+            w.string(&sig);
+            t.send(&w.into_bytes()).await?;
+            let reply = t.recv().await?;
+            Ok::<u8, Error>(reply[0])
+        };
+        let server_side = async move {
+            let mut t = Transport::server(b, ServerConfig::with_host_key(host_key)).await?;
+            server(&mut t, &policy).await
+        };
+        tokio::join!(client_side, server_side)
+    }
+
+    #[tokio::test]
+    async fn security_key_authenticates() {
+        let dev = crate::crypto::sk::SoftAuthenticator::generate("ssh:");
+        let policy = Policy {
+            user: Some("river".into()),
+            keys: vec![UserKey::Sk(dev.public())],
+            trusted_cas: vec![],
+            banner: None,
+        };
+        let (reply, user) = sk_authed(dev, policy, "river", true).await;
+        assert_eq!(reply.unwrap(), msg::USERAUTH_SUCCESS);
+        assert_eq!(user.unwrap(), "river");
+    }
+
+    #[tokio::test]
+    async fn security_key_without_touch_is_refused() {
+        // A valid Ed25519 assertion, but the authenticator did not assert
+        // user presence: the server must reject it.
+        let dev = crate::crypto::sk::SoftAuthenticator::generate("ssh:");
+        let policy = Policy {
+            user: Some("river".into()),
+            keys: vec![UserKey::Sk(dev.public())],
+            trusted_cas: vec![],
+            banner: None,
+        };
+        let (reply, _s) = sk_authed(dev, policy, "river", false).await;
+        assert_eq!(reply.unwrap(), msg::USERAUTH_FAILURE);
+    }
+
+    #[tokio::test]
+    async fn unlisted_security_key_is_refused() {
+        let dev = crate::crypto::sk::SoftAuthenticator::generate("ssh:");
+        let other = crate::crypto::sk::SoftAuthenticator::generate("ssh:");
+        let policy = Policy {
+            user: Some("river".into()),
+            keys: vec![UserKey::Sk(other.public())], // a different credential
+            trusted_cas: vec![],
+            banner: None,
+        };
+        let (reply, _s) = sk_authed(dev, policy, "river", true).await;
+        assert_eq!(reply.unwrap(), msg::USERAUTH_FAILURE);
     }
 }

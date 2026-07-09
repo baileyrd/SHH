@@ -10,6 +10,8 @@ pub mod ed25519;
 pub mod kdf;
 pub mod kex;
 pub mod keyfile;
+pub mod sk;
+pub mod userkey;
 
 /// KEX algorithms in preference order, as advertised in KEXINIT.
 pub const KEX_ALGORITHMS: &[&str] = &["mlkem768x25519-sha256", "curve25519-sha256"];

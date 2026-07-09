@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use base64::prelude::{Engine as _, BASE64_STANDARD};
 use clap::Parser;
-use shh::crypto::{cert, ed25519::PrivateKey, keyfile, sk::SoftwareKey};
+use shh::crypto::{cert, ed25519::PrivateKey, keyfile, sk::SoftwareKey, userkey::UserKey};
 
 #[derive(Parser)]
 #[command(name = "shh-keygen", about = "Generate an Ed25519 key or sign a certificate")]
@@ -115,8 +115,13 @@ fn load_ca_key(path: &Path) -> std::io::Result<PrivateKey> {
 fn sign_certificate(args: &Args, ca_path: &Path) -> std::io::Result<()> {
     let ca = load_ca_key(ca_path)?;
     let pub_text = std::fs::read_to_string(&args.file)?;
-    let (user_key, comment) = keyfile::decode_public(pub_text.trim())
+    let pub_line = pub_text.trim();
+    // A user cert may certify an Ed25519 key or a security key; a host cert is
+    // Ed25519 only. Decode as a UserKey and branch on what we got.
+    let user_key = keyfile::decode_user_key(pub_line)
         .map_err(|e| std::io::Error::other(format!("{}: {e}", args.file.display())))?;
+    // The comment is whatever trails the algo + base64 blob.
+    let comment = pub_line.split_whitespace().skip(2).collect::<Vec<_>>().join(" ");
 
     let principals: Vec<String> = args
         .principals
@@ -133,20 +138,24 @@ fn sign_certificate(args: &Args, ca_path: &Path) -> std::io::Result<()> {
     let valid_after = now.saturating_sub(60); // small clock-skew grace
     let valid_before = now + args.days.saturating_mul(86_400);
 
-    let sign = if args.host {
-        cert::sign_host_cert
-    } else {
-        cert::sign_user_cert
+    let (blob, algo) = match &user_key {
+        UserKey::Ed25519(key) if args.host => (
+            cert::sign_host_cert(&ca, key, args.serial, &args.cert_id, &principals, valid_after, valid_before),
+            cert::CERT_ALGO,
+        ),
+        UserKey::Ed25519(key) => (
+            cert::sign_user_cert(&ca, key, args.serial, &args.cert_id, &principals, valid_after, valid_before),
+            cert::CERT_ALGO,
+        ),
+        UserKey::Sk(_) if args.host => {
+            eprintln!("shh-keygen: a security key cannot be a host key");
+            std::process::exit(1);
+        }
+        UserKey::Sk(sk) => (
+            cert::sign_sk_user_cert(&ca, sk, args.serial, &args.cert_id, &principals, valid_after, valid_before),
+            cert::SK_CERT_ALGO,
+        ),
     };
-    let blob = sign(
-        &ca,
-        &user_key,
-        args.serial,
-        &args.cert_id,
-        &principals,
-        valid_after,
-        valid_before,
-    );
 
     // `<file>` is `foo.pub`; the certificate goes to `foo-cert.pub`.
     let stem = args
@@ -156,7 +165,7 @@ fn sign_certificate(args: &Args, ca_path: &Path) -> std::io::Result<()> {
         .map(str::to_owned)
         .unwrap_or_else(|| args.file.to_string_lossy().into_owned());
     let cert_path = PathBuf::from(format!("{stem}-cert.pub"));
-    let line = format!("{} {} {comment}\n", cert::CERT_ALGO, BASE64_STANDARD.encode(&blob));
+    let line = format!("{} {} {comment}\n", algo, BASE64_STANDARD.encode(&blob));
     std::fs::write(&cert_path, line)?;
 
     let who = if principals.is_empty() {

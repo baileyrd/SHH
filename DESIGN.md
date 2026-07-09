@@ -94,6 +94,20 @@ substitute for a real key. The assertions it produces are cryptographically
 ordinary and verify anywhere, including under OpenSSH `sshd`. Real hardware
 belongs behind an external authenticator helper, which is not yet built.
 
+A security key can also be *certified*: the certificate form
+(`sk-ssh-ed25519-cert-v01@openssh.com`) is the plain Ed25519 certificate
+with one extra field — the credential's application string, sitting right
+after the certified public point — so the CA vouches for the security key
+just as it would a bare key. We keep the certified point and that
+application together, and reconstruct the security-key credential when
+checking the userauth signature: the assertion must verify (user presence
+and all) against the *certified* key, and the CA must be trusted. `shh`
+presents an `<identity>-cert.pub` beside an sk key, and `shh-keygen -s`
+signs an sk public key into one. The wire format matches OpenSSH exactly in
+both directions — `ssh-keygen -L` reads our certs, our parser reads
+`ssh-keygen -s`'s, and OpenSSH `sshd` with `TrustedUserCAKeys` accepts a
+certificate we minted over an assertion our client produced.
+
 The private key may live in an agent instead of the client process:
 `shh` signs through whatever `SSH_AUTH_SOCK` names, and `shh-agent` is our
 own agent — protocol-compatible with OpenSSH's in both directions, but
@@ -268,3 +282,24 @@ shh/                 one library crate
     itself runs in a separate sandboxed unprivileged process (with a
     post-auth per-user session handed off from it) — the privsep milestone
     moves the secret out of harm's way but still parses in the main daemon.
+11. **FIDO2 security keys (done).** `sk-ssh-ed25519@openssh.com` credentials
+    authenticate both ways. Server-side, `shhd` verifies the authenticator's
+    assertion — an Ed25519 signature over `SHA256(application) ‖ flags ‖
+    counter ‖ SHA256(signed-data)` — and refuses one that does not assert
+    user presence, so an unattended replay is rejected even when the maths
+    checks out. Client-side, `shh-keygen -t ed25519-sk` mints a
+    *software-emulated* key: the seed lives in the key file, not a
+    tamper-resistant chip, so it carries no hardware protection (a
+    convenience for testing and tokenless CI, not a substitute for a token),
+    but the assertions it produces are cryptographically ordinary and verify
+    under OpenSSH `sshd`. `shh` prompts for presence before signing. The
+    certificate form (`sk-ssh-ed25519-cert-v01@openssh.com`) is supported
+    too: it is the Ed25519 certificate with the credential's application
+    string appended after the certified point, so a CA can vouch for a
+    security key; `shh-keygen -s` signs one, `shh` presents an
+    `<identity>-cert.pub`, and the server verifies the assertion against the
+    *certified* key. Wire-compatible with OpenSSH in both directions —
+    `ssh-keygen -L` reads our sk certs and ours reads its, and OpenSSH `sshd`
+    with `TrustedUserCAKeys` accepts a cert we minted over an assertion our
+    client produced. Real hardware belongs behind an external authenticator
+    helper, which is not yet built.

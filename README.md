@@ -11,8 +11,8 @@ deviation and its rationale):
 - **Post-quantum by default** — hybrid ML-KEM-768 + X25519 key exchange
   (`mlkem768x25519-sha256`), with `curve25519-sha256` as the only fallback.
 - **Ed25519 only** for host keys and user keys. No RSA, no ECDSA, no DSA —
-  plus FIDO2 hardware security keys (`sk-ssh-ed25519@openssh.com`) for
-  login.
+  plus FIDO2 security keys (`sk-ssh-ed25519@openssh.com`), bare or
+  CA-certified, for login.
 - **AEAD only** — `chacha20-poly1305@openssh.com` and
   `aes256-gcm@openssh.com`. No CBC, no CTR+HMAC, no encrypt-and-MAC.
 - **Strict KEX required** (the Terrapin countermeasure) — a peer without
@@ -101,6 +101,17 @@ are cryptographically ordinary and verify anywhere:
 $ shh-keygen -t ed25519-sk -f ~/.shh/id_sk       # software-emulated
 $ cat ~/.shh/id_sk.pub >> ~/.ssh/authorized_keys # on the server
 $ shh -i ~/.shh/id_sk you@host uptime            # OpenSSH sshd accepts it too
+```
+
+A security key can be **certified** just like a bare key: sign its public
+key with a CA and the server trusts it via `--trusted-ca-keys`, no
+per-key `authorized_keys` entry needed. The certificate algorithm is
+OpenSSH's `sk-ssh-ed25519-cert-v01@openssh.com`, so `shh-keygen` and
+`ssh-keygen` issue and consume each other's sk certificates.
+
+```console
+$ shh-keygen -s user_ca -I river -n you -f ~/.shh/id_sk.pub  # writes id_sk-cert.pub
+$ shh -i ~/.shh/id_sk you@host uptime                        # presents the cert
 ```
 
 Real hardware tokens (`ssh -i id_ed25519_sk` against a physical key) need
@@ -283,7 +294,9 @@ pinned to specific hosts, whole paths, or a certificate authority
 `restrict-destination-v00`). Privilege separation (`shhd --privsep`) holds
 the host key in a separate signer subprocess, out of the pre-auth parser's
 reach. FIDO2 security keys (`sk-ssh-ed25519@openssh.com`) work both ways —
-`shhd` verifies them, and `shh` can present a software-emulated one. Not
+`shhd` verifies them, `shh` can present a software-emulated one, and they
+can be CA-certified (`sk-ssh-ed25519-cert-v01@openssh.com`, interop-verified
+with `ssh-keygen` and OpenSSH `sshd` in both directions). Not
 yet implemented: real-hardware FIDO2 on the client (needs an external
 authenticator helper) and the fuller privsep model that also sandboxes the
 pre-auth *parsing* in its own unprivileged process. Treat it as a working

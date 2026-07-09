@@ -84,6 +84,13 @@ closed on unrecognized critical options, and host certificates plus
 `force-command` / `source-address` are not yet honored. (Planned:
 `sk-ssh-ed25519@openssh.com` FIDO2 keys.)
 
+The private key may live in an agent instead of the client process:
+`shh` signs through whatever `SSH_AUTH_SOCK` names, and `shh-agent` is our
+own agent — protocol-compatible with OpenSSH's in both directions, but
+Ed25519-only and fail-closed (see milestone 7). Client-side, an agent
+identity is offered certificate-first, and any identity type we don't
+speak is skipped rather than negotiated down.
+
 ### Rekeying
 Automatic and non-negotiable: rekey after 1 GiB of traffic in either
 direction or 1 hour, whichever comes first. RFC 4253 recommends this;
@@ -132,7 +139,8 @@ shh/                 one library crate
 ├── src/crypto/      KEX, host keys, AEAD cipher bindings, KDF
 ├── src/transport/   version exchange, negotiation, KEX state machine,
 │                    encrypted packet stream, rekeying
-├── src/auth/        userauth (publickey)
+├── src/auth/        userauth (publickey), local keys or via agent
+├── src/agent/       SSH agent protocol: client, Ed25519 keyring server
 ├── src/connect/     channels, session (exec/shell), flow control
 ├── src/bin/shh.rs   client
 ├── src/bin/shhd.rs  server
@@ -171,6 +179,21 @@ shh/                 one library crate
    session to that account — gid, supplementary groups, then uid, in a
    single post-fork hook that also sets `HOME`/`USER`/`SHELL`, changes to
    the home directory, and runs the login shell. An unknown user is
-   refused rather than run as root. Remaining: `sk-ssh-ed25519` FIDO2 keys,
-   agent protocol, and a sandboxed pre-auth process (privilege
-   *separation*, a further step beyond this privilege *drop*).
+   refused rather than run as root.
+7. **Key agent (done).** `shh-agent` speaks the standard SSH agent
+   protocol (draft-miller-ssh-agent) on a Unix socket, so it is
+   interchangeable with `ssh-agent`: OpenSSH's `ssh`/`ssh-add` drive it,
+   and `shh` uses whatever `SSH_AUTH_SOCK` names (certificates offered
+   before bare keys, non-Ed25519 identities skipped). The store is
+   Ed25519-only and fails closed on everything it cannot fully honor:
+   legacy key types, a public half that does not match the private seed,
+   the confirm-per-use constraint (we will not pretend to prompt), and
+   unknown constraints or extensions are all refused, not ignored. Lock
+   hides identities behind a constant-time passphrase check; the lifetime
+   constraint expires keys server-side. Connections are accepted only
+   from the agent's own uid (`SO_PEERCRED`), the socket is 0600 inside a
+   0700 directory, and seeds are zeroized wherever they pass. Remaining:
+   `sk-ssh-ed25519` FIDO2 keys, agent *forwarding* (with
+   `session-bind@openssh.com` destination restriction), and a sandboxed
+   pre-auth process (privilege *separation*, a further step beyond
+   milestone 6's privilege *drop*).

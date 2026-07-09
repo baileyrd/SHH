@@ -5,6 +5,7 @@
 //! ciphers only, public-key authentication only. See DESIGN.md for the
 //! rationale behind each cut.
 
+pub mod agent;
 pub mod auth;
 pub mod connect;
 pub mod crypto;
@@ -40,6 +41,8 @@ pub enum Error {
     Channel(String),
     #[error("bad key file: {0}")]
     KeyFile(String),
+    #[error("agent: {0}")]
+    Agent(String),
 }
 
 impl Error {

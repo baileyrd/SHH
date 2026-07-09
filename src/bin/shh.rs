@@ -78,6 +78,10 @@ struct Args {
     #[arg(short = 'N', long = "no-command")]
     no_command: bool,
 
+    /// Do not use a key agent, even when SSH_AUTH_SOCK is set.
+    #[arg(long)]
+    no_agent: bool,
+
     /// Seconds of silence before sending a keepalive probe (0 disables).
     #[arg(long, default_value_t = 30)]
     keepalive_interval: u64,
@@ -269,14 +273,44 @@ async fn run(args: Args) -> Result<i32, String> {
         return Err("-N does not take a remote command".into());
     }
 
-    let identity = find_identity(args.identity)?;
-    let text = std::fs::read_to_string(&identity)
-        .map_err(|e| format!("{}: {e}", identity.display()))?;
-    let key = load_identity(&text, &identity)?;
+    // How to authenticate: an agent holding usable identities (when
+    // SSH_AUTH_SOCK is set and no -i pins a file), else a key file. Decided
+    // before dialing, so passphrase prompts never race the handshake.
+    let mut agent: Option<(shh::agent::Client, Vec<shh::agent::Identity>)> = None;
+    if !args.no_agent && args.identity.is_none() && std::env::var_os("SSH_AUTH_SOCK").is_some() {
+        match shh::agent::Client::from_env().await {
+            Ok(mut c) => match c.identities().await {
+                Ok(ids) => {
+                    use shh::crypto::{cert::CERT_ALGO, ed25519::ALGO};
+                    let usable = ids
+                        .iter()
+                        .filter(|i| {
+                            matches!(i.algo().as_deref(), Some(ALGO) | Some(CERT_ALGO))
+                        })
+                        .count();
+                    if usable > 0 {
+                        agent = Some((c, ids));
+                    } // an empty agent is no agent: quietly use key files
+                }
+                Err(e) => eprintln!("shh: agent: {e}; falling back to key files"),
+            },
+            Err(e) => eprintln!("shh: agent: {e}; falling back to key files"),
+        }
+    }
 
-    // Present a certificate if one sits next to the key (OpenSSH convention:
-    // `<identity>-cert.pub`). An explicit --certificate overrides.
-    let cert = load_certificate(args.certificate.as_ref(), &identity)?;
+    // Without an agent, a key file (with a certificate beside it, OpenSSH
+    // convention `<identity>-cert.pub`; an explicit --certificate overrides).
+    let file_key = match &agent {
+        Some(_) => None,
+        None => {
+            let identity = find_identity(args.identity)?;
+            let text = std::fs::read_to_string(&identity)
+                .map_err(|e| format!("{}: {e}", identity.display()))?;
+            let key = load_identity(&text, &identity)?;
+            let cert = load_certificate(args.certificate.as_ref(), &identity)?;
+            Some((key, cert))
+        }
+    };
 
     let label = keyfile::host_label(&host, args.port);
     let known_hosts = args.known_hosts.clone();
@@ -307,9 +341,16 @@ async fn run(args: Args) -> Result<i32, String> {
         .await
         .map_err(|e| e.to_string())?;
 
-    auth::client(&mut t, &user, &key, cert.as_deref(), |banner| eprint!("{banner}"))
-        .await
-        .map_err(|e| e.to_string())?;
+    match (&mut agent, &file_key) {
+        (Some((client, ids)), _) => {
+            auth::client_agent(&mut t, &user, client, ids, |banner| eprint!("{banner}")).await
+        }
+        (None, Some((key, cert))) => {
+            auth::client(&mut t, &user, key, cert.as_deref(), |banner| eprint!("{banner}")).await
+        }
+        (None, None) => unreachable!("one auth source is always chosen"),
+    }
+    .map_err(|e| e.to_string())?;
 
     // One multiplexed connection carries the session (unless -N) and every
     // -L forward, concurrently.

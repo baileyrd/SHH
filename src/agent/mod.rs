@@ -1,0 +1,283 @@
+//! SSH agent protocol (draft-miller-ssh-agent), Ed25519 only.
+//!
+//! The agent holds private keys in one long-lived process; clients ask it to
+//! sign by blob, so keys never enter short-lived client processes at all.
+//! The protocol is uint32-length-framed messages over a Unix socket — the
+//! same wire format OpenSSH's `ssh-agent`/`ssh-add` speak, so either side
+//! can be swapped for ours.
+//!
+//! We speak the modern subset: Ed25519 keys and their certificates. RSA
+//! flags, DSA/ECDSA identities, smartcard messages, and the confirm
+//! constraint (which needs an interactive prompter we refuse to fake) are
+//! not implemented; adds of anything we cannot fully honor fail closed.
+
+pub mod server;
+
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+use crate::crypto::ed25519::PrivateKey;
+use crate::wire::{Reader, Writer};
+use crate::{Error, Result};
+
+/// Message numbers (draft-miller-ssh-agent §5.1) — the subset we speak.
+pub mod num {
+    pub const FAILURE: u8 = 5;
+    pub const SUCCESS: u8 = 6;
+    pub const REQUEST_IDENTITIES: u8 = 11;
+    pub const IDENTITIES_ANSWER: u8 = 12;
+    pub const SIGN_REQUEST: u8 = 13;
+    pub const SIGN_RESPONSE: u8 = 14;
+    pub const ADD_IDENTITY: u8 = 17;
+    pub const REMOVE_IDENTITY: u8 = 18;
+    pub const REMOVE_ALL_IDENTITIES: u8 = 19;
+    pub const LOCK: u8 = 22;
+    pub const UNLOCK: u8 = 23;
+    pub const ADD_ID_CONSTRAINED: u8 = 25;
+    pub const EXTENSION: u8 = 27;
+
+    // Key constraints (§5.2).
+    pub const CONSTRAIN_LIFETIME: u8 = 1;
+    pub const CONSTRAIN_CONFIRM: u8 = 2;
+    pub const CONSTRAIN_EXTENSION: u8 = 255;
+}
+
+/// Cap on one agent message, matching OpenSSH's MAX_AGENT_MESSAGE. Anything
+/// larger is a protocol violation, not a big key.
+pub const MAX_FRAME: usize = 256 * 1024;
+
+/// Read one framed message; `None` on clean EOF (peer closed between
+/// messages). An EOF mid-frame is an error, as is an empty or oversized one.
+pub(crate) async fn read_frame<S>(io: &mut S) -> Result<Option<Vec<u8>>>
+where
+    S: AsyncRead + Unpin,
+{
+    let mut len4 = [0u8; 4];
+    let mut got = 0;
+    while got < 4 {
+        let n = io.read(&mut len4[got..]).await?;
+        if n == 0 {
+            if got == 0 {
+                return Ok(None);
+            }
+            return Err(Error::proto("agent stream closed mid-frame"));
+        }
+        got += n;
+    }
+    let len = u32::from_be_bytes(len4) as usize;
+    if len == 0 || len > MAX_FRAME {
+        return Err(Error::proto(format!("agent frame length {len} out of range")));
+    }
+    let mut body = vec![0u8; len];
+    io.read_exact(&mut body).await?;
+    Ok(Some(body))
+}
+
+pub(crate) async fn write_frame<S>(io: &mut S, body: &[u8]) -> Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    debug_assert!(!body.is_empty() && body.len() <= MAX_FRAME);
+    io.write_all(&(body.len() as u32).to_be_bytes()).await?;
+    io.write_all(body).await?;
+    io.flush().await?;
+    Ok(())
+}
+
+/// One identity as the agent reports it: a public blob (a plain key or a
+/// certificate) and its comment.
+#[derive(Clone, Debug)]
+pub struct Identity {
+    pub blob: Vec<u8>,
+    pub comment: String,
+}
+
+impl Identity {
+    /// The algorithm name leading the blob (`ssh-ed25519`,
+    /// `ssh-ed25519-cert-v01@openssh.com`, or something we don't speak).
+    pub fn algo(&self) -> Option<String> {
+        Reader::new(&self.blob).utf8().ok().map(str::to_owned)
+    }
+
+    /// OpenSSH-style `SHA256:` fingerprint of the blob.
+    pub fn fingerprint(&self) -> String {
+        use base64::prelude::{Engine as _, BASE64_STANDARD_NO_PAD};
+        use sha2::{Digest, Sha256};
+        format!(
+            "SHA256:{}",
+            BASE64_STANDARD_NO_PAD.encode(Sha256::digest(&self.blob))
+        )
+    }
+}
+
+/// The private half of an ADD_IDENTITY for an Ed25519 key: for a plain key
+/// the blob is the algorithm + public key; for a certificate it is the
+/// algorithm + whole certificate, and the raw key parts follow either way.
+fn encode_add(key: &PrivateKey, cert: Option<&[u8]>, comment: &str) -> Writer {
+    let public = key.public();
+    let mut w = Writer::new();
+    match cert {
+        Some(c) => {
+            w.utf8(crate::crypto::cert::CERT_ALGO);
+            w.string(c);
+        }
+        None => {
+            w.utf8(crate::crypto::ed25519::ALGO);
+        }
+    }
+    // ENC(A) follows the algorithm (and, for certificates, the cert blob).
+    w.string(public.0.as_bytes());
+    // k || ENC(A): the 32-byte seed followed by the 32-byte public key.
+    let mut sk = Vec::with_capacity(64);
+    sk.extend_from_slice(&key.0.to_bytes());
+    sk.extend_from_slice(public.0.as_bytes());
+    w.string(&sk);
+    zeroize::Zeroize::zeroize(&mut sk);
+    w.utf8(comment);
+    w
+}
+
+/// Something we can read and write frames over. Boxed so `Client` needs no
+/// stream type parameter (auth code would otherwise carry two generics).
+trait Stream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> Stream for T {}
+
+/// A client of a running agent — ours or OpenSSH's.
+pub struct Client {
+    io: Box<dyn Stream>,
+}
+
+impl Client {
+    /// Connect to the agent at `path` (a Unix socket).
+    #[cfg(unix)]
+    pub async fn connect(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        let io = tokio::net::UnixStream::connect(path.as_ref()).await?;
+        Ok(Client { io: Box::new(io) })
+    }
+
+    /// Connect to the agent named by `$SSH_AUTH_SOCK`.
+    #[cfg(unix)]
+    pub async fn from_env() -> Result<Self> {
+        match std::env::var_os("SSH_AUTH_SOCK") {
+            Some(path) => Self::connect(path).await,
+            None => Err(Error::Agent("SSH_AUTH_SOCK is not set".into())),
+        }
+    }
+
+    /// Wrap an already-connected stream (used by tests).
+    pub fn from_stream<S>(io: S) -> Self
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        Client { io: Box::new(io) }
+    }
+
+    async fn roundtrip(&mut self, req: &[u8]) -> Result<Vec<u8>> {
+        write_frame(&mut self.io, req).await?;
+        read_frame(&mut self.io)
+            .await?
+            .ok_or_else(|| Error::Agent("agent closed the connection".into()))
+    }
+
+    /// A request whose only interesting answer is SUCCESS.
+    async fn expect_success(&mut self, req: &[u8], what: &str) -> Result<()> {
+        let resp = self.roundtrip(req).await?;
+        match resp[0] {
+            num::SUCCESS => Ok(()),
+            num::FAILURE => Err(Error::Agent(format!("agent refused to {what}"))),
+            other => Err(Error::proto(format!("unexpected agent message {other}"))),
+        }
+    }
+
+    /// All identities the agent is willing to name.
+    pub async fn identities(&mut self) -> Result<Vec<Identity>> {
+        let resp = self.roundtrip(&[num::REQUEST_IDENTITIES]).await?;
+        let mut r = Reader::new(&resp);
+        match r.byte()? {
+            num::IDENTITIES_ANSWER => {}
+            num::FAILURE => return Err(Error::Agent("agent refused to list identities".into())),
+            other => return Err(Error::proto(format!("unexpected agent message {other}"))),
+        }
+        let n = r.u32()?;
+        let mut out = Vec::new();
+        for _ in 0..n {
+            out.push(Identity {
+                blob: r.string()?.to_vec(),
+                comment: r.utf8()?.to_owned(),
+            });
+        }
+        r.finish()?;
+        Ok(out)
+    }
+
+    /// Sign `data` with the identity named by `blob`. Returns the standard
+    /// SSH signature blob.
+    pub async fn sign(&mut self, blob: &[u8], data: &[u8]) -> Result<Vec<u8>> {
+        let mut w = Writer::new();
+        w.byte(num::SIGN_REQUEST);
+        w.string(blob);
+        w.string(data);
+        w.u32(0); // flags: the RSA hash bits mean nothing to Ed25519
+        let resp = self.roundtrip(&w.into_bytes()).await?;
+        let mut r = Reader::new(&resp);
+        match r.byte()? {
+            num::SIGN_RESPONSE => {
+                let sig = r.string()?.to_vec();
+                r.finish()?;
+                Ok(sig)
+            }
+            num::FAILURE => Err(Error::Agent("agent refused to sign".into())),
+            other => Err(Error::proto(format!("unexpected agent message {other}"))),
+        }
+    }
+
+    /// Add a key (with `Some(cert)`, the certificate identity for it).
+    /// `lifetime` in seconds makes the agent forget it after that long.
+    pub async fn add(
+        &mut self,
+        key: &PrivateKey,
+        cert: Option<&[u8]>,
+        comment: &str,
+        lifetime: Option<u32>,
+    ) -> Result<()> {
+        let mut w = Writer::new();
+        w.byte(match lifetime {
+            None => num::ADD_IDENTITY,
+            Some(_) => num::ADD_ID_CONSTRAINED,
+        });
+        w.raw(encode_add(key, cert, comment).into_bytes().as_slice());
+        if let Some(secs) = lifetime {
+            w.byte(num::CONSTRAIN_LIFETIME);
+            w.u32(secs);
+        }
+        self.expect_success(&w.into_bytes(), "add the key").await
+    }
+
+    /// Remove the identity named by `blob`.
+    pub async fn remove(&mut self, blob: &[u8]) -> Result<()> {
+        let mut w = Writer::new();
+        w.byte(num::REMOVE_IDENTITY);
+        w.string(blob);
+        self.expect_success(&w.into_bytes(), "remove the key").await
+    }
+
+    /// Remove every identity.
+    pub async fn remove_all(&mut self) -> Result<()> {
+        self.expect_success(&[num::REMOVE_ALL_IDENTITIES], "clear identities")
+            .await
+    }
+
+    /// Lock the agent: identities vanish and nothing signs until `unlock`.
+    pub async fn lock(&mut self, passphrase: &[u8]) -> Result<()> {
+        let mut w = Writer::new();
+        w.byte(num::LOCK);
+        w.string(passphrase);
+        self.expect_success(&w.into_bytes(), "lock").await
+    }
+
+    pub async fn unlock(&mut self, passphrase: &[u8]) -> Result<()> {
+        let mut w = Writer::new();
+        w.byte(num::UNLOCK);
+        w.string(passphrase);
+        self.expect_success(&w.into_bytes(), "unlock").await
+    }
+}

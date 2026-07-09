@@ -141,7 +141,12 @@ fn encode_add(key: &PrivateKey, cert: Option<&[u8]>, comment: &str) -> Writer {
 /// the local origin. The result is the constraint-list bytes to hand to
 /// [`Client::add_constrained`]. Each destination becomes one `local → host`
 /// constraint, so a key with several is usable toward any of them.
-pub fn encode_destinations(dests: &[(String, String, Vec<Vec<u8>>)]) -> Vec<u8> {
+/// A destination hop for a constraint: `(username, hostname, key entries)`,
+/// where each key entry is `(host-key blob, is_ca)` — `is_ca` naming a CA
+/// whose certificates all match, rather than one exact host key.
+pub type Destination = (String, String, Vec<(Vec<u8>, bool)>);
+
+pub fn encode_destinations(dests: &[Destination]) -> Vec<u8> {
     let mut list = Writer::new();
     for (user, host, keys) in dests {
         push_constraint(&mut list, &encode_hop("", "", &[]), &encode_hop(user, host, keys));
@@ -155,7 +160,7 @@ pub fn encode_destinations(dests: &[(String, String, Vec<Vec<u8>>)]) -> Vec<u8> 
 /// session-bind for every hop the request traversed — permits a signature
 /// only when the whole path is present and in order. A single hop is the
 /// same as one entry of [`encode_destinations`] (an endpoint pin).
-pub fn encode_path(hops: &[(String, String, Vec<Vec<u8>>)]) -> Vec<u8> {
+pub fn encode_path(hops: &[Destination]) -> Vec<u8> {
     let mut list = Writer::new();
     let mut from = encode_hop("", "", &[]); // the local origin
     for (user, host, keys) in hops {
@@ -167,15 +172,17 @@ pub fn encode_path(hops: &[(String, String, Vec<Vec<u8>>)]) -> Vec<u8> {
 }
 
 /// One destination-constraint hop: `string user, string host, string
-/// reserved, then (string keyblob, byte is_ca)*`.
-fn encode_hop(user: &str, host: &str, keys: &[Vec<u8>]) -> Vec<u8> {
+/// reserved, then (string keyblob, byte is_ca)*`. A key entry with
+/// `is_ca = true` matches any host presenting a certificate that CA signed,
+/// rather than one exact host key.
+fn encode_hop(user: &str, host: &str, keys: &[(Vec<u8>, bool)]) -> Vec<u8> {
     let mut w = Writer::new();
     w.utf8(user);
     w.utf8(host);
     w.string(&[]);
-    for k in keys {
+    for (k, is_ca) in keys {
         w.string(k);
-        w.byte(0); // is_ca = false
+        w.byte(u8::from(*is_ca));
     }
     w.into_bytes()
 }

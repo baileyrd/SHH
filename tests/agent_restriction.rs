@@ -78,7 +78,7 @@ async fn constrained_key_authenticates_to_its_permitted_host() {
     let dests = encode_destinations(&[(
         String::new(),
         "gw".into(),
-        vec![host.public().to_blob()],
+        vec![(host.public().to_blob(), false)],
     )]);
     adder
         .add_constrained(&user, None, "restricted", None, Some(&dests))
@@ -100,7 +100,7 @@ async fn constrained_key_refused_for_a_different_host() {
     let dests = encode_destinations(&[(
         String::new(),
         "gw".into(),
-        vec![permitted.public().to_blob()],
+        vec![(permitted.public().to_blob(), false)],
     )]);
     adder
         .add_constrained(&user, None, "restricted", None, Some(&dests))

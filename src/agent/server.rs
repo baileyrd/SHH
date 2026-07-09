@@ -687,7 +687,7 @@ mod tests {
         crate::agent::encode_destinations(&[(
             String::new(),
             "h".into(),
-            vec![host.public().to_blob()],
+            vec![(host.public().to_blob(), false)],
         )])
     }
 
@@ -740,7 +740,7 @@ mod tests {
         let payload = crate::agent::encode_destinations(&[(
             "deploy".into(),
             "gw".into(),
-            vec![hk.clone()],
+            vec![(hk.clone(), false)],
         )]);
 
         // Outer list: exactly one string-wrapped constraint, nothing trailing.
@@ -791,8 +791,8 @@ mod tests {
         let a = PrivateKey::generate().public().to_blob();
         let b = PrivateKey::generate().public().to_blob();
         let payload = crate::agent::encode_path(&[
-            (String::new(), "a".into(), vec![a.clone()]),
-            (String::new(), "b".into(), vec![b.clone()]),
+            (String::new(), "a".into(), vec![(a.clone(), false)]),
+            (String::new(), "b".into(), vec![(b.clone(), false)]),
         ]);
         let constraints = parse_dest_constraints(&payload).unwrap();
         assert_eq!(constraints.len(), 2);
@@ -822,8 +822,8 @@ mod tests {
         let c = PrivateKey::generate(); // a stranger
         // Pin the key to the path local → A → B.
         let path = crate::agent::encode_path(&[
-            (String::new(), "a".into(), vec![a.public().to_blob()]),
-            (String::new(), "b".into(), vec![b.public().to_blob()]),
+            (String::new(), "a".into(), vec![(a.public().to_blob(), false)]),
+            (String::new(), "b".into(), vec![(b.public().to_blob(), false)]),
         ]);
         adder
             .add_constrained(&user, None, "k", None, Some(&path))
@@ -859,6 +859,59 @@ mod tests {
         bind(&mut reversed, &b, 7).await;
         bind(&mut reversed, &a, 8).await;
         assert!(reversed.sign(&blob, b"d").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn ca_constraint_matches_any_host_that_ca_certifies() {
+        let (mut adder, kr) = spawn_agent();
+        let user = PrivateKey::generate();
+        let ca = PrivateKey::generate();
+        // Pin the key to "any host certified by `ca`" (an is_ca = true entry).
+        let dests = crate::agent::encode_destinations(&[(
+            String::new(),
+            "corp".into(),
+            vec![(ca.public().to_blob(), true)],
+        )]);
+        adder
+            .add_constrained(&user, None, "k", None, Some(&dests))
+            .await
+            .unwrap();
+        let blob = user.public().to_blob();
+
+        // A host presenting a certificate this CA signed: bind carries the
+        // cert; the CA entry matches; signing is permitted.
+        let host = PrivateKey::generate();
+        let host_cert =
+            cert::sign_host_cert(&ca, &host.public(), 1, "h", &["corp".into()], 0, u64::MAX);
+        let mut ok = client_for(&kr);
+        let sid = [21u8; 32];
+        ok.session_bind(&host_cert, &sid, &host.sign(&sid), false)
+            .await
+            .unwrap();
+        let sig = ok.sign(&blob, b"d").await.unwrap();
+        user.public().verify(b"d", &sig).unwrap();
+
+        // A certificate from a *different* CA: refused.
+        let other_ca = PrivateKey::generate();
+        let host2 = PrivateKey::generate();
+        let cert2 =
+            cert::sign_host_cert(&other_ca, &host2.public(), 1, "h", &["corp".into()], 0, u64::MAX);
+        let mut wrong = client_for(&kr);
+        let sid2 = [22u8; 32];
+        wrong
+            .session_bind(&cert2, &sid2, &host2.sign(&sid2), false)
+            .await
+            .unwrap();
+        assert!(wrong.sign(&blob, b"d").await.is_err());
+
+        // A bare host key (no certificate at all): a CA entry never matches.
+        let plain = PrivateKey::generate();
+        let mut bare = client_for(&kr);
+        let sid3 = [23u8; 32];
+        bare.session_bind(&plain.public().to_blob(), &sid3, &plain.sign(&sid3), false)
+            .await
+            .unwrap();
+        assert!(bare.sign(&blob, b"d").await.is_err());
     }
 
     #[tokio::test]

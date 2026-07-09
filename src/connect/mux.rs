@@ -1560,8 +1560,8 @@ mod tests {
         let host_a = PrivateKey::generate(); // the forwarder's hop
         let host_b = PrivateKey::generate(); // the downstream's hop
         let path = crate::agent::encode_path(&[
-            (String::new(), "a".into(), vec![host_a.public().to_blob()]),
-            (String::new(), "b".into(), vec![host_b.public().to_blob()]),
+            (String::new(), "a".into(), vec![(host_a.public().to_blob(), false)]),
+            (String::new(), "b".into(), vec![(host_b.public().to_blob(), false)]),
         ]);
         crate::agent::Client::connect(&local_sock)
             .await
@@ -1622,8 +1622,8 @@ mod tests {
         let host_a = PrivateKey::generate();
         let host_b = PrivateKey::generate();
         let path = crate::agent::encode_path(&[
-            (String::new(), "a".into(), vec![host_a.public().to_blob()]),
-            (String::new(), "b".into(), vec![host_b.public().to_blob()]),
+            (String::new(), "a".into(), vec![(host_a.public().to_blob(), false)]),
+            (String::new(), "b".into(), vec![(host_b.public().to_blob(), false)]),
         ]);
         crate::agent::Client::connect(&local_sock)
             .await

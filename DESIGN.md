@@ -232,7 +232,11 @@ shh/                 one library crate
    agent connection (`shh -A` does this), so the agent sees the whole
    route the request travelled. `shh-agent add -H gw>prod` expresses a
    path; repeating `-H` allows several destinations, matching `ssh-add
-   -h`. Remaining: `sk-ssh-ed25519` FIDO2 keys, CA (`is_ca`) host-key
-   constraint entries (matched but untested against OpenSSH), and a
-   sandboxed pre-auth process (privilege *separation*, a further step
-   beyond milestone 6's privilege *drop*).
+   -h`. A constraint hop may name a host key directly or a **certificate
+   authority** (an `is_ca` entry): a host presenting a certificate that CA
+   signed then matches, so a key can be pinned to "any host under this host
+   CA" rather than an enumerated key list. `shh-agent -H` fills those in
+   from `@cert-authority` lines in known_hosts, exactly as `ssh-add -h`
+   does. Remaining: `sk-ssh-ed25519` FIDO2 keys and a sandboxed pre-auth
+   process (privilege *separation*, a further step beyond milestone 6's
+   privilege *drop*).

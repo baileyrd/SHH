@@ -129,6 +129,11 @@ pub struct Transport<S> {
     /// Host-key algorithms we advertise in KEXINIT (cert + plain, or plain).
     host_key_algos: Vec<String>,
     peer_host_key: Option<PublicKey>,
+    /// Client role: the host-key blob as presented (a plain key or a
+    /// certificate) and the host's signature over the first exchange hash
+    /// (== the session id). Kept for `session-bind@openssh.com`.
+    peer_host_blob: Vec<u8>,
+    peer_host_sig: Vec<u8>,
 
     peer_ext_info: bool,
     server_sig_algs: Option<Vec<String>>,
@@ -183,6 +188,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Transport<S> {
             hostname: String::new(),
             host_key_algos: vec![crate::crypto::ed25519::ALGO.to_string()],
             peer_host_key: None,
+            peer_host_blob: Vec::new(),
+            peer_host_sig: Vec::new(),
             peer_ext_info: false,
             server_sig_algs: None,
         }
@@ -227,6 +234,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Transport<S> {
     /// The server's host key, once the client handshake completed.
     pub fn peer_host_key(&self) -> Option<&PublicKey> {
         self.peer_host_key.as_ref()
+    }
+
+    /// The material a client needs to bind its agent to this hop with
+    /// `session-bind@openssh.com`: the host-key blob as presented (plain key
+    /// or certificate) and the host's signature over the session id. Empty
+    /// on the server side or before the first key exchange.
+    pub fn host_binding(&self) -> (&[u8], &[u8]) {
+        (&self.peer_host_blob, &self.peer_host_sig)
     }
 
     /// `server-sig-algs` from the peer's EXT_INFO, if it sent one.
@@ -551,6 +566,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Transport<S> {
                     .verify(&h, &sig)
                     .map_err(|_| Error::HostKey("host key signature invalid".into()))?;
                 self.peer_host_key = Some(host_key);
+                if first_kex {
+                    // Retain the proof for `session-bind@openssh.com`: the
+                    // presented blob and the signature over the session id.
+                    self.peer_host_blob = k_s.clone();
+                    self.peer_host_sig = sig.clone();
+                }
                 (k, h)
             }
             Side::Server => {

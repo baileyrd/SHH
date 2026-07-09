@@ -136,6 +136,39 @@ fn encode_add(key: &PrivateKey, cert: Option<&[u8]>, comment: &str) -> Writer {
     w
 }
 
+/// Build the `restrict-destination-v00@openssh.com` payload permitting
+/// authentication to each `(user, hostname, host_key_blobs)` endpoint from
+/// the local origin. The result is the constraint-list bytes to hand to
+/// [`Client::add_constrained`]. Each destination becomes one `local → host`
+/// constraint, so a key with several is usable toward any of them.
+pub fn encode_destinations(dests: &[(String, String, Vec<Vec<u8>>)]) -> Vec<u8> {
+    let mut list = Writer::new();
+    for (user, host, keys) in dests {
+        // The origin hop: empty user, host, reserved, and no keys.
+        let mut from = Writer::new();
+        from.utf8("");
+        from.utf8("");
+        from.string(&[]);
+        // The destination hop, identified by its host key(s).
+        let mut to = Writer::new();
+        to.utf8(user);
+        to.utf8(host);
+        to.string(&[]);
+        for k in keys {
+            to.string(k);
+            to.byte(0); // is_ca = false
+        }
+        // Each constraint is `from ‖ to ‖ reserved`, itself wrapped in a
+        // string so the list can be walked without knowing hop sizes.
+        let mut c = Writer::new();
+        c.string(&from.into_bytes());
+        c.string(&to.into_bytes());
+        c.string(&[]); // per-constraint reserved
+        list.string(&c.into_bytes());
+    }
+    list.into_bytes()
+}
+
 /// Something we can read and write frames over. Boxed so `Client` needs no
 /// stream type parameter (auth code would otherwise carry two generics).
 trait Stream: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -239,15 +272,37 @@ impl Client {
         comment: &str,
         lifetime: Option<u32>,
     ) -> Result<()> {
+        self.add_constrained(key, cert, comment, lifetime, None).await
+    }
+
+    /// Add a key with optional constraints: a `lifetime` and/or a
+    /// destination-constraint payload (`destinations` = the constraint list
+    /// bytes, the content of the `restrict-destination-v00@openssh.com`
+    /// string). A key so constrained signs only for a bound path it allows.
+    pub async fn add_constrained(
+        &mut self,
+        key: &PrivateKey,
+        cert: Option<&[u8]>,
+        comment: &str,
+        lifetime: Option<u32>,
+        destinations: Option<&[u8]>,
+    ) -> Result<()> {
+        let constrained = lifetime.is_some() || destinations.is_some();
         let mut w = Writer::new();
-        w.byte(match lifetime {
-            None => num::ADD_IDENTITY,
-            Some(_) => num::ADD_ID_CONSTRAINED,
+        w.byte(if constrained {
+            num::ADD_ID_CONSTRAINED
+        } else {
+            num::ADD_IDENTITY
         });
         w.raw(encode_add(key, cert, comment).into_bytes().as_slice());
         if let Some(secs) = lifetime {
             w.byte(num::CONSTRAIN_LIFETIME);
             w.u32(secs);
+        }
+        if let Some(dc) = destinations {
+            w.byte(num::CONSTRAIN_EXTENSION);
+            w.utf8("restrict-destination-v00@openssh.com");
+            w.string(dc);
         }
         self.expect_success(&w.into_bytes(), "add the key").await
     }
@@ -279,5 +334,28 @@ impl Client {
         w.byte(num::UNLOCK);
         w.string(passphrase);
         self.expect_success(&w.into_bytes(), "unlock").await
+    }
+
+    /// Bind this agent connection to a host with `session-bind@openssh.com`:
+    /// `host_blob` is the server's host-key blob, `session_id` the session
+    /// identifier, and `sig` the host's signature over it (all straight from
+    /// the transport). The agent verifies the signature and records the hop,
+    /// which is how destination-constrained keys learn the path taken.
+    /// `is_forwarding` marks a connection that is itself being forwarded on.
+    pub async fn session_bind(
+        &mut self,
+        host_blob: &[u8],
+        session_id: &[u8],
+        sig: &[u8],
+        is_forwarding: bool,
+    ) -> Result<()> {
+        let mut w = Writer::new();
+        w.byte(num::EXTENSION);
+        w.utf8("session-bind@openssh.com");
+        w.string(host_blob);
+        w.string(session_id);
+        w.string(sig);
+        w.boolean(is_forwarding);
+        self.expect_success(&w.into_bytes(), "bind the session").await
     }
 }

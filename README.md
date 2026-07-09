@@ -122,6 +122,26 @@ checked by peer uid, a client that didn't pass `-A` refuses relay channels
 outright, and forward it only to servers you trust — root there can use
 (though never read) your keys while the session lasts.
 
+To narrow that trust, **pin a key to the hosts it may authenticate to**:
+
+```console
+$ shh you@gateway              # record gateway's host key once
+$ shh-agent add -H gateway ~/.shh/id_ed25519
+added … restricted to gateway
+$ shh -A you@gateway           # forward the agent onward
+gateway$ shh you@prod          # REFUSED: key is pinned to gateway
+```
+
+The client binds each agent connection to the host it reached
+(`session-bind@openssh.com`) — proving the hop with the host's own
+signature over the session id — and the agent signs with a
+destination-constrained key only when the proven path is allowed. So a
+forwarded agent is no longer a blank cheque: a compromised intermediate
+can use a pinned key toward its permitted host and nowhere else. The
+constraint is OpenSSH's `restrict-destination-v00@openssh.com`, so
+`ssh-add -h` writes constraints `shh-agent` enforces and vice versa.
+(Endpoint pins are enforced; multi-hop *path* constraints are not yet.)
+
 `shh host cmd` behaves like `ssh`: stdin is forwarded, stdout/stderr come
 back separated, and the remote exit status becomes `shh`'s exit status.
 `shh host` with a terminal opens an interactive shell on a real
@@ -190,9 +210,11 @@ authenticated user's account — uid, gid, supplementary groups, home
 directory, and login shell — so a session is never more privileged than
 the account that logged in; an unknown login name is refused. `shh-agent`
 is a drop-in, Ed25519-only `ssh-agent` (interop verified with `ssh-add`
-and `ssh` both ways), and agent forwarding (`-A`, server default-deny via
-`--permit-agent-forwarding`) relays it across hops. Not yet implemented:
-FIDO2 `sk-ssh-ed25519` keys, `session-bind@openssh.com` agent
-restriction, and a sandboxed pre-auth process (privilege *separation*,
+and `ssh` both ways), agent forwarding (`-A`, server default-deny via
+`--permit-agent-forwarding`) relays it across hops, and agent keys can be
+pinned to specific destination hosts (`shh-agent add -H host`, enforced
+via `session-bind@openssh.com` / `restrict-destination-v00`). Not yet
+implemented: FIDO2 `sk-ssh-ed25519` keys, multi-hop agent *path*
+constraints, and a sandboxed pre-auth process (privilege *separation*,
 distinct from the privilege *drop* above). Treat it as a working protocol
 implementation, not a hardened production daemon.

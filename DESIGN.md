@@ -87,9 +87,12 @@ closed on unrecognized critical options, and host certificates plus
 The private key may live in an agent instead of the client process:
 `shh` signs through whatever `SSH_AUTH_SOCK` names, and `shh-agent` is our
 own agent — protocol-compatible with OpenSSH's in both directions, but
-Ed25519-only and fail-closed (see milestone 7). Client-side, an agent
+Ed25519-only and fail-closed (see milestones 7–9). Client-side, an agent
 identity is offered certificate-first, and any identity type we don't
-speak is skipped rather than negotiated down.
+speak is skipped rather than negotiated down. An agent key can be pinned
+to specific destination hosts (milestone 9), and `shh` binds each agent
+connection to the host it reached (`session-bind@openssh.com`) so that
+pinning is enforceable.
 
 ### Rekeying
 Automatic and non-negotiable: rekey after 1 GiB of traffic in either
@@ -205,8 +208,25 @@ shh/                 one library crate
    did not send `-A` refuses `auth-agent` channel opens outright, and the
    daemon scrubs its own inherited `SSH_AUTH_SOCK` from session
    environments so an operator's agent can never leak into sessions.
-   Remaining: `sk-ssh-ed25519` FIDO2 keys, `session-bind@openssh.com`
-   destination restriction (our agent currently answers the extension
-   with FAILURE, so restricted-use bindings are not enforced), and a
-   sandboxed pre-auth process (privilege *separation*, a further step
-   beyond milestone 6's privilege *drop*).
+9. **Agent key restriction (done).** A key held in `shh-agent` can be
+   pinned to the hosts it may authenticate to (`shh-agent add -H
+   [user@]host`), so a forwarded agent is no longer a blank cheque a
+   compromised intermediate can spend anywhere. The mechanism is
+   OpenSSH's: the client binds each agent connection to the host it
+   reached with `session-bind@openssh.com` — a host-key blob, the session
+   id, and the host's signature over it — and the agent *verifies that
+   signature* before recording the hop, so a malicious host cannot claim a
+   path it never took. At sign time a destination-constrained key is used
+   only if the connection's proven binding chain is permitted by its
+   `restrict-destination-v00@openssh.com` constraints; with no bindings, a
+   constrained key does not sign at all (fail-closed). `shh` sends the
+   binding before it uses any agent, so the restriction works whether the
+   agent is ours or OpenSSH's, and our agent enforces constraints written
+   by OpenSSH's `ssh-add -h` (verified against the captured wire format).
+   Scope: endpoint (destination) constraints are enforced; multi-hop
+   *path* constraints — which need the forwarder to replay its own binding
+   onto each relayed connection — are not yet built, and CA (`is_ca`)
+   host-key entries are matched but untested against OpenSSH. Remaining:
+   `sk-ssh-ed25519` FIDO2 keys, path constraints, and a sandboxed pre-auth
+   process (privilege *separation*, a further step beyond milestone 6's
+   privilege *drop*).

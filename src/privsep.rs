@@ -16,11 +16,23 @@
 //! its resource limits, shrinking its own attack surface to almost nothing
 //! (a loop that reads a hash, signs it, and writes the signature back).
 //!
-//! What this does *not* yet do: run the pre-authentication parsing itself in
-//! a separate, sandboxed, unprivileged process (OpenSSH's full monitor +
-//! pre-auth child model). That is the remaining step; here the untrusted
-//! parsing still runs in the main daemon — but a compromise there can no
-//! longer exfiltrate the host key.
+//! A second, stronger posture is [`drop_daemon_privileges`]: after the
+//! signer is forked, the daemon itself drops to an unprivileged account for
+//! the rest of its life (`shhd --sandbox`). All the untrusted parsing then
+//! runs *without privilege and without the host key*, so a memory-safety
+//! compromise yields only that unprivileged account — not root, not the key.
+//! The privileged setup (binding the port, reading the host key, forking the
+//! signer) happens first, while still root, and only then is privilege
+//! dropped. The trade-off is that sessions run as that one account rather
+//! than as each authenticated user.
+//!
+//! What this does *not* yet do: OpenSSH's full monitor model, where the
+//! untrusted parsing runs in a per-connection sandboxed child and a
+//! privileged monitor hands back a session running as *each authenticated
+//! user*. That handoff needs the monitor to re-verify authentication and to
+//! pass session file descriptors back to the parser — the remaining step
+//! after `--sandbox`, which already removes privilege from the parser but
+//! sacrifices per-user sessions to do it.
 
 #![cfg(unix)]
 
@@ -184,6 +196,48 @@ fn harden(drop_to: Option<&str>) {
     // descriptors; clamp both so a hijacked signer cannot fork-bomb or hoard.
     set_limit(libc::RLIMIT_NPROC, 0);
     set_limit(libc::RLIMIT_NOFILE, 16);
+}
+
+/// Drop the *daemon itself* to an unprivileged account for the rest of its
+/// life, so every byte of untrusted protocol parsing runs without privilege.
+///
+/// Unlike the signer's [`harden`], the daemon still forks session children
+/// and opens many sockets, so only `no_new_privs` and the credential drop
+/// (gid, supplementary groups, then uid) are applied — resource limits are
+/// left to the operator. Call this *after* the privileged setup (binding the
+/// listen port, reading the host key, forking the signer) and *before* the
+/// async runtime starts. Returns an error if the drop cannot be done cleanly;
+/// the caller must abort rather than keep running privileged.
+pub fn drop_daemon_privileges(user: &str) -> std::io::Result<()> {
+    // Refuse new privileges for us and every descendant — also stops a
+    // compromised session from re-escalating through a setuid binary.
+    unsafe {
+        libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+    }
+
+    if !nix::unistd::geteuid().is_root() {
+        // Already unprivileged: the parser is unprivileged either way.
+        return Ok(());
+    }
+
+    let u = crate::connect::UserContext::for_user(user)
+        .ok_or_else(|| std::io::Error::other(format!("sandbox user {user:?} not found")))?;
+    let gid = nix::unistd::Gid::from_raw(u.gid);
+    let uid = nix::unistd::Uid::from_raw(u.uid);
+    let cname = std::ffi::CString::new(u.name.clone())
+        .map_err(|_| std::io::Error::other("sandbox user name has an interior NUL"))?;
+
+    nix::unistd::setgid(gid).map_err(std::io::Error::from)?;
+    nix::unistd::initgroups(&cname, gid).map_err(std::io::Error::from)?;
+    nix::unistd::setuid(uid).map_err(std::io::Error::from)?;
+
+    // If we can regain root, the drop was ineffective — refuse to continue.
+    if nix::unistd::setuid(nix::unistd::Uid::from_raw(0)).is_ok() {
+        return Err(std::io::Error::other(
+            "privilege drop ineffective (regained root)",
+        ));
+    }
+    Ok(())
 }
 
 fn set_limit(resource: libc::__rlimit_resource_t, value: u64) {

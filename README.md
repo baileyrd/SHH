@@ -334,7 +334,11 @@ pinned to specific hosts, whole paths, or a certificate authority
 (`shh-agent add -H gw>prod`, enforced via `session-bind@openssh.com` /
 `restrict-destination-v00`). Privilege separation (`shhd --privsep`) holds
 the host key in a separate signer subprocess, out of the pre-auth parser's
-reach. FIDO2 security keys (`sk-ssh-ed25519@openssh.com`) work both ways —
+reach; `--sandbox` goes further and drops the whole parsing daemon to an
+unprivileged account after binding the port and forking the signer, so all
+untrusted parsing runs without privilege or the key (at the cost of running
+sessions as that one account — for single-purpose servers, not multi-user
+login hosts). FIDO2 security keys (`sk-ssh-ed25519@openssh.com`) work both ways —
 `shhd` verifies them, `shh` can present a software-emulated one, and they
 can be CA-certified (`sk-ssh-ed25519-cert-v01@openssh.com`, interop-verified
 with `ssh-keygen` and OpenSSH `sshd` in both directions). User certificates

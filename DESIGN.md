@@ -283,13 +283,27 @@ shh/                 one library crate
     key. When root, the signer drops to an unprivileged account
     (`--privsep-user`, default `nobody`), sets `no_new_privs`, and clamps
     its resource limits — its whole job is a read/sign/write loop, so its
-    attack surface is almost nil. Remaining: real-hardware FIDO2 on the
-    client (a software-emulated security key works today — see the auth
-    section — but a physical token needs an external authenticator helper),
-    and the fuller monitor model where the untrusted pre-auth *parsing*
-    itself runs in a separate sandboxed unprivileged process (with a
-    post-auth per-user session handed off from it) — the privsep milestone
-    moves the secret out of harm's way but still parses in the main daemon.
+    attack surface is almost nil.
+
+    **`--sandbox` goes further:** once the privileged setup is done — binding
+    the listen port (possibly < 1024), reading the host key, forking the
+    signer — the daemon *itself* drops to the unprivileged account and sets
+    `no_new_privs`, so from then on **every byte of untrusted parsing runs
+    without privilege and without the host key**. A memory-safety compromise
+    of the parser now yields only that unprivileged account — not root, not
+    the key, and (the signer being a separate address space) not a signing
+    oracle beyond what the live socket already allows. The trade-off is that
+    sessions run as that one account rather than as each authenticated user,
+    so `--sandbox` suits single-purpose servers (a git or SFTP endpoint, a
+    bastion) rather than multi-user login hosts. Remaining: real-hardware
+    FIDO2 on the client (a software-emulated security key works today — see
+    the auth section — but a physical token needs an external authenticator
+    helper), and OpenSSH's full monitor model, where the parser runs in a
+    *per-connection* sandboxed child and a privileged monitor hands back a
+    session running as *each authenticated user* — the step past `--sandbox`,
+    which removes privilege from the parser but gives up per-user sessions to
+    do it. That handoff needs the monitor to re-verify authentication and pass
+    session descriptors back to the parser; it is not built yet.
 11. **FIDO2 security keys (done).** `sk-ssh-ed25519@openssh.com` credentials
     authenticate both ways. Server-side, `shhd` verifies the authenticator's
     assertion — an Ed25519 signature over `SHA256(application) ‖ flags ‖

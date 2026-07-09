@@ -408,6 +408,59 @@ pub(crate) async fn session_server_task(
                         }
                     }
                 }
+                "subsystem" => {
+                    let mut r = Reader::new(&data);
+                    let name = r.utf8().unwrap_or("").to_owned();
+                    // We speak one subsystem: sftp. A certificate force-command
+                    // means "only this command" — so it denies subsystems too.
+                    if force_command.is_some() || name != "sftp" {
+                        if force_command.is_some() {
+                            tracing::info!(%name, "refusing subsystem: certificate forces a command");
+                        } else {
+                            tracing::info!(%name, "refusing unknown subsystem");
+                        }
+                        if want_reply {
+                            let _ = cmd_tx.send(Cmd::RequestReply { id, success: false });
+                        }
+                        continue;
+                    }
+                    // Run our own sftp-server: re-exec this binary in
+                    // `--internal-sftp` mode through the same privilege-drop
+                    // path as a shell, so it operates as the session user.
+                    let exe = match std::env::current_exe() {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::warn!("cannot locate sftp-server: {e}");
+                            if want_reply {
+                                let _ = cmd_tx.send(Cmd::RequestReply { id, success: false });
+                            }
+                            continue;
+                        }
+                    };
+                    let mut cmd = Command::new(exe);
+                    cmd.arg("--internal-sftp");
+                    cmd.kill_on_drop(true);
+                    cmd.env_remove("SSH_AUTH_SOCK");
+                    if let Some(fwd) = &agent_fwd {
+                        cmd.env("SSH_AUTH_SOCK", &fwd.sock);
+                    }
+                    match spawn_child(&mut cmd, None, user.as_ref()) {
+                        Ok(c) => {
+                            if want_reply {
+                                let _ = cmd_tx.send(Cmd::RequestReply { id, success: true });
+                            }
+                            break c;
+                        }
+                        Err(e) => {
+                            tracing::warn!("sftp-server spawn failed: {e}");
+                            if want_reply {
+                                let _ = cmd_tx.send(Cmd::RequestReply { id, success: false });
+                            }
+                            let _ = cmd_tx.send(Cmd::Close { id });
+                            return;
+                        }
+                    }
+                }
                 _ => {
                     if want_reply {
                         let _ = cmd_tx.send(Cmd::RequestReply { id, success: false });

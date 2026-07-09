@@ -11,6 +11,8 @@ pub mod connect;
 pub mod crypto;
 #[cfg(unix)]
 pub mod privsep;
+#[cfg(unix)]
+pub mod sftp;
 pub mod transport;
 #[cfg(unix)]
 pub mod tty;
@@ -45,6 +47,8 @@ pub enum Error {
     KeyFile(String),
     #[error("agent: {0}")]
     Agent(String),
+    #[error("sftp: {0}")]
+    Sftp(String),
 }
 
 impl Error {

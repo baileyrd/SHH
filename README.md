@@ -129,6 +129,27 @@ $ shh-keygen -s user_ca -I river -n you -f ~/.shh/id_sk.pub  # writes id_sk-cert
 $ shh -i ~/.shh/id_sk you@host uptime                        # presents the cert
 ```
 
+### File transfer (SFTP)
+
+`shhd` serves the **SFTP** subsystem (version 3, the one OpenSSH speaks), so
+the standard `sftp` client transfers files to and from it — `put`, `get`,
+`ls`, `mkdir`, `rename`, `rm`, and the rest:
+
+```console
+$ sftp -P 2222 -i ~/.shh/id you@host
+sftp> put report.pdf
+sftp> get logs/today.log
+```
+
+Like OpenSSH's `sftp-server`, `shhd` runs the file server as the logged-in
+user (it re-execs itself in `--internal-sftp` mode through the same
+privilege-drop path a shell takes), so ordinary filesystem permissions are
+the boundary. The engine (`src/sftp/`) is a self-contained SFTP v3
+implementation — both a server and a client half — verified against OpenSSH
+in both directions (the real `sftp` client drives `shhd`; our client engine
+drives OpenSSH's `sftp-server`). A standalone `shh-sftp` client binary is not
+built yet.
+
 Real hardware tokens (`ssh -i id_ed25519_sk` against a physical key) need
 an external authenticator helper, which is not yet built.
 
@@ -313,8 +334,12 @@ reach. FIDO2 security keys (`sk-ssh-ed25519@openssh.com`) work both ways —
 can be CA-certified (`sk-ssh-ed25519-cert-v01@openssh.com`, interop-verified
 with `ssh-keygen` and OpenSSH `sshd` in both directions). User certificates
 enforce the `force-command` and `source-address` critical options (and fail
-closed on any other). Not
-yet implemented: real-hardware FIDO2 on the client (needs an external
+closed on any other). File transfer works: `shhd` serves the **SFTP v3**
+subsystem to the standard `sftp` client (running the file server as the
+logged-in user, like OpenSSH's `sftp-server`), and the bundled engine
+interoperates with OpenSSH's `sftp-server` in the other direction too. Not
+yet implemented: a standalone `shh-sftp` client binary, real-hardware FIDO2
+on the client (needs an external
 authenticator helper) and the fuller privsep model that also sandboxes the
 pre-auth *parsing* in its own unprivileged process. Treat it as a working
 protocol implementation, not a hardened production daemon.

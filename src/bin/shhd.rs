@@ -1,7 +1,8 @@
 //! shhd — the SHH server.
 //!
-//! Serves session channels (exec/shell) and, where the allowlists permit,
-//! `-L`/`-R` forwards, to holders of authorized keys or valid certificates.
+//! Serves session channels (exec/shell and the `sftp` subsystem) and, where
+//! the allowlists permit, `-L`/`-R` forwards, to holders of authorized keys
+//! or valid certificates.
 //! When run as root it drops each session to the authenticated user's
 //! account (uid/gid/groups, home, login shell); an unknown user is refused
 //! rather than run with root privileges. The pre-auth code is not yet
@@ -135,7 +136,25 @@ fn load_or_create_host_key(path: &PathBuf) -> std::io::Result<PrivateKey> {
     Ok(key)
 }
 
+/// Serve one SFTP client on stdin/stdout and exit. The daemon re-execs this
+/// binary in `--internal-sftp` mode as the `sftp` subsystem child, already
+/// dropped to the session user — the same model as OpenSSH's `sftp-server`.
+fn run_internal_sftp() -> std::io::Result<()> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async {
+        shh::sftp::server::run(tokio::io::stdin(), tokio::io::stdout()).await
+    })
+}
+
 fn main() -> std::io::Result<()> {
+    // Subsystem mode is dispatched before the normal CLI so `--internal-sftp`
+    // (an internal re-exec flag, not a user-facing option) never reaches clap.
+    if std::env::args().skip(1).any(|a| a == "--internal-sftp") {
+        return run_internal_sftp();
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

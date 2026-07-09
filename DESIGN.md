@@ -174,7 +174,8 @@ shh/                 one library crate
 ├── src/auth/        userauth (publickey), local keys or via agent
 ├── src/agent/       SSH agent protocol: client, Ed25519 keyring server
 ├── src/privsep.rs   host-key signer subprocess (privilege separation)
-├── src/connect/     channels, session (exec/shell), flow control
+├── src/connect/     channels, session (exec/shell/subsystem), flow control
+├── src/sftp/        SFTP v3 protocol: server engine + client engine
 ├── src/bin/shh.rs   client
 ├── src/bin/shhd.rs  server
 ├── tests/           integration + parser-robustness tests (`cargo test`)
@@ -323,3 +324,22 @@ shh/                 one library crate
     closed. Verified against OpenSSH both ways: `ssh-keygen -L` prints our
     options, OpenSSH `sshd` runs a `force-command` from a cert we signed, and
     our `shhd` honors a `force-command` cert `ssh-keygen -s` signed.
+13. **SFTP (server, done).** The SSH File Transfer Protocol, version 3 (the
+    version OpenSSH speaks by default), rides a session channel: the client
+    sends a `subsystem` request naming `sftp`, and the channel then carries
+    length-prefixed SFTP packets. `shhd` serves it exactly as OpenSSH does —
+    by re-execing itself in `--internal-sftp` mode through the same
+    privilege-drop path a shell takes, so the file server runs as the
+    logged-in user with no path sandbox beyond ordinary filesystem
+    permissions (`sftp-server`'s model). The engine (`src/sftp/`) is
+    transport-agnostic: a `server::run` loop and a `client::Client` over any
+    async reader/writer, so it is unit-tested end to end over an in-memory
+    pipe with no SSH at all. Operations implemented: open/read/write/close,
+    opendir/readdir, stat/lstat/fstat, setstat/fsetstat (size, mode, times),
+    mkdir/rmdir/remove/rename, realpath, readlink/symlink. A certificate
+    `force-command` denies the subsystem (fail-closed: "only this command"
+    means only that command). Verified against OpenSSH both ways — the real
+    `sftp` client drives our `shhd` (put/get/ls/mkdir/rename/rm), and our
+    client engine drives OpenSSH's `sftp-server`. A standalone `shh-sftp`
+    client binary (the engine wants only a CLI wrapper around the auth flow)
+    is not built yet.

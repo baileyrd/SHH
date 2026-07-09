@@ -10,10 +10,18 @@ use std::path::PathBuf;
 use clap::Parser;
 use tokio::net::TcpStream;
 
-use shh::crypto::ed25519::PublicKey;
+use shh::crypto::ed25519::{PrivateKey, PublicKey};
 use shh::crypto::keyfile;
+use shh::crypto::sk::SoftwareKey;
 use shh::transport::{ClientConfig, Transport};
 use shh::{auth, connect, Error};
+
+/// How a key-file identity authenticates: a plain Ed25519 key (optionally
+/// with a certificate) or a security key.
+enum FileAuth {
+    Ed25519(PrivateKey, Option<Vec<u8>>),
+    SecurityKey(SoftwareKey),
+}
 
 #[derive(Parser)]
 #[command(name = "shh", about = "SHH client: modern SSH, nothing legacy")]
@@ -204,12 +212,16 @@ fn verify_host_key(
     }
 }
 
-/// Decode the identity file, prompting for its passphrase when protected.
-fn load_identity(text: &str, path: &std::path::Path) -> Result<shh::crypto::ed25519::PrivateKey, String> {
+/// Decode the identity file (Ed25519 or security key), prompting for its
+/// passphrase when protected.
+fn load_identity(
+    text: &str,
+    path: &std::path::Path,
+) -> Result<keyfile::PrivateIdentity, String> {
     let protected = keyfile::needs_passphrase(text).map_err(|e| format!("{}: {e}", path.display()))?;
     if !protected {
-        return keyfile::decode_private(text)
-            .map(|(k, _)| k)
+        return keyfile::decode_private_identity(text, None)
+            .map(|(id, _)| id)
             .map_err(|e| format!("{}: {e}", path.display()));
     }
     for _ in 0..3 {
@@ -218,8 +230,8 @@ fn load_identity(text: &str, path: &std::path::Path) -> Result<shh::crypto::ed25
             path.display()
         ))
         .map_err(|e| format!("cannot prompt for passphrase: {e}"))?;
-        match keyfile::decode_private_protected(text, Some(&pass)) {
-            Ok((k, _)) => return Ok(k),
+        match keyfile::decode_private_identity(text, Some(&pass)) {
+            Ok((id, _)) => return Ok(id),
             Err(e) if e.to_string().contains("wrong passphrase") => {
                 eprintln!("shh: wrong passphrase, try again");
             }
@@ -227,6 +239,21 @@ fn load_identity(text: &str, path: &std::path::Path) -> Result<shh::crypto::ed25
         }
     }
     Err("too many passphrase attempts".into())
+}
+
+/// Confirm user presence for a (software) security key. A real token would
+/// blink for a touch; here we ask on the terminal, and proceed automatically
+/// when there is none (scripts, tests).
+fn confirm_presence() {
+    use std::io::{BufRead, Write};
+    let Ok(mut tty) = std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty") else {
+        return; // no terminal — treat as present
+    };
+    let _ = write!(tty, "shh: confirm presence for the security key (press Enter): ");
+    let _ = tty.flush();
+    let mut line = String::new();
+    let mut reader = std::io::BufReader::new(tty);
+    let _ = reader.read_line(&mut line);
 }
 
 /// Load a certificate blob: from `explicit` if given, else from
@@ -304,17 +331,27 @@ async fn run(args: Args) -> Result<i32, String> {
         }
     }
 
-    // Without an agent, a key file (with a certificate beside it, OpenSSH
-    // convention `<identity>-cert.pub`; an explicit --certificate overrides).
+    // Without an agent, a key file. An Ed25519 identity may present a
+    // certificate beside it (OpenSSH convention `<identity>-cert.pub`; an
+    // explicit --certificate overrides); a security key presents itself.
     let file_key = match &agent {
         Some(_) => None,
         None => {
             let identity = find_identity(args.identity)?;
             let text = std::fs::read_to_string(&identity)
                 .map_err(|e| format!("{}: {e}", identity.display()))?;
-            let key = load_identity(&text, &identity)?;
-            let cert = load_certificate(args.certificate.as_ref(), &identity)?;
-            Some((key, cert))
+            Some(match load_identity(&text, &identity)? {
+                keyfile::PrivateIdentity::Ed25519(key) => {
+                    let cert = load_certificate(args.certificate.as_ref(), &identity)?;
+                    FileAuth::Ed25519(key, cert)
+                }
+                keyfile::PrivateIdentity::SecurityKey(sk) => {
+                    if args.certificate.is_some() {
+                        return Err("certificates with security keys are not supported".into());
+                    }
+                    FileAuth::SecurityKey(sk)
+                }
+            })
         }
     };
 
@@ -365,8 +402,12 @@ async fn run(args: Args) -> Result<i32, String> {
         (Some((client, ids)), _) => {
             auth::client_agent(&mut t, &user, client, ids, |banner| eprint!("{banner}")).await
         }
-        (None, Some((key, cert))) => {
+        (None, Some(FileAuth::Ed25519(key, cert))) => {
             auth::client(&mut t, &user, key, cert.as_deref(), |banner| eprint!("{banner}")).await
+        }
+        (None, Some(FileAuth::SecurityKey(sk))) => {
+            confirm_presence();
+            auth::client_sk(&mut t, &user, sk, |banner| eprint!("{banner}")).await
         }
         (None, None) => unreachable!("one auth source is always chosen"),
     }

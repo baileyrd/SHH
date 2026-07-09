@@ -1,12 +1,13 @@
-//! Generate an Ed25519 keypair, or sign a user certificate. There is no
-//! `-t` option: SHH has exactly one key type.
+//! Generate a keypair, or sign a user certificate. The default key type is
+//! Ed25519; `-t ed25519-sk` makes a *software-emulated* security key (see
+//! `--type`).
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use base64::prelude::{Engine as _, BASE64_STANDARD};
 use clap::Parser;
-use shh::crypto::{cert, ed25519::PrivateKey, keyfile};
+use shh::crypto::{cert, ed25519::PrivateKey, keyfile, sk::SoftwareKey};
 
 #[derive(Parser)]
 #[command(name = "shh-keygen", about = "Generate an Ed25519 key or sign a certificate")]
@@ -15,6 +16,14 @@ struct Args {
     /// Signing (`--sign`): the public key to certify.
     #[arg(short = 'f', long = "file")]
     file: PathBuf,
+
+    /// Key type: `ed25519` (default) or `ed25519-sk`. The `-sk` type is a
+    /// *software-emulated* FIDO2 security key — the seed lives in the file,
+    /// not a hardware token, so it has no hardware protection; it is for
+    /// testing and environments without a key. The public credential is a
+    /// standard `sk-ssh-ed25519@openssh.com` line any server accepts.
+    #[arg(short = 't', long = "type", default_value = "ed25519")]
+    key_type: String,
 
     /// Comment embedded in the generated key.
     #[arg(short = 'C', long = "comment", default_value = "")]
@@ -174,10 +183,39 @@ fn generate_key(args: &Args) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
     }
 
-    let key = PrivateKey::generate();
     let passphrase = choose_passphrase(args.passphrase.clone())?;
-    let encoded = keyfile::encode_private_protected(&key, &args.comment, passphrase.as_deref())
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+    // Serialize the private key and its `.pub` line, per key type.
+    let (encoded, pub_line, fingerprint) = match args.key_type.as_str() {
+        "ed25519" => {
+            let key = PrivateKey::generate();
+            let enc = keyfile::encode_private_protected(&key, &args.comment, passphrase.as_deref())
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            (
+                enc,
+                keyfile::encode_public(&key.public(), &args.comment),
+                key.public().fingerprint(),
+            )
+        }
+        "ed25519-sk" => {
+            let key = SoftwareKey::generate("ssh:");
+            let enc = keyfile::encode_sk_private(&key, &args.comment, passphrase.as_deref())
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            eprintln!(
+                "shh-keygen: note: ed25519-sk here is SOFTWARE-emulated (no hardware \
+                 protection); the seed is stored in the key file."
+            );
+            (
+                enc,
+                keyfile::encode_sk_public(&key.public(), &args.comment),
+                key.public().fingerprint(),
+            )
+        }
+        other => {
+            eprintln!("shh-keygen: unknown key type {other:?} (ed25519 or ed25519-sk)");
+            std::process::exit(2);
+        }
+    };
 
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true);
@@ -194,11 +232,11 @@ fn generate_key(args: &Args) -> std::io::Result<()> {
         p.push(".pub");
         PathBuf::from(p)
     };
-    std::fs::write(&pub_path, keyfile::encode_public(&key.public(), &args.comment))?;
+    std::fs::write(&pub_path, pub_line)?;
 
     println!("private key: {}", args.file.display());
     println!("public key:  {}", pub_path.display());
-    println!("fingerprint: {}", key.public().fingerprint());
+    println!("fingerprint: {fingerprint}");
     Ok(())
 }
 

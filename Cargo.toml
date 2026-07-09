@@ -38,6 +38,7 @@ clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { version = "1", features = ["test-util"] }
 
 [[bin]]
 name = "shh"
@@ -53,3 +54,7 @@ lto = "thin"
 [[bin]]
 name = "shh-keygen"
 path = "src/bin/shh_keygen.rs"
+
+[[bin]]
+name = "shh-agent"
+path = "src/bin/shh_agent.rs"

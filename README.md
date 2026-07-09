@@ -81,6 +81,31 @@ $ shh you@gateway.corp uptime
 When no host certificate or CA is configured, host identity falls back to
 `known_hosts` TOFU pinning, exactly as before.
 
+### Key agent
+
+`shh-agent` holds Ed25519 keys in one long-lived process and signs for
+clients over a Unix socket, so private keys never enter short-lived client
+processes. The protocol is the standard SSH agent protocol, so the pieces
+are interchangeable with OpenSSH's: `ssh` and `ssh-add` work against
+`shh-agent`, and `shh` uses any agent named by `SSH_AUTH_SOCK` — including
+`ssh-agent`. Certificates ride along automatically (`<key>-cert.pub`), and
+agent-held certificates are offered before bare keys.
+
+```console
+$ shh-agent &                       # serve on ~/.shh/agent.sock (0600)
+SSH_AUTH_SOCK=/home/you/.shh/agent.sock; export SSH_AUTH_SOCK;
+$ shh-agent add                     # add the default identity (+ cert)
+$ shh you@host uptime               # signs via the agent — no key file read
+$ shh-agent list                    # fingerprints, like ssh-add -l
+$ shh-agent lock                    # identities vanish until unlock
+```
+
+The agent accepts only what it can fully honor: Ed25519 keys and
+certificates, and the lifetime constraint (`add -t 3600`). Anything else —
+legacy key types, confirm-per-use, unknown constraints or extensions — is
+refused, never silently ignored. Connections from other uids are dropped,
+and `shh --no-agent` forces key files even when an agent is running.
+
 `shh host cmd` behaves like `ssh`: stdin is forwarded, stdout/stderr come
 back separated, and the remote exit status becomes `shh`'s exit status.
 `shh host` with a terminal opens an interactive shell on a real
@@ -136,18 +161,20 @@ readable (unencrypted keys for now).
 
 ## Status
 
-Transport, auth (keys and CA-signed user certificates), host certificates,
-exec sessions, interactive PTY sessions (pty-req, window-change,
-controlling terminal), encrypted key files, local (`-L`) and remote (`-R`)
-TCP forwarding with server-side allowlists, and connection keep-alives —
-all multiplexed so a session and any number of forwards share one
-connection — are complete and tested (`cargo test`). Keep-alives probe an
-idle peer (`keepalive@openssh.com`) and drop it after several unanswered
-probes (`--keepalive-interval` / `--keepalive-count`, on by default). When
-`shhd` runs as root it drops each session to the authenticated user's
-account — uid, gid, supplementary groups, home directory, and login shell
-— so a session is never more privileged than the account that logged in;
-an unknown login name is refused. Not yet implemented: FIDO2
-`sk-ssh-ed25519` keys, and a sandboxed pre-auth process (privilege
+Transport, auth (keys and CA-signed user certificates, from files or an
+agent), host certificates, exec sessions, interactive PTY sessions
+(pty-req, window-change, controlling terminal), encrypted key files, local
+(`-L`) and remote (`-R`) TCP forwarding with server-side allowlists, and
+connection keep-alives — all multiplexed so a session and any number of
+forwards share one connection — are complete and tested (`cargo test`).
+Keep-alives probe an idle peer (`keepalive@openssh.com`) and drop it after
+several unanswered probes (`--keepalive-interval` / `--keepalive-count`,
+on by default). When `shhd` runs as root it drops each session to the
+authenticated user's account — uid, gid, supplementary groups, home
+directory, and login shell — so a session is never more privileged than
+the account that logged in; an unknown login name is refused. `shh-agent`
+is a drop-in, Ed25519-only `ssh-agent` (interop verified with `ssh-add`
+and `ssh` both ways). Not yet implemented: FIDO2 `sk-ssh-ed25519` keys,
+agent *forwarding*, and a sandboxed pre-auth process (privilege
 *separation*, distinct from the privilege *drop* above). Treat it as a
 working protocol implementation, not a hardened production daemon.

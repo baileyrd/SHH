@@ -253,6 +253,9 @@ pub struct Connection<S> {
     recv_since_tick: bool,
     /// The account server-side sessions run as (privilege drop when root).
     session_user: Option<super::UserContext>,
+    /// Server role: a `force-command` from the client's certificate. When
+    /// set, every session runs this command instead of the client's request.
+    force_command: Option<String>,
     /// Client role: the local agent socket to splice [`AGENT_CHANNEL`]
     /// opens to (`-A`). `None` refuses such opens.
     agent_path: Option<std::path::PathBuf>,
@@ -336,6 +339,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
             keepalive_outstanding: 0,
             recv_since_tick: true,
             session_user: None,
+            force_command: None,
             agent_path: None,
             agent_bind: None,
             permit_agent: false,
@@ -364,6 +368,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
     /// Run server-side sessions as this account (privilege drop when root).
     pub fn session_user(mut self, user: Option<super::UserContext>) -> Self {
         self.session_user = user;
+        self
+    }
+
+    /// Server role: pin every session to this command (the certificate's
+    /// `force-command` critical option), overriding whatever the client asks.
+    pub fn force_command(mut self, command: Option<String>) -> Self {
+        self.force_command = command;
         self
     }
 
@@ -1113,6 +1124,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
             rx,
             self.cmd_tx.clone(),
             self.session_user.clone(),
+            self.force_command.clone(),
             self.permit_agent,
         ));
     }

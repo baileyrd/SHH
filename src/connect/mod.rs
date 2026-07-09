@@ -278,7 +278,7 @@ mod tests {
         };
         let server_side = async move {
             let mut t = Transport::server(b, ServerConfig::with_host_key(host_key)).await?;
-            auth::server(&mut t, &policy).await?;
+            auth::server(&mut t, &policy, None).await?;
             server_session(t, None).await
         };
         let (c, s) = tokio::join!(client_side, server_side);
@@ -299,6 +299,48 @@ mod tests {
     async fn stdin_reaches_the_command() {
         let (status, out, _) = run("tr a-z A-Z", b"quiet please\n").await;
         assert_eq!(out, b"QUIET PLEASE\n");
+        assert_eq!(status.code, Some(0));
+    }
+
+    #[tokio::test]
+    async fn force_command_overrides_client_request() {
+        // The client asks to run `id`, but a certificate force-command pins
+        // the session to a different command; the client's request appears
+        // only as SSH_ORIGINAL_COMMAND.
+        let (a, b) = duplex(1 << 20);
+        let user_key = PrivateKey::generate();
+        let host_key = PrivateKey::generate();
+        let policy = auth::Policy {
+            user: Some("tester".into()),
+            keys: vec![user_key.public().into()],
+            trusted_cas: vec![],
+            banner: None,
+        };
+        let out = Sink::default();
+        let out2 = out.clone();
+        let client_side = async move {
+            let mut t =
+                Transport::client(a, ClientConfig::with_verifier(Box::new(|_| Ok(())))).await?;
+            auth::client(&mut t, "tester", &user_key, None, |_| {}).await?;
+            let status =
+                client_session(t, Some("id"), None, None, b"".as_ref(), out, Sink::default())
+                    .await?;
+            Ok::<_, Error>(status)
+        };
+        let server_side = async move {
+            let mut t = Transport::server(b, ServerConfig::with_host_key(host_key)).await?;
+            auth::server(&mut t, &policy, None).await?;
+            mux::Connection::new(t, forward::Policy::DenyAll)
+                .force_command(Some(
+                    "printf FORCED; printf '[%s]' \"$SSH_ORIGINAL_COMMAND\"".into(),
+                ))
+                .run(None)
+                .await
+        };
+        let (c, s) = tokio::join!(client_side, server_side);
+        s.unwrap();
+        let status = c.unwrap();
+        assert_eq!(out2.take(), b"FORCED[id]");
         assert_eq!(status.code, Some(0));
     }
 
@@ -359,7 +401,7 @@ mod tests {
         };
         let server_side = async move {
             let mut t = Transport::server(b, ServerConfig::with_host_key(host_key)).await?;
-            auth::server(&mut t, &policy).await?;
+            auth::server(&mut t, &policy, None).await?;
             server_session(t, None).await
         };
         let (c, s) = tokio::join!(client_side, server_side);

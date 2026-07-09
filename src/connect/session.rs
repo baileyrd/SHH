@@ -285,6 +285,7 @@ pub(crate) async fn session_client_task(
 
 // ------------------------------------------------------------- server ----
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn session_server_task(
     id: u32,
     credit: Arc<Semaphore>,
@@ -292,6 +293,7 @@ pub(crate) async fn session_server_task(
     mut to_task: mpsc::UnboundedReceiver<ToTask>,
     cmd_tx: mpsc::UnboundedSender<Cmd>,
     user: Option<super::UserContext>,
+    force_command: Option<String>,
     permit_agent: bool,
 ) {
     let mut allocated: Option<pty::Pty> = None;
@@ -357,11 +359,29 @@ pub(crate) async fn session_server_task(
                         Some(u) => u.shell.clone(),
                         None => std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()),
                     };
-                    let mut cmd = Command::new(&shell);
-                    if kind == "exec" {
+                    // What the client asked to run (empty for a shell).
+                    let requested = if kind == "exec" {
                         let mut r = Reader::new(&data);
-                        let line = r.utf8().unwrap_or("").to_owned();
-                        cmd.arg("-c").arg(line);
+                        Some(r.utf8().unwrap_or("").to_owned())
+                    } else {
+                        None
+                    };
+                    let mut cmd = Command::new(&shell);
+                    match &force_command {
+                        // A certificate's force-command overrides the request:
+                        // run the pinned command, and expose what the client
+                        // asked for as SSH_ORIGINAL_COMMAND (as OpenSSH does).
+                        Some(forced) => {
+                            cmd.arg("-c").arg(forced);
+                            if let Some(orig) = &requested {
+                                cmd.env("SSH_ORIGINAL_COMMAND", orig);
+                            }
+                        }
+                        None => {
+                            if let Some(line) = &requested {
+                                cmd.arg("-c").arg(line);
+                            }
+                        }
                     }
                     cmd.kill_on_drop(true);
                     // The child sees an SSH_AUTH_SOCK only when the client

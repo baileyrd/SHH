@@ -62,9 +62,24 @@ $ shhd --trusted-ca-keys /etc/shh/user_ca.pub --user deploy
 $ shh -i id_ed25519 deploy@host uptime
 ```
 
-SHH honors the validity window and principals and fails closed on any
-critical option it doesn't implement. `force-command` / `source-address`
-options are not yet honored.
+SHH honors the validity window and principals, and enforces two critical
+options: **`force-command`** pins the session to a fixed command whatever the
+client requested (the client's command survives only as
+`SSH_ORIGINAL_COMMAND`), and **`source-address`** refuses the certificate
+from a client outside its CIDR list. Mint them with `shh-keygen -O`, exactly
+like `ssh-keygen`:
+
+```console
+# this cert may only run the backup script, and only from the office subnet
+$ shh-keygen -s ca_key -I alice -n deploy \
+    -O force-command='/usr/local/bin/backup' \
+    -O source-address='198.51.100.0/24' -f id_ed25519.pub
+```
+
+Any *other* critical option still fails closed (an unknown one denies the
+cert). Verified against OpenSSH both ways — `ssh-keygen -L` prints ours,
+OpenSSH `sshd` runs a `force-command` from a cert we signed, and `shhd`
+honors one `ssh-keygen -s` signed.
 
 **Host certificates** work the same way in reverse: a server presents a
 CA-signed certificate as its host key, and the client verifies it against a
@@ -296,7 +311,9 @@ the host key in a separate signer subprocess, out of the pre-auth parser's
 reach. FIDO2 security keys (`sk-ssh-ed25519@openssh.com`) work both ways —
 `shhd` verifies them, `shh` can present a software-emulated one, and they
 can be CA-certified (`sk-ssh-ed25519-cert-v01@openssh.com`, interop-verified
-with `ssh-keygen` and OpenSSH `sshd` in both directions). Not
+with `ssh-keygen` and OpenSSH `sshd` in both directions). User certificates
+enforce the `force-command` and `source-address` critical options (and fail
+closed on any other). Not
 yet implemented: real-hardware FIDO2 on the client (needs an external
 authenticator helper) and the fuller privsep model that also sandboxes the
 pre-auth *parsing* in its own unprivileged process. Treat it as a working

@@ -6,6 +6,8 @@
 //! bound to the session identifier (RFC 4252 §7), so a captured auth
 //! exchange is useless on any other connection.
 
+use std::net::IpAddr;
+
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -228,9 +230,15 @@ impl Policy {
         }
     }
 
-    /// Validate a presented certificate for `user` and, if it checks out,
-    /// return the certified key to verify the userauth signature against.
-    fn authorize_cert(&self, blob: &[u8], user: &str) -> Option<UserKey> {
+    /// Validate a presented certificate for `user`, connecting from `peer`,
+    /// and if it checks out return the certified key to verify the userauth
+    /// signature against together with any `force-command` it carries.
+    fn authorize_cert(
+        &self,
+        blob: &[u8],
+        user: &str,
+        peer: Option<IpAddr>,
+    ) -> Option<(UserKey, Option<String>)> {
         let cert = match Certificate::parse_and_verify(blob) {
             Ok(c) => c,
             Err(e) => {
@@ -254,13 +262,31 @@ impl Policy {
             tracing::info!(key_id = %cert.key_id, %user, "certificate does not list this principal");
             return None;
         }
-        Some(cert.certified_user_key())
+        if !cert.permits_source(peer) {
+            tracing::info!(key_id = %cert.key_id, ?peer, "certificate source-address does not admit this client");
+            return None;
+        }
+        Some((cert.certified_user_key(), cert.force_command))
     }
 }
 
-/// Run the server side of authentication; returns the authenticated
-/// username.
-pub async fn server<S>(t: &mut Transport<S>, policy: &Policy) -> Result<String>
+/// The result of a successful authentication: the login name plus any
+/// `force-command` the presented certificate pins the session to.
+#[derive(Clone, Debug)]
+pub struct Authenticated {
+    pub user: String,
+    pub force_command: Option<String>,
+}
+
+/// Run the server side of authentication. `peer` is the client's address,
+/// used to enforce a certificate's `source-address` option (an unknown
+/// address fails such a check closed). Returns the authenticated login name
+/// and any `force-command` its certificate pins the session to.
+pub async fn server<S>(
+    t: &mut Transport<S>,
+    policy: &Policy,
+    peer: Option<IpAddr>,
+) -> Result<Authenticated>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
@@ -307,20 +333,22 @@ where
         let blob = r.string()?.to_vec();
 
         // Derive the key whose signature we must verify: the presented key
-        // itself (plain publickey) or the key certified by a trusted CA.
-        let verify_key = if !policy.user_allowed(&user) {
+        // itself (plain publickey) or the key certified by a trusted CA. A
+        // certificate may additionally pin a forced command.
+        let authorized = if !policy.user_allowed(&user) {
             None
         } else if algo == ALGO || algo == SK_ALGO {
             // A bare key or a security-key credential: it must be listed.
             UserKey::from_blob(&blob)
                 .ok()
                 .filter(|k| policy.key_authorized(k))
+                .map(|k| (k, None))
         } else if algo == CERT_ALGO || algo == SK_CERT_ALGO {
-            policy.authorize_cert(&blob, &user)
+            policy.authorize_cert(&blob, &user, peer)
         } else {
             None
         };
-        let Some(verify_key) = verify_key else {
+        let Some((verify_key, force_command)) = authorized else {
             reject(t).await?;
             continue;
         };
@@ -345,7 +373,10 @@ where
         }
 
         t.send(&[msg::USERAUTH_SUCCESS]).await?;
-        return Ok(user);
+        return Ok(Authenticated {
+            user,
+            force_command,
+        });
     }
 
     Err(Error::Auth("too many authentication attempts".into()))
@@ -385,7 +416,7 @@ mod tests {
         };
         let server_side = async move {
             let mut t = Transport::server(b, ServerConfig::with_host_key(host_key)).await?;
-            server(&mut t, &policy).await
+            server(&mut t, &policy, None).await.map(|a| a.user)
         };
         tokio::join!(client_side, server_side)
     }
@@ -452,7 +483,7 @@ mod tests {
         };
         let server_side = async move {
             let mut t = Transport::server(b, ServerConfig::with_host_key(host_key)).await?;
-            server(&mut t, &policy).await
+            server(&mut t, &policy, None).await.map(|a| a.user)
         };
         tokio::join!(client_side, server_side)
     }
@@ -534,6 +565,85 @@ mod tests {
         assert_eq!(s.unwrap(), "river");
     }
 
+    /// Like `cert_authed` but keeps the full `Authenticated` result and lets
+    /// the test supply the client's apparent peer address (for source-address).
+    async fn cert_authed_peer(
+        client_key: &PrivateKey,
+        cert: Vec<u8>,
+        policy: Policy,
+        user: &str,
+        peer: Option<IpAddr>,
+    ) -> (Result<()>, Result<Authenticated>) {
+        let (a, b) = duplex(1 << 20);
+        let host_key = PrivateKey::generate();
+        let user = user.to_owned();
+        let client_key = client_key.clone();
+        let client_side = async move {
+            let mut t =
+                Transport::client(a, ClientConfig::with_verifier(Box::new(|_| Ok(())))).await?;
+            client(&mut t, &user, &client_key, Some(&cert), |_| {}).await
+        };
+        let server_side = async move {
+            let mut t = Transport::server(b, ServerConfig::with_host_key(host_key)).await?;
+            server(&mut t, &policy, peer).await
+        };
+        tokio::join!(client_side, server_side)
+    }
+
+    #[tokio::test]
+    async fn cert_force_command_is_surfaced() {
+        let ca = PrivateKey::generate();
+        let user_key = PrivateKey::generate();
+        let opts = cert::CertOptions {
+            force_command: Some("/usr/bin/backup --nightly".into()),
+            ..Default::default()
+        };
+        let cert = cert::sign_user_cert_with(
+            &ca, &user_key.public(), &opts, 1, "id", &["river".into()], 0, u64::MAX,
+        );
+        let policy = Policy {
+            user: Some("river".into()),
+            keys: vec![],
+            trusted_cas: vec![ca.public()],
+            banner: None,
+        };
+        let (c, s) = cert_authed_peer(&user_key, cert, policy, "river", None).await;
+        c.unwrap();
+        let authed = s.unwrap();
+        assert_eq!(authed.user, "river");
+        assert_eq!(authed.force_command.as_deref(), Some("/usr/bin/backup --nightly"));
+    }
+
+    #[tokio::test]
+    async fn cert_source_address_gates_login() {
+        let ca = PrivateKey::generate();
+        let user_key = PrivateKey::generate();
+        let opts = cert::CertOptions {
+            source_address: Some("192.0.2.0/24".into()),
+            ..Default::default()
+        };
+        let cert = cert::sign_user_cert_with(
+            &ca, &user_key.public(), &opts, 1, "id", &["river".into()], 0, u64::MAX,
+        );
+        let mk_policy = || Policy {
+            user: Some("river".into()),
+            keys: vec![], // only the cert can let anyone in
+            trusted_cas: vec![ca.public()],
+            banner: None,
+        };
+
+        // An in-range client is admitted.
+        let ok: IpAddr = "192.0.2.10".parse().unwrap();
+        let (c, s) = cert_authed_peer(&user_key, cert.clone(), mk_policy(), "river", Some(ok)).await;
+        c.unwrap();
+        assert_eq!(s.unwrap().user, "river");
+
+        // An out-of-range client is refused (no fallback key is authorized).
+        let bad: IpAddr = "198.51.100.1".parse().unwrap();
+        let (c, _s) = cert_authed_peer(&user_key, cert, mk_policy(), "river", Some(bad)).await;
+        assert!(matches!(c, Err(Error::Auth(_))));
+    }
+
     /// A live in-memory agent holding `keys` (and one certificate, when
     /// given), plus the auth pair that uses it.
     async fn agent_authed(
@@ -567,7 +677,7 @@ mod tests {
         };
         let server_side = async move {
             let mut t = Transport::server(tb, ServerConfig::with_host_key(host_key)).await?;
-            server(&mut t, &policy).await
+            server(&mut t, &policy, None).await.map(|a| a.user)
         };
         tokio::join!(client_side, server_side)
     }
@@ -691,7 +801,7 @@ mod tests {
         };
         let server_side = async move {
             let mut t = Transport::server(b, ServerConfig::with_host_key(host_key)).await?;
-            server(&mut t, &policy).await
+            server(&mut t, &policy, None).await.map(|a| a.user)
         };
         tokio::join!(client_side, server_side)
     }
@@ -715,7 +825,7 @@ mod tests {
         };
         let server_side = async move {
             let mut t = Transport::server(b, ServerConfig::with_host_key(host_key)).await?;
-            server(&mut t, &policy).await
+            server(&mut t, &policy, None).await.map(|a| a.user)
         };
         let (c, s) = tokio::join!(client_side, server_side);
         c.unwrap();
@@ -753,7 +863,7 @@ mod tests {
         };
         let server_side = async move {
             let mut t = Transport::server(b, ServerConfig::with_host_key(host_key)).await?;
-            server(&mut t, &policy).await
+            server(&mut t, &policy, None).await.map(|a| a.user)
         };
         let (c, s) = tokio::join!(client_side, server_side);
         c.unwrap();
@@ -784,7 +894,7 @@ mod tests {
         };
         let server_side = async move {
             let mut t = Transport::server(b, ServerConfig::with_host_key(host_key)).await?;
-            server(&mut t, &policy).await
+            server(&mut t, &policy, None).await.map(|a| a.user)
         };
         let (c, s) = tokio::join!(client_side, server_side);
         c.unwrap();

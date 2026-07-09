@@ -300,14 +300,20 @@ async fn serve(
                     return;
                 }
             };
-            let user = match auth::server(&mut t, &policy).await {
-                Ok(u) => u,
+            let auth::Authenticated {
+                user,
+                force_command,
+            } = match auth::server(&mut t, &policy, Some(addr.ip())).await {
+                Ok(a) => a,
                 Err(e) => {
                     tracing::info!(%addr, "authentication failed: {e}");
                     t.bail(&e).await;
                     return;
                 }
             };
+            if force_command.is_some() {
+                tracing::info!(%addr, %user, "certificate pins a forced command");
+            }
 
             // Resolve the account the session should run as. When we are
             // root we drop to it; an unknown user is refused rather than run
@@ -340,6 +346,7 @@ async fn serve(
                 .listen_policy(listen)
                 .keepalive(std::time::Duration::from_secs(ka_interval), ka_count)
                 .session_user(session_user)
+                .force_command(force_command)
                 .permit_agent_forward(permit_agent);
             match conn.run(None).await {
                 Ok(()) => tracing::info!(%addr, %user, "connection ended"),

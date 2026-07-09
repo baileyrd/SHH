@@ -51,7 +51,7 @@ async fn attempt(
         let mut t = Transport::server(b, ServerConfig::with_host_key(server_host_key))
             .await
             .unwrap();
-        let _ = auth::server(&mut t, &policy).await;
+        let _ = auth::server(&mut t, &policy, None).await;
     });
 
     let mut t = Transport::client(a, ClientConfig::with_verifier(Box::new(|_| Ok(())))).await?;

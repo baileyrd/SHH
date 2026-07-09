@@ -783,6 +783,84 @@ mod tests {
         assert!(!destinations_permit(&constraints, &[bound(&stranger)]));
     }
 
+    #[test]
+    fn encode_path_chains_each_hop_from_the_previous() {
+        // The security-critical shape: constraint[i].from must carry hop
+        // i-1's key (and constraint[0].from is the empty origin), so a hop is
+        // reachable only *through* the one before it.
+        let a = PrivateKey::generate().public().to_blob();
+        let b = PrivateKey::generate().public().to_blob();
+        let payload = crate::agent::encode_path(&[
+            (String::new(), "a".into(), vec![a.clone()]),
+            (String::new(), "b".into(), vec![b.clone()]),
+        ]);
+        let constraints = parse_dest_constraints(&payload).unwrap();
+        assert_eq!(constraints.len(), 2);
+        // local → A
+        assert!(constraints[0].from.keys.is_empty());
+        assert!(hop_lists_key(&constraints[0].to, &a));
+        // A → B (the "from" is A, not the origin)
+        assert!(hop_lists_key(&constraints[1].from, &a));
+        assert!(hop_lists_key(&constraints[1].to, &b));
+        assert!(!constraints[1].from.keys.is_empty(), "second hop is not from origin");
+    }
+
+    /// Bind `host` (with a fresh session id keyed by `seed`) on `c`.
+    async fn bind(c: &mut Client, host: &PrivateKey, seed: u8) {
+        let sid = [seed; 32];
+        c.session_bind(&host.public().to_blob(), &sid, &host.sign(&sid), false)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn path_constraint_requires_the_whole_chain_in_order() {
+        let (mut adder, kr) = spawn_agent();
+        let user = PrivateKey::generate();
+        let a = PrivateKey::generate(); // first hop
+        let b = PrivateKey::generate(); // second hop
+        let c = PrivateKey::generate(); // a stranger
+        // Pin the key to the path local → A → B.
+        let path = crate::agent::encode_path(&[
+            (String::new(), "a".into(), vec![a.public().to_blob()]),
+            (String::new(), "b".into(), vec![b.public().to_blob()]),
+        ]);
+        adder
+            .add_constrained(&user, None, "k", None, Some(&path))
+            .await
+            .unwrap();
+        let blob = user.public().to_blob();
+
+        // The full chain A→B: permitted (this is the point of the path).
+        let mut full = client_for(&kr);
+        bind(&mut full, &a, 1).await;
+        bind(&mut full, &b, 2).await;
+        full.sign(&blob, b"d").await.unwrap();
+
+        // At the first hop alone: still permitted (the key authenticates to A
+        // to make the hop in the first place).
+        let mut at_a = client_for(&kr);
+        bind(&mut at_a, &a, 3).await;
+        at_a.sign(&blob, b"d").await.unwrap();
+
+        // Straight to B without going through A: refused.
+        let mut skip = client_for(&kr);
+        bind(&mut skip, &b, 4).await;
+        assert!(skip.sign(&blob, b"d").await.is_err());
+
+        // A then a *different* second hop: refused.
+        let mut wrong = client_for(&kr);
+        bind(&mut wrong, &a, 5).await;
+        bind(&mut wrong, &c, 6).await;
+        assert!(wrong.sign(&blob, b"d").await.is_err());
+
+        // The hops out of order (B then A): refused.
+        let mut reversed = client_for(&kr);
+        bind(&mut reversed, &b, 7).await;
+        bind(&mut reversed, &a, 8).await;
+        assert!(reversed.sign(&blob, b"d").await.is_err());
+    }
+
     #[tokio::test]
     async fn unconstrained_key_still_signs_without_any_binding() {
         // The restriction must not leak to ordinary keys.

@@ -44,11 +44,13 @@ enum Cmd {
         /// Forget the key after this many seconds.
         #[arg(short = 't', long, value_name = "seconds")]
         lifetime: Option<u32>,
-        /// Restrict the key to authenticating to this destination
-        /// (`[user@]host`, repeatable). The host's key must be in
-        /// known_hosts. The agent then refuses to sign toward any other
-        /// host, even through forwarding.
-        #[arg(short = 'H', long = "destination", value_name = "[user@]host")]
+        /// Restrict the key to a destination (`[user@]host`, repeatable).
+        /// Chain hops with `>` for a path — `gw>prod` pins the key so it
+        /// signs for prod only when the forwarded agent reached prod via gw
+        /// (and gw itself). Repeating `-H` allows several destinations. Each
+        /// host's key must be in known_hosts; the agent refuses to sign for
+        /// anything else, even through forwarding.
+        #[arg(short = 'H', long = "destination", value_name = "[user@]host[>host…]")]
         destination: Vec<String>,
         /// known_hosts file used to resolve `--destination` host keys.
         #[arg(long, default_value_os_t = default_path("known_hosts"))]
@@ -245,8 +247,10 @@ fn cert_path(identity: &std::path::Path) -> PathBuf {
     PathBuf::from(p)
 }
 
-/// Resolve `--destination` specs into the constraint payload, looking each
-/// host's key up in known_hosts.
+/// Resolve `--destination` specs into a constraint payload, looking each
+/// host's key up in known_hosts. Each spec is a `>`-separated path from the
+/// local host (`gw>prod` means "prod only via gw"); repeating `-H` allows
+/// several independent destinations, exactly like OpenSSH's `ssh-add -h`.
 fn build_destinations(
     specs: &[String],
     known_hosts: &std::path::Path,
@@ -256,22 +260,27 @@ fn build_destinations(
     }
     let text = std::fs::read_to_string(known_hosts)
         .map_err(|e| format!("{}: {e}", known_hosts.display()))?;
-    let mut dests = Vec::new();
+    let mut payload = Vec::new();
     for spec in specs {
-        let (user, host) = match spec.split_once('@') {
-            Some((u, h)) => (u.to_string(), h.to_string()),
-            None => (String::new(), spec.clone()),
-        };
-        let keys = keyfile::known_hosts_keys_for(&text, &host);
-        if keys.is_empty() {
-            return Err(format!(
-                "no host key for {host:?} in {} — connect once (or add it) before restricting to it",
-                known_hosts.display()
-            ));
+        let mut hops = Vec::new();
+        for part in spec.split('>') {
+            let (user, host) = match part.split_once('@') {
+                Some((u, h)) => (u.to_string(), h.to_string()),
+                None => (String::new(), part.to_string()),
+            };
+            let keys = keyfile::known_hosts_keys_for(&text, &host);
+            if keys.is_empty() {
+                return Err(format!(
+                    "no host key for {host:?} in {} — connect once (or add it) before restricting to it",
+                    known_hosts.display()
+                ));
+            }
+            hops.push((user, host, keys.iter().map(|k| k.to_blob()).collect()));
         }
-        dests.push((user, host, keys.iter().map(|k| k.to_blob()).collect()));
+        // One spec = one path (local → h1 → h2 → …); specs are ORed.
+        payload.extend(shh::agent::encode_path(&hops));
     }
-    Ok(Some(shh::agent::encode_destinations(&dests)))
+    Ok(Some(payload))
 }
 
 async fn add(

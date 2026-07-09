@@ -386,6 +386,18 @@ async fn run(args: Args) -> Result<i32, String> {
         None
     };
 
+    // Our own binding for this hop, replayed onto each relayed agent
+    // connection so a forwarded agent records the full path (this host, then
+    // the downstream's). Captured before the transport moves into the loop.
+    let agent_bind = agent_sock.as_ref().and_then(|_| {
+        let (blob, sig) = t.host_binding();
+        (!blob.is_empty()).then(|| connect::mux::AgentBind {
+            host_blob: blob.to_vec(),
+            session_id: t.session_id().to_vec(),
+            sig: sig.to_vec(),
+        })
+    });
+
     // One multiplexed connection carries the session (unless -N) and every
     // -L forward, concurrently.
     let conn = connect::mux::Connection::new(t, connect::forward::Policy::DenyAll)
@@ -393,7 +405,8 @@ async fn run(args: Args) -> Result<i32, String> {
             std::time::Duration::from_secs(args.keepalive_interval),
             args.keepalive_count,
         )
-        .agent_forward(agent_sock.clone());
+        .agent_forward(agent_sock.clone())
+        .agent_bind(agent_bind);
     let handle = conn.handle();
     for spec in &forwards {
         let listener = tokio::net::TcpListener::bind(&spec.bind)

@@ -38,6 +38,18 @@ use crate::{Error, Result};
 /// Its CHANNEL_OPEN carries no type-specific fields.
 pub(crate) const AGENT_CHANNEL: &str = "auth-agent@openssh.com";
 
+/// A client's `session-bind@openssh.com` material for the hop it made: the
+/// server's host-key blob, the session id, and the host's signature over it.
+/// When forwarding an agent (`-A`), the client replays this onto each
+/// relayed agent connection so the agent sees the full path the request
+/// traversed — the basis for multi-hop destination constraints.
+#[derive(Clone)]
+pub struct AgentBind {
+    pub host_blob: Vec<u8>,
+    pub session_id: Vec<u8>,
+    pub sig: Vec<u8>,
+}
+
 /// Any byte stream a tunnel channel can splice — a TCP socket for the
 /// `-L`/`-R` forwards, a Unix socket for a forwarded agent.
 pub(crate) trait TunnelIo: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -244,6 +256,9 @@ pub struct Connection<S> {
     /// Client role: the local agent socket to splice [`AGENT_CHANNEL`]
     /// opens to (`-A`). `None` refuses such opens.
     agent_path: Option<std::path::PathBuf>,
+    /// Client role: this hop's binding, replayed onto each relayed agent
+    /// connection so a forwarded agent records the whole path (`-A`).
+    agent_bind: Option<AgentBind>,
     /// Server role: whether sessions may request agent forwarding.
     permit_agent: bool,
     next_id: u32,
@@ -270,6 +285,26 @@ async fn tick(interval: Option<&mut tokio::time::Interval>) {
         }
         None => std::future::pending().await,
     }
+}
+
+/// Write one `session-bind@openssh.com` request for `bind` onto a freshly
+/// connected agent socket and read its reply, before any downstream traffic
+/// flows. `is_forwarding` is true: this connection is a forwarded one.
+async fn inject_bind<S>(io: &mut S, bind: &AgentBind) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut w = Writer::new();
+    w.byte(crate::agent::num::EXTENSION);
+    w.utf8("session-bind@openssh.com");
+    w.string(&bind.host_blob);
+    w.string(&bind.session_id);
+    w.string(&bind.sig);
+    w.boolean(true);
+    crate::agent::write_frame(io, &w.into_bytes()).await?;
+    // Drain the SUCCESS/FAILURE so the downstream sees a clean stream.
+    crate::agent::read_frame(io).await?;
+    Ok(())
 }
 
 /// Map a requested bind address to something bindable.
@@ -302,6 +337,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
             recv_since_tick: true,
             session_user: None,
             agent_path: None,
+            agent_bind: None,
             permit_agent: false,
             next_id: 0,
             cmd_tx,
@@ -335,6 +371,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
     /// at `path` (`-A`). Without this, such opens are refused.
     pub fn agent_forward(mut self, path: Option<std::path::PathBuf>) -> Self {
         self.agent_path = path;
+        self
+    }
+
+    /// Client role: this hop's binding, replayed onto each relayed agent
+    /// connection so a forwarded agent learns the full path (multi-hop
+    /// destination constraints). Only meaningful alongside `agent_forward`.
+    pub fn agent_bind(mut self, bind: Option<AgentBind>) -> Self {
+        self.agent_bind = bind;
         self
     }
 
@@ -522,7 +566,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
                 r.finish()?;
                 match self.agent_path.clone() {
                     Some(path) => {
-                        self.spawn_connect_agent(sender, window, max, path);
+                        self.spawn_connect_agent(sender, window, max, path, self.agent_bind.clone());
                         Ok(())
                     }
                     None => {
@@ -568,10 +612,27 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         peer_window: u32,
         peer_max: u32,
         path: std::path::PathBuf,
+        bind: Option<AgentBind>,
     ) {
         let cmd_tx = self.cmd_tx.clone();
         tokio::spawn(async move {
-            let stream = tokio::net::UnixStream::connect(&path).await;
+            let stream = match tokio::net::UnixStream::connect(&path).await {
+                Ok(mut s) => {
+                    // Replay our own hop onto the connection before the
+                    // downstream talks, so the agent records the full path
+                    // (our host, then the downstream's). Best-effort: an
+                    // agent that rejects it just won't enforce path
+                    // constraints — endpoint constraints still hold via the
+                    // downstream's own bind.
+                    if let Some(b) = &bind {
+                        if let Err(e) = inject_bind(&mut s, b).await {
+                            tracing::info!("agent session-bind injection failed: {e}");
+                        }
+                    }
+                    Ok(s)
+                }
+                Err(e) => Err(e),
+            };
             let _ = cmd_tx.send(Cmd::Connected {
                 peer_id,
                 peer_window,
@@ -1480,6 +1541,121 @@ mod tests {
         assert_eq!(ids[0].comment, "forwarded");
         let sig = relayed.sign(&ids[0].blob, b"signed across the wire").await.unwrap();
         key.public().verify(b"signed across the wire", &sig).unwrap();
+
+        client.abort();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn agent_forwarding_injects_the_forwarders_hop() {
+        // The local agent holds a key pinned to the path local -> A -> B,
+        // where A is the host this client (the forwarder) reached and B is the
+        // host the downstream reaches. Signing succeeds only if the forwarder
+        // replays its own bind for A onto the relayed connection — without it
+        // the agent would see the chain [B] and refuse.
+        let keyring = std::sync::Arc::new(crate::agent::server::Keyring::new());
+        let (_dir, local_sock) = local_agent(keyring).await;
+
+        let user = PrivateKey::generate();
+        let host_a = PrivateKey::generate(); // the forwarder's hop
+        let host_b = PrivateKey::generate(); // the downstream's hop
+        let path = crate::agent::encode_path(&[
+            (String::new(), "a".into(), vec![host_a.public().to_blob()]),
+            (String::new(), "b".into(), vec![host_b.public().to_blob()]),
+        ]);
+        crate::agent::Client::connect(&local_sock)
+            .await
+            .unwrap()
+            .add_constrained(&user, None, "pinned", None, Some(&path))
+            .await
+            .unwrap();
+
+        // The forwarder carries A's binding, exactly as `shh -A` would.
+        let a_sid = [1u8; 32];
+        let bind = AgentBind {
+            host_blob: host_a.public().to_blob(),
+            session_id: a_sid.to_vec(),
+            sig: host_a.sign(&a_sid),
+        };
+
+        let (client_t, server_t) = transport_pair().await;
+        let server = tokio::spawn(async move {
+            Connection::new(server_t, Policy::DenyAll)
+                .permit_agent_forward(true)
+                .run(None)
+                .await
+        });
+        let client_conn = Connection::new(client_t, Policy::DenyAll)
+            .agent_forward(Some(local_sock))
+            .agent_bind(Some(bind));
+        let handle = client_conn.handle();
+        let client = tokio::spawn(async move { client_conn.run(None).await });
+
+        let (relay_path, _exit) = session_reporting_agent_sock(&handle, true).await;
+        assert!(!relay_path.is_empty());
+
+        // The downstream reaches B: it sends its own bind for B, then signs.
+        // With A injected ahead of it, the agent sees [A, B] and permits.
+        let mut downstream = crate::agent::Client::connect(&relay_path).await.unwrap();
+        let b_sid = [2u8; 32];
+        downstream
+            .session_bind(&host_b.public().to_blob(), &b_sid, &host_b.sign(&b_sid), false)
+            .await
+            .unwrap();
+        let blob = user.public().to_blob();
+        let sig = downstream.sign(&blob, b"through the path").await.unwrap();
+        user.public().verify(b"through the path", &sig).unwrap();
+
+        client.abort();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn without_injection_a_path_key_is_refused_through_the_relay() {
+        // Same setup, but the forwarder carries no binding (as if it never
+        // reached A). The agent then sees only [B] for a key pinned to
+        // local -> A -> B, and refuses — proving the injection is what makes
+        // the path usable, not some looser check.
+        let keyring = std::sync::Arc::new(crate::agent::server::Keyring::new());
+        let (_dir, local_sock) = local_agent(keyring).await;
+        let user = PrivateKey::generate();
+        let host_a = PrivateKey::generate();
+        let host_b = PrivateKey::generate();
+        let path = crate::agent::encode_path(&[
+            (String::new(), "a".into(), vec![host_a.public().to_blob()]),
+            (String::new(), "b".into(), vec![host_b.public().to_blob()]),
+        ]);
+        crate::agent::Client::connect(&local_sock)
+            .await
+            .unwrap()
+            .add_constrained(&user, None, "pinned", None, Some(&path))
+            .await
+            .unwrap();
+
+        let (client_t, server_t) = transport_pair().await;
+        let server = tokio::spawn(async move {
+            Connection::new(server_t, Policy::DenyAll)
+                .permit_agent_forward(true)
+                .run(None)
+                .await
+        });
+        // No `.agent_bind(...)`: the forwarder does not replay a hop.
+        let client_conn =
+            Connection::new(client_t, Policy::DenyAll).agent_forward(Some(local_sock));
+        let handle = client_conn.handle();
+        let client = tokio::spawn(async move { client_conn.run(None).await });
+
+        let (relay_path, _exit) = session_reporting_agent_sock(&handle, true).await;
+        let mut downstream = crate::agent::Client::connect(&relay_path).await.unwrap();
+        let b_sid = [3u8; 32];
+        downstream
+            .session_bind(&host_b.public().to_blob(), &b_sid, &host_b.sign(&b_sid), false)
+            .await
+            .unwrap();
+        assert!(
+            downstream.sign(&user.public().to_blob(), b"x").await.is_err(),
+            "path key must be refused when the forwarder's hop is missing"
+        );
 
         client.abort();
         server.abort();

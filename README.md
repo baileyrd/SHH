@@ -131,14 +131,20 @@ $ shh -i ~/.shh/id_sk you@host uptime                        # presents the cert
 
 ### File transfer (SFTP)
 
-`shhd` serves the **SFTP** subsystem (version 3, the one OpenSSH speaks), so
-the standard `sftp` client transfers files to and from it — `put`, `get`,
-`ls`, `mkdir`, `rename`, `rm`, and the rest:
+`shhd` serves the **SFTP** subsystem (version 3, the one OpenSSH speaks), and
+`shh-sftp` is our matching client — either interoperates with the other side's
+OpenSSH counterpart. Both do `put`, `get`, `ls`, `mkdir`, `rmdir`, `rm`,
+`rename`:
 
 ```console
+# our client, one command per invocation (composes in scripts)
+$ shh-sftp -i ~/.shh/id you@host put report.pdf
+$ shh-sftp -i ~/.shh/id you@host get logs/today.log
+$ shh-sftp -i ~/.shh/id you@host ls /var/log
+
+# or the standard OpenSSH sftp client against shhd
 $ sftp -P 2222 -i ~/.shh/id you@host
 sftp> put report.pdf
-sftp> get logs/today.log
 ```
 
 Like OpenSSH's `sftp-server`, `shhd` runs the file server as the logged-in
@@ -146,9 +152,8 @@ user (it re-execs itself in `--internal-sftp` mode through the same
 privilege-drop path a shell takes), so ordinary filesystem permissions are
 the boundary. The engine (`src/sftp/`) is a self-contained SFTP v3
 implementation — both a server and a client half — verified against OpenSSH
-in both directions (the real `sftp` client drives `shhd`; our client engine
-drives OpenSSH's `sftp-server`). A standalone `shh-sftp` client binary is not
-built yet.
+in both directions: the real `sftp` client drives `shhd`, and `shh-sftp`
+drives OpenSSH's `sftp-server` behind OpenSSH `sshd`.
 
 Real hardware tokens (`ssh -i id_ed25519_sk` against a physical key) need
 an external authenticator helper, which is not yet built.
@@ -336,9 +341,9 @@ with `ssh-keygen` and OpenSSH `sshd` in both directions). User certificates
 enforce the `force-command` and `source-address` critical options (and fail
 closed on any other). File transfer works: `shhd` serves the **SFTP v3**
 subsystem to the standard `sftp` client (running the file server as the
-logged-in user, like OpenSSH's `sftp-server`), and the bundled engine
-interoperates with OpenSSH's `sftp-server` in the other direction too. Not
-yet implemented: a standalone `shh-sftp` client binary, real-hardware FIDO2
+logged-in user, like OpenSSH's `sftp-server`), and `shh-sftp` is a matching
+client that also drives OpenSSH's `sftp-server`. Not
+yet implemented: real-hardware FIDO2
 on the client (needs an external
 authenticator helper) and the fuller privsep model that also sandboxes the
 pre-auth *parsing* in its own unprivileged process. Treat it as a working

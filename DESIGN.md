@@ -176,7 +176,9 @@ shh/                 one library crate
 ├── src/privsep.rs   host-key signer subprocess (privilege separation)
 ├── src/connect/     channels, session (exec/shell/subsystem), flow control
 ├── src/sftp/        SFTP v3 protocol: server engine + client engine
-├── src/bin/shh.rs   client
+├── src/client.rs    shared dial-and-auth flow for the client binaries
+├── src/bin/shh.rs   client (shell/exec/forwarding)
+├── src/bin/shh-sftp file-transfer client
 ├── src/bin/shhd.rs  server
 ├── tests/           integration + parser-robustness tests (`cargo test`)
 └── fuzz/            cargo-fuzz targets for the peer-controlled parsers
@@ -324,7 +326,7 @@ shh/                 one library crate
     closed. Verified against OpenSSH both ways: `ssh-keygen -L` prints our
     options, OpenSSH `sshd` runs a `force-command` from a cert we signed, and
     our `shhd` honors a `force-command` cert `ssh-keygen -s` signed.
-13. **SFTP (server, done).** The SSH File Transfer Protocol, version 3 (the
+13. **SFTP (done).** The SSH File Transfer Protocol, version 3 (the
     version OpenSSH speaks by default), rides a session channel: the client
     sends a `subsystem` request naming `sftp`, and the channel then carries
     length-prefixed SFTP packets. `shhd` serves it exactly as OpenSSH does —
@@ -339,7 +341,8 @@ shh/                 one library crate
     mkdir/rmdir/remove/rename, realpath, readlink/symlink. A certificate
     `force-command` denies the subsystem (fail-closed: "only this command"
     means only that command). Verified against OpenSSH both ways — the real
-    `sftp` client drives our `shhd` (put/get/ls/mkdir/rename/rm), and our
-    client engine drives OpenSSH's `sftp-server`. A standalone `shh-sftp`
-    client binary (the engine wants only a CLI wrapper around the auth flow)
-    is not built yet.
+    `sftp` client drives our `shhd` (put/get/ls/mkdir/rename/rm), and
+    `shh-sftp` (our client) drives OpenSSH's `sftp-server` behind OpenSSH
+    `sshd`. The dial-and-auth flow shared by `shh` and `shh-sftp` now lives in
+    `src/client.rs`, and a client opens any subsystem channel through
+    `connect::client_subsystem`.

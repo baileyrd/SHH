@@ -425,13 +425,14 @@ pub fn parse_authorized_user_keys(text: &str) -> Vec<crate::crypto::userkey::Use
 
 // -------------------------------------------------------- certificates --
 
-/// Parse a certificate line (`ssh-ed25519-cert-v01@openssh.com AAAA... id`)
-/// and return the raw certificate blob. The signature is *not* verified
-/// here — that happens where the cert is used.
+/// Parse a certificate line (`ssh-ed25519-cert-v01@openssh.com AAAA... id`,
+/// or the `sk-ssh-ed25519-cert-v01@openssh.com` security-key form) and return
+/// the raw certificate blob. The signature is *not* verified here — that
+/// happens where the cert is used.
 pub fn decode_cert(line: &str) -> Result<Vec<u8>> {
     let mut parts = line.split_whitespace();
     let algo = parts.next().ok_or_else(|| bad("empty certificate line"))?;
-    if algo != super::cert::CERT_ALGO {
+    if algo != super::cert::CERT_ALGO && algo != super::cert::SK_CERT_ALGO {
         return Err(bad(format!("not an Ed25519 certificate: {algo:?}")));
     }
     let b64 = parts.next().ok_or_else(|| bad("missing certificate blob"))?;

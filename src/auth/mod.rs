@@ -9,7 +9,7 @@
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::crypto::cert::{self, Certificate, CERT_ALGO, CERT_TYPE_USER};
+use crate::crypto::cert::{self, Certificate, CERT_ALGO, CERT_TYPE_USER, SK_CERT_ALGO};
 use crate::crypto::ed25519::{PrivateKey, PublicKey, ALGO};
 use crate::crypto::sk::{SoftwareKey, SK_ALGO};
 use crate::crypto::userkey::UserKey;
@@ -100,18 +100,25 @@ where
 
 /// Authenticate as `user` with a security key: present its
 /// `sk-ssh-ed25519@openssh.com` credential and sign the challenge as an
-/// assertion. User presence is assumed already confirmed by the caller (the
-/// CLI prompts before calling), so the assertion carries the presence flag.
+/// assertion. If `cert` (an `sk-ssh-ed25519-cert-v01` blob certifying this
+/// key) is given, present it first and fall back to the bare credential.
+/// User presence is assumed already confirmed by the caller (the CLI prompts
+/// before calling), so the assertion carries the presence flag.
 pub async fn client_sk<S>(
     t: &mut Transport<S>,
     user: &str,
     key: &SoftwareKey,
+    cert: Option<&[u8]>,
     on_banner: impl FnMut(&str),
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let creds = vec![(SK_ALGO.to_owned(), key.public().to_blob())];
+    let mut creds: Vec<(String, Vec<u8>)> = Vec::new();
+    if let Some(c) = cert {
+        creds.push((SK_CERT_ALGO.to_owned(), c.to_vec()));
+    }
+    creds.push((SK_ALGO.to_owned(), key.public().to_blob()));
     run_auth(t, user, creds, SignWith::SecurityKey(key), on_banner).await
 }
 
@@ -247,7 +254,7 @@ impl Policy {
             tracing::info!(key_id = %cert.key_id, %user, "certificate does not list this principal");
             return None;
         }
-        Some(UserKey::Ed25519(cert.key))
+        Some(cert.certified_user_key())
     }
 }
 
@@ -308,7 +315,7 @@ where
             UserKey::from_blob(&blob)
                 .ok()
                 .filter(|k| policy.key_authorized(k))
-        } else if algo == CERT_ALGO {
+        } else if algo == CERT_ALGO || algo == SK_CERT_ALGO {
             policy.authorize_cert(&blob, &user)
         } else {
             None
@@ -704,7 +711,76 @@ mod tests {
         let client_side = async move {
             let mut t =
                 Transport::client(a, ClientConfig::with_verifier(Box::new(|_| Ok(())))).await?;
-            client_sk(&mut t, "river", &key, |_| {}).await
+            client_sk(&mut t, "river", &key, None, |_| {}).await
+        };
+        let server_side = async move {
+            let mut t = Transport::server(b, ServerConfig::with_host_key(host_key)).await?;
+            server(&mut t, &policy).await
+        };
+        let (c, s) = tokio::join!(client_side, server_side);
+        c.unwrap();
+        assert_eq!(s.unwrap(), "river");
+    }
+
+    #[tokio::test]
+    async fn client_sk_certificate_authenticates_end_to_end() {
+        // A security key presenting a CA-signed sk certificate: the server
+        // trusts only the CA, and the certified sk credential must verify the
+        // assertion.
+        let ca = PrivateKey::generate();
+        let key = crate::crypto::sk::SoftwareKey::generate("ssh:");
+        let cert = cert::sign_sk_user_cert(
+            &ca,
+            &key.public(),
+            1,
+            "sk-id",
+            &["river".into()],
+            0,
+            u64::MAX,
+        );
+        let policy = Policy {
+            user: Some("river".into()),
+            keys: vec![], // only the CA is trusted; the cert must carry it
+            trusted_cas: vec![ca.public()],
+            banner: None,
+        };
+        let (a, b) = duplex(1 << 20);
+        let host_key = PrivateKey::generate();
+        let client_side = async move {
+            let mut t =
+                Transport::client(a, ClientConfig::with_verifier(Box::new(|_| Ok(())))).await?;
+            client_sk(&mut t, "river", &key, Some(&cert), |_| {}).await
+        };
+        let server_side = async move {
+            let mut t = Transport::server(b, ServerConfig::with_host_key(host_key)).await?;
+            server(&mut t, &policy).await
+        };
+        let (c, s) = tokio::join!(client_side, server_side);
+        c.unwrap();
+        assert_eq!(s.unwrap(), "river");
+    }
+
+    #[tokio::test]
+    async fn sk_certificate_from_untrusted_ca_falls_back_to_bare_key() {
+        // The server trusts the sk credential directly but not the cert's CA.
+        // The client offers the cert first, is refused, and lands on the bare
+        // credential.
+        let ca = PrivateKey::generate();
+        let key = crate::crypto::sk::SoftwareKey::generate("ssh:");
+        let cert =
+            cert::sign_sk_user_cert(&ca, &key.public(), 1, "id", &["river".into()], 0, u64::MAX);
+        let policy = Policy {
+            user: Some("river".into()),
+            keys: vec![UserKey::Sk(key.public())],
+            trusted_cas: vec![], // nobody trusts the CA
+            banner: None,
+        };
+        let (a, b) = duplex(1 << 20);
+        let host_key = PrivateKey::generate();
+        let client_side = async move {
+            let mut t =
+                Transport::client(a, ClientConfig::with_verifier(Box::new(|_| Ok(())))).await?;
+            client_sk(&mut t, "river", &key, Some(&cert), |_| {}).await
         };
         let server_side = async move {
             let mut t = Transport::server(b, ServerConfig::with_host_key(host_key)).await?;

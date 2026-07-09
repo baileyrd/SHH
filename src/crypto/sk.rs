@@ -71,6 +71,16 @@ impl SkPublicKey {
         w.into_bytes()
     }
 
+    /// The raw 32-byte Ed25519 public key (`enc_A`).
+    pub fn ed25519_bytes(&self) -> [u8; 32] {
+        self.key.to_bytes()
+    }
+
+    /// The application (relying-party) string this credential is scoped to.
+    pub fn application(&self) -> &str {
+        &self.application
+    }
+
     pub fn fingerprint(&self) -> String {
         use base64::prelude::{Engine as _, BASE64_STANDARD_NO_PAD};
         format!(

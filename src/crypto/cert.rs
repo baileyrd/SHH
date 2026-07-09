@@ -13,10 +13,15 @@ use ed25519_dalek::VerifyingKey;
 use rand_core::{OsRng, RngCore};
 
 use super::ed25519::{PrivateKey, PublicKey};
+use super::sk::SkPublicKey;
+use super::userkey::UserKey;
 use crate::wire::{Reader, Writer};
 use crate::{Error, Result};
 
 pub const CERT_ALGO: &str = "ssh-ed25519-cert-v01@openssh.com";
+/// The certificate form of a FIDO2 security key. Identical to `CERT_ALGO`
+/// except for the type string and an extra `application` field after the key.
+pub const SK_CERT_ALGO: &str = "sk-ssh-ed25519-cert-v01@openssh.com";
 pub const CERT_TYPE_USER: u32 = 1;
 pub const CERT_TYPE_HOST: u32 = 2;
 
@@ -36,8 +41,16 @@ const DEFAULT_EXTENSIONS: &[&str] = &[
 /// signature from *some* CA (whether that CA is trusted is a later check).
 #[derive(Clone)]
 pub struct Certificate {
-    /// The certified user key.
+    /// The certified key — for a security-key certificate, the Ed25519 point
+    /// it is built on; combine with [`sk_application`] via
+    /// [`certified_user_key`] to get the credential proper.
+    ///
+    /// [`sk_application`]: Self::sk_application
+    /// [`certified_user_key`]: Self::certified_user_key
     pub key: PublicKey,
+    /// `Some(application)` when this certifies a FIDO2 security key
+    /// (`sk-ssh-ed25519-cert-v01`); `None` for a plain Ed25519 certificate.
+    pub sk_application: Option<String>,
     pub serial: u64,
     pub cert_type: u32,
     pub key_id: String,
@@ -84,11 +97,20 @@ impl Certificate {
     /// checks (see the `check_*` / `permits_*` methods).
     pub fn parse_and_verify(blob: &[u8]) -> Result<Certificate> {
         let mut r = Reader::new(blob);
-        if r.utf8()? != CERT_ALGO {
-            return Err(Error::proto("not an ssh-ed25519 certificate"));
-        }
+        let is_sk = match r.utf8()? {
+            CERT_ALGO => false,
+            SK_CERT_ALGO => true,
+            _ => return Err(Error::proto("not an ssh-ed25519 certificate")),
+        };
         let _nonce = r.string()?;
         let key = read_ed25519_point(r.string()?)?;
+        // A security-key certificate carries the application right after the
+        // key; a plain one does not.
+        let sk_application = if is_sk {
+            Some(r.utf8()?.to_owned())
+        } else {
+            None
+        };
         let serial = r.u64()?;
         let cert_type = r.u32()?;
         let key_id = r.utf8()?.to_owned();
@@ -120,6 +142,7 @@ impl Certificate {
 
         Ok(Certificate {
             key,
+            sk_application,
             serial,
             cert_type,
             key_id,
@@ -133,6 +156,19 @@ impl Certificate {
 
     pub fn blob(&self) -> &[u8] {
         &self.blob
+    }
+
+    /// The certified key as a [`UserKey`]: a security key when this is an
+    /// `sk-ssh-ed25519-cert-v01`, otherwise a plain Ed25519 key. This is the
+    /// key a userauth signature must verify against.
+    pub fn certified_user_key(&self) -> UserKey {
+        match &self.sk_application {
+            Some(app) => UserKey::Sk(
+                SkPublicKey::new(self.key.0.to_bytes(), app)
+                    .expect("certified point already validated"),
+            ),
+            None => UserKey::Ed25519(self.key.clone()),
+        }
     }
 
     /// Is `now` (seconds since the Unix epoch) within the validity window?
@@ -166,7 +202,7 @@ pub fn sign_user_cert(
     valid_after: u64,
     valid_before: u64,
 ) -> Vec<u8> {
-    sign_cert(ca, user_key, CERT_TYPE_USER, serial, key_id, principals, valid_after, valid_before)
+    sign_cert(ca, user_key.0.as_bytes(), None, CERT_TYPE_USER, serial, key_id, principals, valid_after, valid_before)
 }
 
 /// Sign a host certificate for `host_key`. The principals are hostnames.
@@ -180,13 +216,38 @@ pub fn sign_host_cert(
     valid_after: u64,
     valid_before: u64,
 ) -> Vec<u8> {
-    sign_cert(ca, host_key, CERT_TYPE_HOST, serial, key_id, principals, valid_after, valid_before)
+    sign_cert(ca, host_key.0.as_bytes(), None, CERT_TYPE_HOST, serial, key_id, principals, valid_after, valid_before)
+}
+
+/// Sign a user certificate for a FIDO2 security key (`sk_key`).
+#[allow(clippy::too_many_arguments)]
+pub fn sign_sk_user_cert(
+    ca: &PrivateKey,
+    sk_key: &SkPublicKey,
+    serial: u64,
+    key_id: &str,
+    principals: &[String],
+    valid_after: u64,
+    valid_before: u64,
+) -> Vec<u8> {
+    sign_cert(
+        ca,
+        &sk_key.ed25519_bytes(),
+        Some(sk_key.application()),
+        CERT_TYPE_USER,
+        serial,
+        key_id,
+        principals,
+        valid_after,
+        valid_before,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
 fn sign_cert(
     ca: &PrivateKey,
-    key: &PublicKey,
+    key_point: &[u8],
+    sk_application: Option<&str>,
     cert_type: u32,
     serial: u64,
     key_id: &str,
@@ -195,11 +256,18 @@ fn sign_cert(
     valid_before: u64,
 ) -> Vec<u8> {
     let mut w = Writer::new();
-    w.utf8(CERT_ALGO);
+    w.utf8(if sk_application.is_some() {
+        SK_CERT_ALGO
+    } else {
+        CERT_ALGO
+    });
     let mut nonce = [0u8; 32];
     OsRng.fill_bytes(&mut nonce);
     w.string(&nonce);
-    w.string(key.0.as_bytes());
+    w.string(key_point);
+    if let Some(app) = sk_application {
+        w.utf8(app); // the sk application follows the key
+    }
     w.u64(serial);
     w.u32(cert_type);
     w.utf8(key_id);
@@ -286,5 +354,55 @@ mod tests {
         let mut w = Writer::new();
         w.utf8("ssh-rsa-cert-v01@openssh.com");
         assert!(Certificate::parse_and_verify(&w.into_bytes()).is_err());
+    }
+
+    // ------------------------------------------ security-key certificates ---
+
+    #[test]
+    fn sk_cert_roundtrip_carries_application() {
+        use crate::crypto::sk::SoftwareKey;
+        let ca = PrivateKey::generate();
+        let sk = SoftwareKey::generate("ssh:").public();
+        let blob = sign_sk_user_cert(&ca, &sk, 3, "sk@test", &["river".into()], 0, u64::MAX);
+
+        let cert = Certificate::parse_and_verify(&blob).unwrap();
+        // The extra application string is parsed and preserved…
+        assert_eq!(cert.sk_application.as_deref(), Some("ssh:"));
+        assert_eq!(cert.ca_key, ca.public());
+        assert_eq!(cert.cert_type, CERT_TYPE_USER);
+        assert!(cert.permits_principal("river"));
+        // …and the certified key is the security-key credential, not a bare
+        // Ed25519 point.
+        match cert.certified_user_key() {
+            UserKey::Sk(pk) => assert_eq!(pk, sk),
+            other => panic!("expected an sk credential, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sk_cert_verifies_a_touched_assertion() {
+        // An end-to-end check that the certified sk key verifies an assertion
+        // the way the auth path will: sign a message with the software key,
+        // then verify it against the key the certificate certifies.
+        use crate::crypto::sk::SoftwareKey;
+        let ca = PrivateKey::generate();
+        let dev = SoftwareKey::generate("ssh:");
+        let blob = sign_sk_user_cert(&ca, &dev.public(), 1, "id", &[], 0, u64::MAX);
+
+        let cert = Certificate::parse_and_verify(&blob).unwrap();
+        let key = cert.certified_user_key();
+        let sig = dev.sign(b"the challenge", true);
+        key.verify(b"the challenge", &sig).unwrap();
+        // A different key's assertion does not verify against this cert.
+        let other = SoftwareKey::generate("ssh:").sign(b"the challenge", true);
+        assert!(key.verify(b"the challenge", &other).is_err());
+    }
+
+    #[test]
+    fn plain_cert_has_no_application() {
+        let (_ca, _user, blob) = user_cert(&["x"], 0, u64::MAX);
+        let cert = Certificate::parse_and_verify(&blob).unwrap();
+        assert!(cert.sk_application.is_none());
+        assert!(matches!(cert.certified_user_key(), UserKey::Ed25519(_)));
     }
 }

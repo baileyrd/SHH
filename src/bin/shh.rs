@@ -16,11 +16,11 @@ use shh::crypto::sk::SoftwareKey;
 use shh::transport::{ClientConfig, Transport};
 use shh::{auth, connect, Error};
 
-/// How a key-file identity authenticates: a plain Ed25519 key (optionally
-/// with a certificate) or a security key.
+/// How a key-file identity authenticates: a plain Ed25519 key or a security
+/// key, either optionally accompanied by a certificate to present.
 enum FileAuth {
     Ed25519(PrivateKey, Option<Vec<u8>>),
-    SecurityKey(SoftwareKey),
+    SecurityKey(SoftwareKey, Option<Vec<u8>>),
 }
 
 #[derive(Parser)]
@@ -346,10 +346,8 @@ async fn run(args: Args) -> Result<i32, String> {
                     FileAuth::Ed25519(key, cert)
                 }
                 keyfile::PrivateIdentity::SecurityKey(sk) => {
-                    if args.certificate.is_some() {
-                        return Err("certificates with security keys are not supported".into());
-                    }
-                    FileAuth::SecurityKey(sk)
+                    let cert = load_certificate(args.certificate.as_ref(), &identity)?;
+                    FileAuth::SecurityKey(sk, cert)
                 }
             })
         }
@@ -405,9 +403,9 @@ async fn run(args: Args) -> Result<i32, String> {
         (None, Some(FileAuth::Ed25519(key, cert))) => {
             auth::client(&mut t, &user, key, cert.as_deref(), |banner| eprint!("{banner}")).await
         }
-        (None, Some(FileAuth::SecurityKey(sk))) => {
+        (None, Some(FileAuth::SecurityKey(sk, cert))) => {
             confirm_presence();
-            auth::client_sk(&mut t, &user, sk, |banner| eprint!("{banner}")).await
+            auth::client_sk(&mut t, &user, sk, cert.as_deref(), |banner| eprint!("{banner}")).await
         }
         (None, None) => unreachable!("one auth source is always chosen"),
     }

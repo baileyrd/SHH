@@ -82,6 +82,12 @@ struct Args {
     #[arg(long)]
     no_agent: bool,
 
+    /// Forward the agent: processes on the server can reach the local
+    /// SSH_AUTH_SOCK agent through this connection. Use only on servers
+    /// you trust — root there can use (not read) your keys while connected.
+    #[arg(short = 'A', long)]
+    forward_agent: bool,
+
     /// Seconds of silence before sending a keepalive probe (0 disables).
     #[arg(long, default_value_t = 30)]
     keepalive_interval: u64,
@@ -352,12 +358,28 @@ async fn run(args: Args) -> Result<i32, String> {
     }
     .map_err(|e| e.to_string())?;
 
+    // -A: forward whatever agent SSH_AUTH_SOCK names. Auth may have used
+    // key files; forwarding is an independent choice.
+    let agent_sock = if args.forward_agent {
+        match std::env::var_os("SSH_AUTH_SOCK") {
+            Some(p) => Some(std::path::PathBuf::from(p)),
+            None => {
+                eprintln!("shh: -A ignored: SSH_AUTH_SOCK is not set");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // One multiplexed connection carries the session (unless -N) and every
     // -L forward, concurrently.
-    let conn = connect::mux::Connection::new(t, connect::forward::Policy::DenyAll).keepalive(
-        std::time::Duration::from_secs(args.keepalive_interval),
-        args.keepalive_count,
-    );
+    let conn = connect::mux::Connection::new(t, connect::forward::Policy::DenyAll)
+        .keepalive(
+            std::time::Duration::from_secs(args.keepalive_interval),
+            args.keepalive_count,
+        )
+        .agent_forward(agent_sock.clone());
     let handle = conn.handle();
     for spec in &forwards {
         let listener = tokio::net::TcpListener::bind(&spec.bind)
@@ -455,6 +477,7 @@ async fn run(args: Args) -> Result<i32, String> {
         stdout: Box::new(tokio::io::stdout()),
         stderr: Box::new(tokio::io::stderr()),
         exit: exit_tx,
+        forward_agent: agent_sock.is_some(),
         end_connection_on_close: true,
     });
     conn.run(None).await.map_err(|e| e.to_string())?;

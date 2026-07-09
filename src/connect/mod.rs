@@ -182,6 +182,7 @@ where
         stdout: Box::new(stdout),
         stderr: Box::new(stderr),
         exit: tx,
+        forward_agent: false,
         end_connection_on_close: true,
     });
     conn.run(None).await?;

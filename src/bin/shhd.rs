@@ -65,6 +65,12 @@ struct Args {
     #[arg(long = "permit-listen", value_name = "bind:port")]
     permit_listen: Vec<String>,
 
+    /// Permit agent forwarding (`ssh -A` / `shh -A`): sessions get an
+    /// SSH_AUTH_SOCK reaching back to the client's agent. Default:
+    /// refused, like the other forwarding kinds.
+    #[arg(long)]
+    permit_agent_forwarding: bool,
+
     /// Seconds of silence before probing a client with a keepalive (0 off).
     #[arg(long, default_value_t = 30)]
     keepalive_interval: u64,
@@ -200,6 +206,11 @@ async fn main() -> std::io::Result<()> {
     } else {
         tracing::info!("remote (-R) forwarding permitted for: {}", args.permit_listen.join(", "));
     }
+    if args.permit_agent_forwarding {
+        tracing::info!("agent forwarding permitted");
+    } else {
+        tracing::info!("agent forwarding disabled (no --permit-agent-forwarding)");
+    }
 
     let is_root = nix::unistd::geteuid().is_root();
     if args.no_privilege_drop {
@@ -224,6 +235,7 @@ async fn main() -> std::io::Result<()> {
         };
         let permit_open = args.permit_open.clone();
         let permit_listen = args.permit_listen.clone();
+        let permit_agent = args.permit_agent_forwarding;
         let ka_interval = args.keepalive_interval;
         let ka_count = args.keepalive_count;
         let no_privilege_drop = args.no_privilege_drop;
@@ -278,7 +290,8 @@ async fn main() -> std::io::Result<()> {
             let conn = connect::mux::Connection::new(t, fwd)
                 .listen_policy(listen)
                 .keepalive(std::time::Duration::from_secs(ka_interval), ka_count)
-                .session_user(session_user);
+                .session_user(session_user)
+                .permit_agent_forward(permit_agent);
             match conn.run(None).await {
                 Ok(()) => tracing::info!(%addr, %user, "connection ended"),
                 Err(e) => tracing::info!(%addr, %user, "connection error: {e}"),

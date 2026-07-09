@@ -1,0 +1,55 @@
+[package]
+name = "shh-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# A separate, nested workspace so `cargo build` in the parent crate never
+# pulls in `libfuzzer-sys` (which needs a nightly toolchain + libFuzzer).
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.shh]
+path = ".."
+
+# libFuzzer needs coverage/ASAN instrumentation, so these binaries are only
+# ever built by `cargo fuzz`, never by `cargo test`/`cargo build`.
+[[bin]]
+name = "wire_reader"
+path = "fuzz_targets/wire_reader.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "kexinit_parse"
+path = "fuzz_targets/kexinit_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cert_parse"
+path = "fuzz_targets/cert_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "keyfile_decode"
+path = "fuzz_targets/keyfile_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ed25519_blob"
+path = "fuzz_targets/ed25519_blob.rs"
+test = false
+doc = false
+bench = false

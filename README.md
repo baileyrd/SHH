@@ -20,7 +20,9 @@ deviation and its rationale):
 - **No compression, no SSH1, no rekey avoidance** (automatic rekey at
   1 GiB / 1 hour), `ext-info` (RFC 8308) supported.
 - Memory-safe implementation, secrets zeroized on drop, constant-time
-  comparisons, panic-free wire parsing, cancel-safe async I/O.
+  comparisons, panic-free wire parsing, cancel-safe async I/O — the last two
+  backed by `cargo-fuzz` targets (`fuzz/`), an always-on parser-robustness
+  test, and a transport test that fragments the stream to one byte per read.
 
 ## Quick start
 

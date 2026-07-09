@@ -113,7 +113,16 @@ we enforce it.
   `aes-gcm`, `sha2`) and dalek (`x25519-dalek`, `ed25519-dalek`) crates.
 - **Testing.** Unit tests per layer, end-to-end `shh`↔`shhd` tests over
   localhost, and interop tests against OpenSSH where available. Wire parsers
-  are written to be fuzzable (no panics on arbitrary input).
+  are written to be fuzzable (no panics on arbitrary input): every
+  peer-controlled parser has a `cargo-fuzz` target under `fuzz/` (KEXINIT,
+  certificates, key files, Ed25519 blobs, the wire cursor), and the same
+  panic-free promise is checked on stable in ordinary `cargo test` by
+  `tests/parser_robustness.rs`, which hammers each parser with random and
+  near-valid (mutated) input. The transport reader is exercised under
+  pathological byte fragmentation — a `Dribble` adapter that hands over one
+  byte per poll, plus a metered-input test that freezes `recv_raw`
+  mid-packet and drops it to prove the incremental reader is cancel-safe and
+  never desyncs.
 
 ## Crate layout
 
@@ -126,7 +135,9 @@ shh/                 one library crate
 ├── src/auth/        userauth (publickey)
 ├── src/connect/     channels, session (exec/shell), flow control
 ├── src/bin/shh.rs   client
-└── src/bin/shhd.rs  server
+├── src/bin/shhd.rs  server
+├── tests/           integration + parser-robustness tests (`cargo test`)
+└── fuzz/            cargo-fuzz targets for the peer-controlled parsers
 ```
 
 ## Milestones

@@ -84,11 +84,30 @@ struct Args {
     /// setups where login names are not system accounts.
     #[arg(long)]
     no_privilege_drop: bool,
+
+    /// Privilege separation: hold the host private key in a separate,
+    /// minimal signer process, so the daemon that parses untrusted
+    /// network input never has the key in its address space.
+    #[arg(long)]
+    privsep: bool,
+
+    /// Account the privsep signer drops to when `shhd` runs as root
+    /// (default: `nobody`). Ignored when not root.
+    #[arg(long, default_value = "nobody")]
+    privsep_user: String,
 }
 
 fn default_path(name: &str) -> PathBuf {
     let home = std::env::var_os("HOME").unwrap_or_else(|| ".".into());
     PathBuf::from(home).join(".shh").join(name)
+}
+
+/// Where host-key signatures come from: the private key held in this process,
+/// or a separate privilege-separation signer that holds it for us.
+#[derive(Clone)]
+enum HostAuth {
+    Local(PrivateKey),
+    Monitor(shh::privsep::MonitorSigner),
 }
 
 fn load_or_create_host_key(path: &PathBuf) -> std::io::Result<PrivateKey> {
@@ -116,8 +135,7 @@ fn load_or_create_host_key(path: &PathBuf) -> std::io::Result<PrivateKey> {
     Ok(key)
 }
 
-#[tokio::main]
-async fn main() -> std::io::Result<()> {
+fn main() -> std::io::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -171,7 +189,7 @@ async fn main() -> std::io::Result<()> {
         );
     }
 
-    let user = match args.user {
+    let user = match args.user.clone() {
         Some(u) if u == "*" => None,
         Some(u) if u.is_empty() => {
             eprintln!("shhd: --user must not be empty (use '*' to accept any name)");
@@ -219,13 +237,40 @@ async fn main() -> std::io::Result<()> {
         tracing::warn!("not running as root — sessions run as the shhd account (cannot drop)");
     }
 
+    // Privilege separation: fork the host-key signer *now*, while the process
+    // is still single-threaded, before the async runtime spawns any workers.
+    // After this the daemon no longer holds the host private key.
+    let host_auth = if args.privsep {
+        let signer = shh::privsep::spawn_signer(host_key, Some(&args.privsep_user))?;
+        tracing::info!("privilege separation on: host key held by a separate signer process");
+        HostAuth::Monitor(signer)
+    } else {
+        HostAuth::Local(host_key)
+    };
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(serve(args, host_auth, host_cert, keys, trusted_cas, user, is_root))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn serve(
+    args: Args,
+    host_auth: HostAuth,
+    host_cert: Option<Vec<u8>>,
+    keys: Vec<shh::crypto::ed25519::PublicKey>,
+    trusted_cas: Vec<shh::crypto::ed25519::PublicKey>,
+    user: Option<String>,
+    is_root: bool,
+) -> std::io::Result<()> {
     let listener = TcpListener::bind(&args.listen).await?;
     tracing::info!("listening on {}", args.listen);
 
     loop {
         let (socket, addr) = listener.accept().await?;
         socket.set_nodelay(true).ok();
-        let host_key = host_key.clone();
+        let host_auth = host_auth.clone();
         let host_cert = host_cert.clone();
         let policy = auth::Policy {
             user: user.clone(),
@@ -240,11 +285,15 @@ async fn main() -> std::io::Result<()> {
         let ka_count = args.keepalive_count;
         let no_privilege_drop = args.no_privilege_drop;
         tokio::spawn(async move {
-            let config = ServerConfig {
-                host_key,
-                host_cert,
+            let handshake = match host_auth {
+                HostAuth::Local(key) => {
+                    Transport::server(socket, ServerConfig { host_key: key, host_cert }).await
+                }
+                HostAuth::Monitor(signer) => {
+                    Transport::server_with_signer(socket, Box::new(signer), host_cert).await
+                }
             };
-            let mut t = match Transport::server(socket, config).await {
+            let mut t = match handshake {
                 Ok(t) => t,
                 Err(e) => {
                     tracing::info!(%addr, "handshake failed: {e}");

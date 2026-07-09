@@ -207,6 +207,25 @@ Interoperates with OpenSSH both ways for `-L` and `-R` (`ssh -L/-R … host`
 through `shhd`, `shh -L/-R … host` through `sshd`), sessions and forwards
 multiplexed on one connection.
 
+### Privilege separation
+
+The daemon parses a lot of attacker-controlled data before anyone has
+authenticated. `shhd --privsep` keeps the host private key out of that
+blast radius: at startup it forks a minimal **signer** subprocess that
+holds the key and answers only "sign this exchange hash", then drops its
+own copy. Every key exchange (initial and each rekey) is signed through
+the signer, so a memory-disclosure or code-execution bug in the daemon's
+pre-auth parsing can't walk away with the host key.
+
+```console
+$ shhd -L 0.0.0.0:2222 --privsep            # signer runs as `nobody` under root
+```
+
+When `shhd` runs as root the signer drops to `--privsep-user` (default
+`nobody`), sets `no_new_privs`, and clamps its resource limits to a bare
+read/sign/write loop. (This isolates the *secret*; running the untrusted
+pre-auth *parsing* in a separate sandboxed process is the next step.)
+
 ## Interoperability
 
 Verified against OpenSSH 9.6 in both directions (`ssh → shhd` and
@@ -236,7 +255,9 @@ and `ssh` both ways), agent forwarding (`-A`, server default-deny via
 `--permit-agent-forwarding`) relays it across hops, and agent keys can be
 pinned to specific hosts, whole paths, or a certificate authority
 (`shh-agent add -H gw>prod`, enforced via `session-bind@openssh.com` /
-`restrict-destination-v00`). Not yet implemented: FIDO2 `sk-ssh-ed25519`
-keys and a sandboxed pre-auth process (privilege *separation*, distinct
-from the privilege *drop* above). Treat it as a working protocol
-implementation, not a hardened production daemon.
+`restrict-destination-v00`). Privilege separation (`shhd --privsep`) holds
+the host key in a separate signer subprocess, out of the pre-auth parser's
+reach. Not yet implemented: FIDO2 `sk-ssh-ed25519` keys and the fuller
+privsep model that also sandboxes the pre-auth *parsing* in its own
+unprivileged process. Treat it as a working protocol implementation, not a
+hardened production daemon.

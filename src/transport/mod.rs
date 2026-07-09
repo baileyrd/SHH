@@ -70,6 +70,30 @@ impl ClientConfig {
     }
 }
 
+/// Produces host-key signatures over the key-exchange hash. Abstracting this
+/// lets the private key live somewhere other than the process running the
+/// handshake — e.g. a privilege-separation monitor that holds the host key
+/// while an unprivileged child parses the untrusted wire input.
+pub trait HostSigner: Send {
+    /// The host public-key blob to present when no certificate is in play.
+    fn public_blob(&self) -> Vec<u8>;
+    /// Sign the exchange hash with the host private key, returning the SSH
+    /// signature blob. Called once per key exchange (initial and each rekey).
+    fn sign(&self, exchange_hash: &[u8]) -> Vec<u8>;
+}
+
+/// The ordinary case: the host private key is right here.
+pub struct LocalSigner(pub PrivateKey);
+
+impl HostSigner for LocalSigner {
+    fn public_blob(&self) -> Vec<u8> {
+        self.0.public().to_blob()
+    }
+    fn sign(&self, exchange_hash: &[u8]) -> Vec<u8> {
+        self.0.sign(exchange_hash)
+    }
+}
+
 pub struct ServerConfig {
     pub host_key: PrivateKey,
     /// An optional host certificate (`ssh-ed25519-cert-v01`) certifying
@@ -121,8 +145,8 @@ pub struct Transport<S> {
     pub(crate) queued: VecDeque<Vec<u8>>,
 
     // Host-key material.
-    host_key: Option<PrivateKey>,      // when we are the server
-    host_cert: Option<Vec<u8>>,        // optional server host certificate
+    host_signer: Option<Box<dyn HostSigner>>, // when we are the server
+    host_cert: Option<Vec<u8>>,               // optional server host certificate
     verifier: Option<HostKeyVerifier>, // TOFU decision, when we are the client
     host_cas: Vec<PublicKey>,          // trusted host-cert CAs (client)
     hostname: String,                  // for host-cert principal check (client)
@@ -151,8 +175,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Transport<S> {
     }
 
     pub async fn server(io: S, config: ServerConfig) -> Result<Self> {
-        let mut t = Self::new(io, Side::Server, Some(config.host_key), None);
-        t.host_cert = config.host_cert;
+        Self::server_with_signer(io, Box::new(LocalSigner(config.host_key)), config.host_cert).await
+    }
+
+    /// Like [`server`](Self::server), but the host key signs through an
+    /// arbitrary [`HostSigner`] — used by privilege separation to keep the
+    /// private key out of the handshake process.
+    pub async fn server_with_signer(
+        io: S,
+        signer: Box<dyn HostSigner>,
+        host_cert: Option<Vec<u8>>,
+    ) -> Result<Self> {
+        let mut t = Self::new(io, Side::Server, Some(signer), None);
+        t.host_cert = host_cert;
         t.host_key_algos = host_key_algos(t.host_cert.is_some());
         t.exchange_idents().await?;
         t.initial_kex().await?;
@@ -162,7 +197,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Transport<S> {
     fn new(
         io: S,
         side: Side,
-        host_key: Option<PrivateKey>,
+        host_signer: Option<Box<dyn HostSigner>>,
         verifier: Option<HostKeyVerifier>,
     ) -> Self {
         Transport {
@@ -181,7 +216,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Transport<S> {
             rekey_interval: REKEY_INTERVAL,
             session_id: Vec::new(),
             queued: VecDeque::new(),
-            host_key,
+            host_signer,
             host_cert: None,
             verifier,
             host_cas: Vec::new(),
@@ -584,7 +619,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Transport<S> {
                 r.finish()?;
 
                 let (q_s, k) = kex::server_exchange(neg.kex, &q_c)?;
-                let host_key = self.host_key.as_ref().expect("server always has a host key");
+                let signer = self.host_signer.as_ref().expect("server always has a signer");
                 // Present the certificate as the host key when it was
                 // negotiated; we still sign with the (certified) private key.
                 let k_s = if neg.host_key_algo == CERT_ALGO {
@@ -592,10 +627,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Transport<S> {
                         .clone()
                         .expect("cert host-key algo implies we have a host cert")
                 } else {
-                    host_key.public().to_blob()
+                    signer.public_blob()
                 };
                 let h = exchange_hash(&v_c, &v_s, i_c, i_s, &k_s, &q_c, &q_s, &k);
-                let sig = host_key.sign(&h);
+                let sig = signer.sign(&h);
 
                 let mut w = Writer::new();
                 w.byte(msg::KEX_ECDH_REPLY);

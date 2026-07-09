@@ -17,6 +17,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use crate::wire::{Reader, Writer};
 
 pub mod client;
+// The server operates on the real filesystem with positioned I/O and unix
+// permission/ownership metadata; the client half is portable.
+#[cfg(unix)]
 pub mod server;
 
 /// The protocol version we implement and advertise.
@@ -251,6 +254,7 @@ mod tests {
 
     /// Drive our client against our server over an in-memory duplex — no SSH,
     /// no subprocess — exercising the whole operation set on a temp directory.
+    #[cfg(unix)] // the server half is unix-only
     #[tokio::test]
     async fn client_and_server_round_trip_operations() {
         use crate::sftp::client::Client;

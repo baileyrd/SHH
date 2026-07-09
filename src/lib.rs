@@ -7,16 +7,13 @@
 
 pub mod agent;
 pub mod auth;
-#[cfg(unix)]
 pub mod client;
 pub mod connect;
 pub mod crypto;
 #[cfg(unix)]
 pub mod privsep;
-#[cfg(unix)]
 pub mod sftp;
 pub mod transport;
-#[cfg(unix)]
 pub mod tty;
 pub mod wire;
 

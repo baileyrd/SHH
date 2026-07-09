@@ -293,6 +293,7 @@ async fn tick(interval: Option<&mut tokio::time::Interval>) {
 /// Write one `session-bind@openssh.com` request for `bind` onto a freshly
 /// connected agent socket and read its reply, before any downstream traffic
 /// flows. `is_forwarding` is true: this connection is a forwarded one.
+#[cfg(unix)] // only the (unix) agent-splice path injects bindings
 async fn inject_bind<S>(io: &mut S, bind: &AgentBind) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -517,6 +518,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         let max = r.u32()?;
 
         match kind.as_str() {
+            // Serving sessions means child processes and ptys — Unix
+            // machinery. A Windows build acts only as a client, so an
+            // incoming session open is refused there.
+            #[cfg(unix)]
             "session" => {
                 let id = self.alloc_id();
                 let mut w = chan(msg::CHANNEL_OPEN_CONFIRMATION, sender);
@@ -526,6 +531,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
                 self.t.send(&w.into_bytes()).await?;
                 self.spawn_session_server(id, sender, window, max);
                 Ok(())
+            }
+            #[cfg(not(unix))]
+            "session" => {
+                self.reject_open(
+                    sender,
+                    open_failure::UNKNOWN_CHANNEL_TYPE,
+                    "sessions are not served on this platform",
+                )
+                .await
             }
             // Server side of `-L`: connect out to the requested target.
             "direct-tcpip" => {
@@ -572,24 +586,23 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
                 }
             }
             // Client side of `-A`: the server relays a connection from a
-            // remote process back to our local agent.
+            // remote process back to our local agent. Agent sockets are Unix
+            // sockets; a Windows client never offers -A, so any such open is
+            // unsolicited and refused.
             AGENT_CHANNEL => {
                 r.finish()?;
-                match self.agent_path.clone() {
-                    Some(path) => {
-                        self.spawn_connect_agent(sender, window, max, path, self.agent_bind.clone());
-                        Ok(())
-                    }
-                    None => {
-                        tracing::info!("agent channel refused (forwarding not requested)");
-                        self.reject_open(
-                            sender,
-                            open_failure::ADMINISTRATIVELY_PROHIBITED,
-                            "agent forwarding was not requested",
-                        )
-                        .await
-                    }
+                #[cfg(unix)]
+                if let Some(path) = self.agent_path.clone() {
+                    self.spawn_connect_agent(sender, window, max, path, self.agent_bind.clone());
+                    return Ok(());
                 }
+                tracing::info!("agent channel refused (forwarding not requested)");
+                self.reject_open(
+                    sender,
+                    open_failure::ADMINISTRATIVELY_PROHIBITED,
+                    "agent forwarding was not requested",
+                )
+                .await
             }
             _ => {
                 self.reject_open(sender, open_failure::UNKNOWN_CHANNEL_TYPE, "unsupported channel type")
@@ -617,6 +630,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
     }
 
     /// Connect to the local agent socket for an accepted agent channel.
+    #[cfg(unix)]
     fn spawn_connect_agent(
         &self,
         peer_id: u32,
@@ -1114,6 +1128,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         ));
     }
 
+    #[cfg(unix)]
     fn spawn_session_server(&mut self, id: u32, peer_id: u32, peer_window: u32, peer_max: u32) {
         let (credit, _, rx) = self.insert_chan(id, peer_id, peer_window, true, false);
         let remote_max = peer_max.clamp(1, MAX_CHUNK);

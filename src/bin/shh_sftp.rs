@@ -79,6 +79,21 @@ fn basename(path: &str) -> &str {
     path.rsplit('/').next().filter(|s| !s.is_empty()).unwrap_or(path)
 }
 
+/// The Unix mode bits to record for an uploaded file: the local file's own on
+/// Unix, a sensible default elsewhere (Windows has no Unix permission bits).
+#[cfg(unix)]
+async fn local_file_mode(file: &tokio::fs::File) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    file.metadata()
+        .await
+        .map(|m| m.permissions().mode())
+        .unwrap_or(0o644)
+}
+#[cfg(not(unix))]
+async fn local_file_mode(_file: &tokio::fs::File) -> u32 {
+    0o644
+}
+
 async fn run_cmd<R, W>(client: &mut Client<R, W>, cmd: &Cmd) -> Result<(), String>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -110,15 +125,7 @@ where
             let mut file = tokio::fs::File::open(local)
                 .await
                 .map_err(|err| format!("{local}: {err}"))?;
-            let mode = file
-                .metadata()
-                .await
-                .ok()
-                .map(|m| {
-                    use std::os::unix::fs::PermissionsExt;
-                    m.permissions().mode()
-                })
-                .unwrap_or(0o644);
+            let mode = local_file_mode(&file).await;
             client.upload(&mut file, &remote, mode).await.map_err(e)?;
             eprintln!("shh-sftp: sent {local} -> {remote}");
         }

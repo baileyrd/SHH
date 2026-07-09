@@ -5,19 +5,34 @@
 //! or valid certificates.
 //! When run as root it drops each session to the authenticated user's
 //! account (uid/gid/groups, home, login shell); an unknown user is refused
-//! rather than run with root privileges. The pre-auth code is not yet
-//! sandboxed in a separate process, so still prefer a container or a
-//! dedicated account when exposing it broadly.
+//! rather than run with root privileges. `--privsep` holds the host key in a
+//! separate signer process, and `--sandbox` additionally drops the whole
+//! parsing daemon to an unprivileged account (running every session as that
+//! account) so no untrusted parsing runs with privilege. A per-connection
+//! sandboxed parser with per-user session handoff (OpenSSH's full monitor)
+//! is not built yet, so still prefer a container when exposing broadly.
 
+// shhd is a Unix daemon: the session model needs fork/setuid, ptys, and (for
+// privsep) a single-threaded fork at startup. On non-Unix it builds as an
+// honest stub (see the bottom of the file) rather than a broken binary.
+#![cfg_attr(not(unix), allow(unused))]
+
+#[cfg(unix)]
 use std::path::PathBuf;
 
+#[cfg(unix)]
 use clap::Parser;
+#[cfg(unix)]
 use tokio::net::TcpListener;
 
+#[cfg(unix)]
 use shh::crypto::{ed25519::PrivateKey, keyfile};
+#[cfg(unix)]
 use shh::transport::{ServerConfig, Transport};
+#[cfg(unix)]
 use shh::{auth, connect};
 
+#[cfg(unix)]
 #[derive(Parser)]
 #[command(name = "shhd", about = "SHH server: modern SSH, nothing legacy")]
 struct Args {
@@ -96,8 +111,17 @@ struct Args {
     /// (default: `nobody`). Ignored when not root.
     #[arg(long, default_value = "nobody")]
     privsep_user: String,
+
+    /// Run the whole daemon unprivileged: after the privileged setup (port
+    /// bind, host-key read, signer fork) drop to `--privsep-user` for the
+    /// daemon's entire life, so all untrusted parsing runs without privilege
+    /// or the host key. Implies `--privsep`. Sessions then run as that one
+    /// account (no per-user privilege drop).
+    #[arg(long)]
+    sandbox: bool,
 }
 
+#[cfg(unix)]
 fn default_path(name: &str) -> PathBuf {
     let home = std::env::var_os("HOME").unwrap_or_else(|| ".".into());
     PathBuf::from(home).join(".shh").join(name)
@@ -105,12 +129,14 @@ fn default_path(name: &str) -> PathBuf {
 
 /// Where host-key signatures come from: the private key held in this process,
 /// or a separate privilege-separation signer that holds it for us.
+#[cfg(unix)]
 #[derive(Clone)]
 enum HostAuth {
     Local(PrivateKey),
     Monitor(shh::privsep::MonitorSigner),
 }
 
+#[cfg(unix)]
 fn load_or_create_host_key(path: &PathBuf) -> std::io::Result<PrivateKey> {
     if path.exists() {
         let text = std::fs::read_to_string(path)?;
@@ -139,6 +165,7 @@ fn load_or_create_host_key(path: &PathBuf) -> std::io::Result<PrivateKey> {
 /// Serve one SFTP client on stdin/stdout and exit. The daemon re-execs this
 /// binary in `--internal-sftp` mode as the `sftp` subsystem child, already
 /// dropped to the session user — the same model as OpenSSH's `sftp-server`.
+#[cfg(unix)]
 fn run_internal_sftp() -> std::io::Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -148,6 +175,17 @@ fn run_internal_sftp() -> std::io::Result<()> {
     })
 }
 
+/// Honest stub on non-Unix: the server has no Windows session model.
+#[cfg(not(unix))]
+fn main() {
+    eprintln!(
+        "shhd (the SHH server) runs only on Unix — its session model needs \
+         fork/setuid and pseudo-terminals. Use shh / shh-sftp on this platform."
+    );
+    std::process::exit(1);
+}
+
+#[cfg(unix)]
 fn main() -> std::io::Result<()> {
     // Subsystem mode is dispatched before the normal CLI so `--internal-sftp`
     // (an internal re-exec flag, not a user-facing option) never reaches clap.
@@ -249,17 +287,26 @@ fn main() -> std::io::Result<()> {
         tracing::info!("agent forwarding disabled (no --permit-agent-forwarding)");
     }
 
-    let is_root = nix::unistd::geteuid().is_root();
+    let started_root = nix::unistd::geteuid().is_root();
+    // --sandbox implies --privsep (the key must be out of the parser before
+    // the parser goes unprivileged, or it would still be readable there).
+    let privsep = args.privsep || args.sandbox;
     if args.no_privilege_drop {
         tracing::warn!("privilege drop disabled — sessions run as the shhd account");
-    } else if !is_root {
+    } else if !started_root && !args.sandbox {
         tracing::warn!("not running as root — sessions run as the shhd account (cannot drop)");
     }
+
+    // Bind the listen socket *before* dropping privileges, so a privileged
+    // port (< 1024) still works under --sandbox. Blocking bind is fine here —
+    // we hand the socket to the runtime below.
+    let listener = std::net::TcpListener::bind(&args.listen)?;
+    listener.set_nonblocking(true)?;
 
     // Privilege separation: fork the host-key signer *now*, while the process
     // is still single-threaded, before the async runtime spawns any workers.
     // After this the daemon no longer holds the host private key.
-    let host_auth = if args.privsep {
+    let host_auth = if privsep {
         let signer = shh::privsep::spawn_signer(host_key, Some(&args.privsep_user))?;
         tracing::info!("privilege separation on: host key held by a separate signer process");
         HostAuth::Monitor(signer)
@@ -267,15 +314,32 @@ fn main() -> std::io::Result<()> {
         HostAuth::Local(host_key)
     };
 
+    // --sandbox: drop the daemon itself to the unprivileged account, now that
+    // the port is bound, the key is read, and the signer is forked. From here
+    // on all untrusted parsing runs without privilege or the host key.
+    if args.sandbox {
+        shh::privsep::drop_daemon_privileges(&args.privsep_user)?;
+        tracing::info!(
+            "sandbox on: daemon dropped to {:?}; sessions run as that account",
+            args.privsep_user
+        );
+    }
+    // After a sandbox drop we are no longer root; per-user session drop is off.
+    let is_root = nix::unistd::geteuid().is_root();
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    rt.block_on(serve(args, host_auth, host_cert, keys, trusted_cas, user, is_root))
+    rt.block_on(serve(
+        args, listener, host_auth, host_cert, keys, trusted_cas, user, is_root,
+    ))
 }
 
+#[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
 async fn serve(
     args: Args,
+    listener: std::net::TcpListener,
     host_auth: HostAuth,
     host_cert: Option<Vec<u8>>,
     keys: Vec<shh::crypto::userkey::UserKey>,
@@ -283,7 +347,9 @@ async fn serve(
     user: Option<String>,
     is_root: bool,
 ) -> std::io::Result<()> {
-    let listener = TcpListener::bind(&args.listen).await?;
+    // The listener was bound (as root, for privileged ports) before any
+    // privilege drop; adopt it into the runtime here.
+    let listener = TcpListener::from_std(listener)?;
     tracing::info!("listening on {}", args.listen);
 
     loop {
@@ -302,7 +368,9 @@ async fn serve(
         let permit_agent = args.permit_agent_forwarding;
         let ka_interval = args.keepalive_interval;
         let ka_count = args.keepalive_count;
-        let no_privilege_drop = args.no_privilege_drop;
+        // Under --sandbox the daemon is already unprivileged and cannot setuid,
+        // so sessions run as the daemon account — the same as no-privilege-drop.
+        let no_privilege_drop = args.no_privilege_drop || args.sandbox;
         tokio::spawn(async move {
             let handshake = match host_auth {
                 HostAuth::Local(key) => {

@@ -20,7 +20,9 @@ pub mod forward;
 pub mod mux;
 pub mod session;
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite};
+#[cfg(unix)]
+use tokio::io::AsyncReadExt; // for maybe_read's `.read()` (unix session server)
 use tokio::sync::mpsc;
 
 use crate::transport::Transport;
@@ -94,6 +96,7 @@ pub struct PtyRequest {
 pub type WindowChange = (u32, u32, u32, u32);
 
 /// Read from a reader that may not exist; absent readers never produce.
+#[cfg(unix)] // only the (unix) session server reads optional child pipes
 pub(crate) async fn maybe_read<R: AsyncRead + Unpin>(
     r: Option<&mut R>,
     buf: &mut [u8],

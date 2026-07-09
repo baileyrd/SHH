@@ -5,6 +5,9 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "A modern SSH: post-quantum hybrid KEX, Ed25519 only, AEAD only"
 rust-version = "1.85"
+# Bins are declared explicitly below; disable auto-discovery so helper source
+# files under src/bin/ (e.g. shh_agent_impl.rs) are not treated as targets.
+autobins = false
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "io-std", "macros", "time", "sync", "process", "signal", "fs"] }
@@ -28,13 +31,21 @@ bcrypt-pbkdf = "0.10"
 aes = "0.8"
 ctr = "0.9"
 
-# pty / terminal
-nix = { version = "0.29", features = ["term", "process", "fs", "signal", "user"] }
-libc = "0.2"
-
 # encoding / cli
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
+
+# pty / terminal / process control (server + unix client bits)
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29", features = ["term", "process", "fs", "signal", "user"] }
+libc = "0.2"
+
+# console control for the Windows client (raw mode, echo-off, size)
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+] }
 
 [dev-dependencies]
 tempfile = "3"

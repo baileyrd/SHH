@@ -184,6 +184,19 @@ shh/                 one library crate
 └── fuzz/            cargo-fuzz targets for the peer-controlled parsers
 ```
 
+### Portability
+
+The protocol core — `crypto`, `transport`, `wire`, `auth`, `agent`, and the
+channel `connect` machinery — is platform-neutral Rust. Platform-specific
+code is confined and cfg-gated: `tty` has a Unix (`/dev/tty` + termios) and a
+Windows (console API) backend behind one facade; `sftp::server`, `privsep`,
+and the session server (fork/setuid/ptys) are `#[cfg(unix)]`; the agent's
+Unix-socket transport is gated while its protocol is shared. So the **client**
+binaries (`shh`, `shh-sftp`, `shh-keygen`) compile and run on Windows, macOS,
+and Linux, while the **server** and **agent** are Unix, building as explicit
+stubs elsewhere. The Windows client is cross-built and exercised under Wine
+against a native Linux `shhd`.
+
 ## Milestones
 
 1. **End to end (done).** `shh user@host cmd` against `shhd`:
@@ -283,13 +296,27 @@ shh/                 one library crate
     key. When root, the signer drops to an unprivileged account
     (`--privsep-user`, default `nobody`), sets `no_new_privs`, and clamps
     its resource limits — its whole job is a read/sign/write loop, so its
-    attack surface is almost nil. Remaining: real-hardware FIDO2 on the
-    client (a software-emulated security key works today — see the auth
-    section — but a physical token needs an external authenticator helper),
-    and the fuller monitor model where the untrusted pre-auth *parsing*
-    itself runs in a separate sandboxed unprivileged process (with a
-    post-auth per-user session handed off from it) — the privsep milestone
-    moves the secret out of harm's way but still parses in the main daemon.
+    attack surface is almost nil.
+
+    **`--sandbox` goes further:** once the privileged setup is done — binding
+    the listen port (possibly < 1024), reading the host key, forking the
+    signer — the daemon *itself* drops to the unprivileged account and sets
+    `no_new_privs`, so from then on **every byte of untrusted parsing runs
+    without privilege and without the host key**. A memory-safety compromise
+    of the parser now yields only that unprivileged account — not root, not
+    the key, and (the signer being a separate address space) not a signing
+    oracle beyond what the live socket already allows. The trade-off is that
+    sessions run as that one account rather than as each authenticated user,
+    so `--sandbox` suits single-purpose servers (a git or SFTP endpoint, a
+    bastion) rather than multi-user login hosts. Remaining: real-hardware
+    FIDO2 on the client (a software-emulated security key works today — see
+    the auth section — but a physical token needs an external authenticator
+    helper), and OpenSSH's full monitor model, where the parser runs in a
+    *per-connection* sandboxed child and a privileged monitor hands back a
+    session running as *each authenticated user* — the step past `--sandbox`,
+    which removes privilege from the parser but gives up per-user sessions to
+    do it. That handoff needs the monitor to re-verify authentication and pass
+    session descriptors back to the parser; it is not built yet.
 11. **FIDO2 security keys (done).** `sk-ssh-ed25519@openssh.com` credentials
     authenticate both ways. Server-side, `shhd` verifies the authenticator's
     assertion — an Ed25519 signature over `SHA256(application) ‖ flags ‖

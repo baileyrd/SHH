@@ -303,6 +303,16 @@ When `shhd` runs as root the signer drops to `--privsep-user` (default
 read/sign/write loop. (This isolates the *secret*; running the untrusted
 pre-auth *parsing* in a separate sandboxed process is the next step.)
 
+### Desktop GUI
+
+A Termius-style host manager and terminal — saved hosts, generated/listed
+identities, a live pty session per tab — lives in [`gui/`](gui/README.md),
+built on this same library crate.
+
+```console
+$ cd gui && npm install && npm run tauri dev
+```
+
 ## Interoperability
 
 Verified against OpenSSH 9.6 in both directions (`ssh → shhd` and

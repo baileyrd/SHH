@@ -150,10 +150,19 @@ gateway$ shh you@other         # REFUSED — off the pinned path
 ```
 
 For the path to be provable across a hop, `shh -A` replays its own binding
-onto each relayed agent connection, so the agent sees the whole route. The
-constraint is OpenSSH's `restrict-destination-v00@openssh.com`, so
+onto each relayed agent connection, so the agent sees the whole route. A
+destination may also name a **certificate authority** instead of a specific
+host key — any host presenting a certificate that CA signed then matches,
+so one pin covers a whole fleet:
+
+```console
+$ echo "@cert-authority *.corp $(cat host_ca.pub)" >> ~/.shh/known_hosts
+$ shh-agent add -H gw.corp ~/.shh/id_ed25519   # pins to hosts under the corp CA
+```
+
+The constraint is OpenSSH's `restrict-destination-v00@openssh.com`, so
 `ssh-add -h` writes constraints `shh-agent` enforces and vice versa —
-endpoint pins and multi-hop paths alike.
+endpoint pins, multi-hop paths, and CA-scoped destinations alike.
 
 `shh host cmd` behaves like `ssh`: stdin is forwarded, stdout/stderr come
 back separated, and the remote exit status becomes `shh`'s exit status.
@@ -225,8 +234,8 @@ the account that logged in; an unknown login name is refused. `shh-agent`
 is a drop-in, Ed25519-only `ssh-agent` (interop verified with `ssh-add`
 and `ssh` both ways), agent forwarding (`-A`, server default-deny via
 `--permit-agent-forwarding`) relays it across hops, and agent keys can be
-pinned to specific destination hosts or whole paths (`shh-agent add -H
-gw>prod`, enforced via `session-bind@openssh.com` /
+pinned to specific hosts, whole paths, or a certificate authority
+(`shh-agent add -H gw>prod`, enforced via `session-bind@openssh.com` /
 `restrict-destination-v00`). Not yet implemented: FIDO2 `sk-ssh-ed25519`
 keys and a sandboxed pre-auth process (privilege *separation*, distinct
 from the privilege *drop* above). Treat it as a working protocol

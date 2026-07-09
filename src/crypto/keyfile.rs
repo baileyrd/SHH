@@ -375,6 +375,57 @@ pub fn known_hosts_cert_authorities(text: &str) -> Vec<PublicKey> {
         .collect()
 }
 
+/// Match a known_hosts host pattern against a hostname, honoring `*`/`?`
+/// wildcards (comma-separated alternatives are the caller's business).
+fn host_pattern_matches(pattern: &str, host: &str) -> bool {
+    fn go(p: &[u8], h: &[u8]) -> bool {
+        match p.first() {
+            None => h.is_empty(),
+            Some(b'*') => go(&p[1..], h) || (!h.is_empty() && go(p, &h[1..])),
+            Some(b'?') => !h.is_empty() && go(&p[1..], &h[1..]),
+            Some(&c) => h.first() == Some(&c) && go(&p[1..], &h[1..]),
+        }
+    }
+    go(label_host(pattern).as_bytes(), host.as_bytes())
+}
+
+/// Destination-constraint key entries for `host`: every plain host key
+/// (`is_ca = false`) recorded for it, plus every `@cert-authority` CA key
+/// whose pattern matches it (`is_ca = true`). The CA entries let a constraint
+/// name a whole certificate authority instead of one host key.
+pub fn known_hosts_constraint_keys(text: &str, host: &str) -> Vec<(PublicKey, bool)> {
+    let mut out = Vec::new();
+    for line in text.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("@cert-authority") {
+            let rest = rest.trim_start();
+            let Some((pattern, keypart)) = rest.split_once(char::is_whitespace) else {
+                continue;
+            };
+            if pattern.split(',').any(|p| host_pattern_matches(p, host)) {
+                if let Ok((key, _)) = decode_public(keypart.trim_start()) {
+                    out.push((key, true));
+                }
+            }
+            continue;
+        }
+        if line.starts_with('@') {
+            continue; // other markers (e.g. @revoked) are not ours to use
+        }
+        let Some((hosts, rest)) = line.split_once(char::is_whitespace) else {
+            continue;
+        };
+        if hosts.split(',').any(|h| host_pattern_matches(h, host)) {
+            if let Ok((key, _)) = decode_public(rest.trim_start()) {
+                out.push((key, false));
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,6 +486,30 @@ mod tests {
     fn garbage_rejected() {
         assert!(decode_private("not a key").is_err());
         assert!(decode_public("ecdsa-sha2-nistp256 AAAA...").is_err());
+    }
+
+    #[test]
+    fn constraint_keys_collect_plain_and_matching_ca() {
+        let host_key = PrivateKey::generate().public();
+        let ca = PrivateKey::generate().public();
+        let other_ca = PrivateKey::generate().public();
+        let text = format!(
+            "{}@cert-authority *.corp {}@cert-authority other.net {}",
+            known_hosts_line("prod.corp", &host_key),
+            encode_public(&ca, ""),
+            encode_public(&other_ca, ""),
+        );
+        let got = known_hosts_constraint_keys(&text, "prod.corp");
+        // The plain key (is_ca=false) and the *.corp CA (is_ca=true), but not
+        // the other.net CA whose pattern does not match.
+        assert_eq!(got.len(), 2, "plain key + matching CA");
+        assert!(got.iter().any(|(k, ca)| *k == host_key && !ca));
+        assert!(got.iter().any(|(k, is_ca)| *k == ca && *is_ca));
+        assert!(!got.iter().any(|(k, _)| *k == other_ca));
+        // A host the CA pattern also covers, with no plain entry: just the CA.
+        let only_ca = known_hosts_constraint_keys(&text, "web.corp");
+        assert_eq!(only_ca.len(), 1);
+        assert!(only_ca[0].1, "the sole entry is the CA");
     }
 
     #[test]

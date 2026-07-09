@@ -268,14 +268,19 @@ fn build_destinations(
                 Some((u, h)) => (u.to_string(), h.to_string()),
                 None => (String::new(), part.to_string()),
             };
-            let keys = keyfile::known_hosts_keys_for(&text, &host);
-            if keys.is_empty() {
+            let entries = keyfile::known_hosts_constraint_keys(&text, &host);
+            if entries.is_empty() {
                 return Err(format!(
-                    "no host key for {host:?} in {} — connect once (or add it) before restricting to it",
+                    "no host key or matching @cert-authority for {host:?} in {} — connect once \
+                     (or add a CA line) before restricting to it",
                     known_hosts.display()
                 ));
             }
-            hops.push((user, host, keys.iter().map(|k| k.to_blob()).collect()));
+            hops.push((
+                user,
+                host,
+                entries.iter().map(|(k, ca)| (k.to_blob(), *ca)).collect(),
+            ));
         }
         // One spec = one path (local → h1 → h2 → …); specs are ORed.
         payload.extend(shh::agent::encode_path(&hops));

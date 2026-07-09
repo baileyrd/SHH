@@ -85,15 +85,26 @@ When no host certificate or CA is configured, host identity falls back to
 
 ### Security keys (FIDO2)
 
-`shhd` accepts FIDO2 hardware security keys — put an
-`sk-ssh-ed25519@openssh.com` line in `authorized_keys` and a user logs in
-with their key (e.g. OpenSSH's `ssh -i ~/.ssh/id_ed25519_sk`). The server
-verifies the authenticator's assertion and **requires user presence** (a
-physical touch); an assertion without it is refused. The public-key
-encoding is byte-identical to OpenSSH's (verified against `ssh-keygen`).
-Producing assertions needs the physical key, so *presenting* an sk key is
-a client-side concern — the `shh` client does not yet drive an
-authenticator; `shhd` implements the server verification.
+`shhd` accepts FIDO2 security keys — put an `sk-ssh-ed25519@openssh.com`
+line in `authorized_keys` and a user logs in with their key. The server
+verifies the authenticator's assertion and **requires user presence**; an
+assertion without it is refused. The public-key encoding is byte-identical
+to OpenSSH's (verified against `ssh-keygen`).
+
+The `shh` client can present one too. The only authenticator it drives is
+**software-emulated** (`shh-keygen -t ed25519-sk`) — the seed lives in the
+key file, so it has *no hardware protection*; it is for testing and
+tokenless environments, not a replacement for a real key. Its assertions
+are cryptographically ordinary and verify anywhere:
+
+```console
+$ shh-keygen -t ed25519-sk -f ~/.shh/id_sk       # software-emulated
+$ cat ~/.shh/id_sk.pub >> ~/.ssh/authorized_keys # on the server
+$ shh -i ~/.shh/id_sk you@host uptime            # OpenSSH sshd accepts it too
+```
+
+Real hardware tokens (`ssh -i id_ed25519_sk` against a physical key) need
+an external authenticator helper, which is not yet built.
 
 ### Key agent
 
@@ -271,9 +282,9 @@ pinned to specific hosts, whole paths, or a certificate authority
 (`shh-agent add -H gw>prod`, enforced via `session-bind@openssh.com` /
 `restrict-destination-v00`). Privilege separation (`shhd --privsep`) holds
 the host key in a separate signer subprocess, out of the pre-auth parser's
-reach. FIDO2 security keys (`sk-ssh-ed25519@openssh.com`) authenticate to
-`shhd` (server-side verification). Not yet implemented: client-side FIDO2
-signing (needs a physical authenticator) and the fuller privsep model that
-also sandboxes the pre-auth *parsing* in its own unprivileged process.
-Treat it as a working protocol implementation, not a hardened production
-daemon.
+reach. FIDO2 security keys (`sk-ssh-ed25519@openssh.com`) work both ways —
+`shhd` verifies them, and `shh` can present a software-emulated one. Not
+yet implemented: real-hardware FIDO2 on the client (needs an external
+authenticator helper) and the fuller privsep model that also sandboxes the
+pre-auth *parsing* in its own unprivileged process. Treat it as a working
+protocol implementation, not a hardened production daemon.

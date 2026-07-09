@@ -120,23 +120,49 @@ fn authenticator_data(application: &str, flags: u8, counter: u32, message: &[u8]
     out
 }
 
-/// A software stand-in for a hardware authenticator, for tests only: it holds
-/// an Ed25519 key and produces assertions the way a real security key would.
-#[cfg(test)]
-pub(crate) struct SoftAuthenticator {
+/// A **software-emulated** security key: it holds the Ed25519 seed itself and
+/// produces assertions the way a hardware token would.
+///
+/// This has none of the protection a real authenticator gives — the secret
+/// lives in a file, not a tamper-resistant chip — so it is a convenience for
+/// testing, CI, and environments without a token, *not* a substitute for
+/// hardware. Assertions it produces are cryptographically ordinary and are
+/// accepted by any `sk-ssh-ed25519` verifier (SHH's or OpenSSH's); the honest
+/// difference is only where the key is kept. Real hardware belongs behind an
+/// external authenticator helper.
+#[derive(Clone)]
+pub struct SoftwareKey {
     signing: ed25519_dalek::SigningKey,
     application: String,
-    counter: u32,
 }
 
-#[cfg(test)]
-impl SoftAuthenticator {
+impl SoftwareKey {
     pub fn generate(application: &str) -> Self {
-        SoftAuthenticator {
+        SoftwareKey {
             signing: ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng),
             application: application.to_owned(),
-            counter: 0,
         }
+    }
+
+    /// Rebuild from the 32-byte seed and application (as loaded from a file).
+    pub fn from_seed(seed: [u8; 32], application: &str) -> Self {
+        SoftwareKey {
+            signing: ed25519_dalek::SigningKey::from_bytes(&seed),
+            application: application.to_owned(),
+        }
+    }
+
+    pub fn seed(&self) -> [u8; 32] {
+        self.signing.to_bytes()
+    }
+
+    pub fn application(&self) -> &str {
+        &self.application
+    }
+
+    /// The raw 32-byte Ed25519 public key (`enc_A`), for the key-file blob.
+    pub fn verifying_bytes(&self) -> [u8; 32] {
+        self.signing.verifying_key().to_bytes()
     }
 
     pub fn public(&self) -> SkPublicKey {
@@ -146,19 +172,21 @@ impl SoftAuthenticator {
         }
     }
 
-    /// Produce an assertion over `message`. `user_present` models whether the
-    /// user touched the key.
-    pub fn sign(&mut self, message: &[u8], user_present: bool) -> Vec<u8> {
+    /// Produce an assertion over `message`. `user_present` sets the
+    /// user-presence flag; the CLI sets it only after confirming presence.
+    /// The counter is fixed at 0 — a stateless software key cannot maintain a
+    /// monotonic one, and servers do not require it.
+    pub fn sign(&self, message: &[u8], user_present: bool) -> Vec<u8> {
         use ed25519_dalek::Signer;
         let flags = if user_present { FLAG_USER_PRESENT } else { 0 };
-        self.counter += 1;
-        let signed = authenticator_data(&self.application, flags, self.counter, message);
+        let counter = 0u32;
+        let signed = authenticator_data(&self.application, flags, counter, message);
         let sig = self.signing.sign(&signed);
         let mut w = Writer::new();
         w.utf8(SK_ALGO);
         w.string(&sig.to_bytes());
         w.byte(flags);
-        w.u32(self.counter);
+        w.u32(counter);
         w.into_bytes()
     }
 }
@@ -169,14 +197,14 @@ mod tests {
 
     #[test]
     fn assertion_round_trips() {
-        let mut auth = SoftAuthenticator::generate("ssh:");
+        let auth = SoftwareKey::generate("ssh:");
         let pk = auth.public();
 
         // The public credential survives a blob round trip.
         let reparsed = SkPublicKey::from_blob(&pk.to_blob()).unwrap();
         assert_eq!(reparsed, pk);
 
-        // A touched assertion verifies; the counter advances each time.
+        // Touched assertions over distinct messages verify.
         let sig1 = auth.sign(b"first message", true);
         pk.verify(b"first message", &sig1).unwrap();
         let sig2 = auth.sign(b"second message", true);
@@ -185,13 +213,20 @@ mod tests {
     }
 
     #[test]
+    fn seed_round_trips() {
+        let key = SoftwareKey::generate("ssh:");
+        let same = SoftwareKey::from_seed(key.seed(), key.application());
+        assert_eq!(same.public(), key.public());
+    }
+
+    #[test]
     fn wrong_message_or_key_is_rejected() {
-        let mut auth = SoftAuthenticator::generate("ssh:");
+        let auth = SoftwareKey::generate("ssh:");
         let pk = auth.public();
         let sig = auth.sign(b"the message", true);
         assert!(pk.verify(b"a different message", &sig).is_err());
 
-        let other = SoftAuthenticator::generate("ssh:").public();
+        let other = SoftwareKey::generate("ssh:").public();
         assert!(other.verify(b"the message", &sig).is_err());
     }
 
@@ -199,7 +234,7 @@ mod tests {
     fn untouched_assertion_is_refused() {
         // No user-presence flag: the server must reject it even though the
         // Ed25519 math is valid.
-        let mut auth = SoftAuthenticator::generate("ssh:");
+        let auth = SoftwareKey::generate("ssh:");
         let pk = auth.public();
         let sig = auth.sign(b"m", false);
         assert!(pk.verify(b"m", &sig).is_err());
@@ -210,14 +245,9 @@ mod tests {
         // Two credentials with the same key but different applications must
         // not verify each other's assertions (the app is hashed into the
         // signed data).
-        let a = SoftAuthenticator::generate("ssh:");
-        let mut b = SoftAuthenticator {
-            signing: a.signing.clone(),
-            application: "ssh:other".into(),
-            counter: 0,
-        };
-        let a_pub = a.public();
+        let a = SoftwareKey::generate("ssh:");
+        let b = SoftwareKey::from_seed(a.seed(), "ssh:other");
         let sig = b.sign(b"m", true);
-        assert!(a_pub.verify(b"m", &sig).is_err());
+        assert!(a.public().verify(b"m", &sig).is_err());
     }
 }

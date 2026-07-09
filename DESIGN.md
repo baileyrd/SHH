@@ -81,13 +81,18 @@ channel. Both bare keys and OpenSSH-style Ed25519 user certificates
 (`--trusted-ca-keys`) and admit any certificate it signed whose validity
 window covers now and whose principals include the login name. We fail
 closed on unrecognized critical options, and host certificates plus
-`force-command` / `source-address` are not yet honored. FIDO2 hardware
-security keys (`sk-ssh-ed25519@openssh.com`) are accepted too: the server
+`force-command` / `source-address` are not yet honored. FIDO2 security
+keys (`sk-ssh-ed25519@openssh.com`) are supported both ways: the server
 verifies the authenticator's assertion — an Ed25519 signature over
 `SHA256(application) ‖ flags ‖ counter ‖ SHA256(signed-data)` — and
-refuses one that does not assert user presence. Producing an assertion
-needs the physical key and is a client concern; `shhd` implements the
-verification a server needs (an OpenSSH `ssh -i id_ed25519_sk` logs in).
+refuses one that does not assert user presence, and the client can present
+one. Client-side, the only authenticator implemented is
+*software-emulated* (`shh-keygen -t ed25519-sk`): the seed lives in the
+key file rather than a tamper-resistant chip, so it has no hardware
+protection — a convenience for testing and tokenless environments, not a
+substitute for a real key. The assertions it produces are cryptographically
+ordinary and verify anywhere, including under OpenSSH `sshd`. Real hardware
+belongs behind an external authenticator helper, which is not yet built.
 
 The private key may live in an agent instead of the client process:
 `shh` signs through whatever `SSH_AUTH_SOCK` names, and `shh-agent` is our
@@ -256,9 +261,10 @@ shh/                 one library crate
     key. When root, the signer drops to an unprivileged account
     (`--privsep-user`, default `nobody`), sets `no_new_privs`, and clamps
     its resource limits — its whole job is a read/sign/write loop, so its
-    attack surface is almost nil. Remaining: client-side FIDO2 signing (the
-    server side is done — see the auth section), and the fuller monitor
-    model where the untrusted pre-auth *parsing* itself runs in a separate
-    sandboxed unprivileged process (with a post-auth per-user session
-    handed off from it) — this milestone moves the secret out of harm's way
-    but still parses in the main daemon.
+    attack surface is almost nil. Remaining: real-hardware FIDO2 on the
+    client (a software-emulated security key works today — see the auth
+    section — but a physical token needs an external authenticator helper),
+    and the fuller monitor model where the untrusted pre-auth *parsing*
+    itself runs in a separate sandboxed unprivileged process (with a
+    post-auth per-user session handed off from it) — the privsep milestone
+    moves the secret out of harm's way but still parses in the main daemon.

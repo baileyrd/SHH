@@ -73,14 +73,15 @@ fn kdf_material(passphrase: &str, salt: &[u8], rounds: u32) -> Result<Zeroizing<
     Ok(km)
 }
 
-/// Serialize a private key as an `openssh-key-v1` file; encrypted with
-/// AES-256-CTR under a bcrypt-derived key when a passphrase is given.
-pub fn encode_private_protected(
-    key: &PrivateKey,
-    comment: &str,
+/// Wrap a public blob and a private-section builder into an `openssh-key-v1`
+/// file, encrypting with AES-256-CTR under a bcrypt-derived key when a
+/// passphrase is given. `build_inner(block)` returns the padded inner
+/// section for the given cipher block size.
+fn armor_key(
+    pub_blob: &[u8],
+    build_inner: impl Fn(usize) -> Zeroizing<Vec<u8>>,
     passphrase: Option<&str>,
 ) -> Result<String> {
-    let pub_blob = key.public().to_blob();
     let mut w = Writer::new();
     let mut out = AUTH_MAGIC.to_vec();
     match passphrase {
@@ -89,14 +90,14 @@ pub fn encode_private_protected(
             w.utf8("none");
             w.string(b"");
             w.u32(1);
-            w.string(&pub_blob);
-            w.string(&build_inner(key, comment, 8));
+            w.string(pub_blob);
+            w.string(&build_inner(8));
         }
         Some(pass) => {
             let mut salt = [0u8; 16];
             OsRng.fill_bytes(&mut salt);
             let km = kdf_material(pass, &salt, BCRYPT_ROUNDS)?;
-            let mut inner = build_inner(key, comment, 16);
+            let mut inner = build_inner(16);
             Aes256Ctr::new(km[..32].into(), km[32..].into()).apply_keystream(&mut inner);
 
             w.utf8("aes256-ctr");
@@ -106,7 +107,7 @@ pub fn encode_private_protected(
             opts.u32(BCRYPT_ROUNDS);
             w.string(&opts.into_bytes());
             w.u32(1);
-            w.string(&pub_blob);
+            w.string(pub_blob);
             w.string(&inner);
         }
     }
@@ -114,9 +115,64 @@ pub fn encode_private_protected(
     Ok(pem_wrap(&out))
 }
 
+/// Serialize a private key as an `openssh-key-v1` file; encrypted with
+/// AES-256-CTR under a bcrypt-derived key when a passphrase is given.
+pub fn encode_private_protected(
+    key: &PrivateKey,
+    comment: &str,
+    passphrase: Option<&str>,
+) -> Result<String> {
+    armor_key(
+        &key.public().to_blob(),
+        |block| build_inner(key, comment, block),
+        passphrase,
+    )
+}
+
 /// Serialize a private key unencrypted (host keys, tests).
 pub fn encode_private(key: &PrivateKey, comment: &str) -> String {
     encode_private_protected(key, comment, None).expect("unencrypted encoding cannot fail")
+}
+
+/// The private "inner" section for a software security key, mirroring
+/// OpenSSH's `sk-ssh-ed25519` layout — except the "key handle" a real
+/// authenticator stores is, for a software key, the Ed25519 seed itself.
+fn build_sk_inner(
+    key: &crate::crypto::sk::SoftwareKey,
+    comment: &str,
+    block: usize,
+) -> Zeroizing<Vec<u8>> {
+    let mut inner = Writer::new();
+    let check = OsRng.next_u32();
+    inner.u32(check).u32(check);
+    inner.utf8(crate::crypto::sk::SK_ALGO);
+    inner.string(&key.verifying_bytes());
+    inner.utf8(key.application());
+    inner.byte(0x01); // SSH_SK_USER_PRESENCE_REQUIRED
+    let handle = Zeroizing::new(key.seed().to_vec()); // software: the seed
+    inner.string(&handle);
+    inner.string(b""); // reserved
+    inner.utf8(comment);
+    let mut inner = Zeroizing::new(inner.into_bytes());
+    let mut padbyte = 1u8;
+    while inner.len() % block != 0 {
+        inner.push(padbyte);
+        padbyte = padbyte.wrapping_add(1);
+    }
+    inner
+}
+
+/// Serialize a software security key as an `openssh-key-v1` file.
+pub fn encode_sk_private(
+    key: &crate::crypto::sk::SoftwareKey,
+    comment: &str,
+    passphrase: Option<&str>,
+) -> Result<String> {
+    armor_key(
+        &key.public().to_blob(),
+        |block| build_sk_inner(key, comment, block),
+        passphrase,
+    )
 }
 
 /// Strip PEM armor and base64.
@@ -157,6 +213,19 @@ pub fn decode_private_protected(
     text: &str,
     passphrase: Option<&str>,
 ) -> Result<(PrivateKey, String)> {
+    match decode_private_identity(text, passphrase)? {
+        (PrivateIdentity::Ed25519(key), comment) => Ok((key, comment)),
+        (PrivateIdentity::SecurityKey(_), _) => Err(bad(
+            "this is a security-key identity; load it as one",
+        )),
+    }
+}
+
+/// Decrypt and check-validate the inner private section of an
+/// `openssh-key-v1` file, without parsing the key material itself. Returns
+/// the decrypted inner bytes positioned at the first key field (algorithm),
+/// so the caller can dispatch on key type.
+fn open_inner(text: &str, passphrase: Option<&str>) -> Result<Zeroizing<Vec<u8>>> {
     let raw = unarmor(text)?;
     let rest = raw
         .strip_prefix(AUTH_MAGIC)
@@ -199,39 +268,87 @@ pub fn decode_private_protected(
         Aes256Ctr::new(km[..32].into(), km[32..].into()).apply_keystream(&mut inner);
     }
 
+    // Validate the check-int pair up front so a wrong passphrase is caught
+    // before we try to interpret garbage as key fields.
     let mut r = Reader::new(&inner);
-    let c1 = r.u32()?;
-    let c2 = r.u32()?;
-    if c1 != c2 {
+    if r.u32()? != r.u32()? {
         return Err(if encrypted {
             bad("wrong passphrase")
         } else {
             bad("check bytes mismatch (corrupt file?)")
         });
     }
-    let algo = r.utf8()?;
-    if algo != ALGO {
-        return Err(bad(format!("unsupported key type {algo:?} (Ed25519 only)")));
+    // Return the decrypted inner; callers re-read from the algorithm field.
+    let pos = 8; // two consumed check words
+    Ok(Zeroizing::new(inner[pos..].to_vec()))
+}
+
+/// A private authentication identity loaded from a file: a plain Ed25519 key
+/// or a (software) security key.
+pub enum PrivateIdentity {
+    Ed25519(PrivateKey),
+    SecurityKey(crate::crypto::sk::SoftwareKey),
+}
+
+/// Parse any private identity we support, dispatching on the key type in the
+/// file. Handles passphrase decryption via `passphrase`.
+pub fn decode_private_identity(
+    text: &str,
+    passphrase: Option<&str>,
+) -> Result<(PrivateIdentity, String)> {
+    let inner = open_inner(text, passphrase)?;
+    let mut r = Reader::new(&inner);
+    let algo = r.utf8()?.to_owned();
+    match algo.as_str() {
+        ALGO => {
+            let public = r.string()?;
+            let sk = r.string()?;
+            let comment = r.utf8()?.to_owned();
+            check_padding(r.rest())?;
+            if sk.len() != 64 || public.len() != 32 || &sk[32..] != public {
+                return Err(bad("inconsistent ed25519 key material"));
+            }
+            let seed: [u8; 32] = sk[..32].try_into().expect("length checked");
+            let key = PrivateKey(SigningKey::from_bytes(&seed));
+            if key.public().0.as_bytes() != public {
+                return Err(bad("public key does not match private seed"));
+            }
+            Ok((PrivateIdentity::Ed25519(key), comment))
+        }
+        a if a == crate::crypto::sk::SK_ALGO => {
+            let enc_a: [u8; 32] = r
+                .string()?
+                .try_into()
+                .map_err(|_| bad("sk public key must be 32 bytes"))?;
+            let application = r.utf8()?.to_owned();
+            let _flags = r.byte()?;
+            let handle = Zeroizing::new(r.string()?.to_vec()); // software: the seed
+            let _reserved = r.string()?;
+            let comment = r.utf8()?.to_owned();
+            check_padding(r.rest())?;
+            let seed: [u8; 32] = handle
+                .as_slice()
+                .try_into()
+                .map_err(|_| bad("this security key is not software-backed (no seed to sign with)"))?;
+            let key = crate::crypto::sk::SoftwareKey::from_seed(seed, &application);
+            if key.verifying_bytes() != enc_a {
+                return Err(bad("sk public key does not match the stored seed"));
+            }
+            Ok((PrivateIdentity::SecurityKey(key), comment))
+        }
+        other => Err(bad(format!("unsupported key type {other:?}"))),
     }
-    let public = r.string()?;
-    let sk = r.string()?;
-    let comment = r.utf8()?.to_owned();
-    // remaining bytes are deterministic padding 1,2,3…
-    for (i, &b) in r.rest().iter().enumerate() {
+}
+
+/// The trailing bytes of an inner section must be deterministic padding
+/// 1, 2, 3, ….
+fn check_padding(rest: &[u8]) -> Result<()> {
+    for (i, &b) in rest.iter().enumerate() {
         if b != (i + 1) as u8 {
             return Err(bad("bad trailing padding"));
         }
     }
-
-    if sk.len() != 64 || public.len() != 32 || &sk[32..] != public {
-        return Err(bad("inconsistent ed25519 key material"));
-    }
-    let seed: [u8; 32] = sk[..32].try_into().expect("length checked");
-    let key = PrivateKey(SigningKey::from_bytes(&seed));
-    if key.public().0.as_bytes() != public {
-        return Err(bad("public key does not match private seed"));
-    }
-    Ok((key, comment))
+    Ok(())
 }
 
 // -------------------------------------------------------------- public --
@@ -243,6 +360,18 @@ pub fn encode_public(key: &PublicKey, comment: &str) -> String {
         format!("{ALGO} {b64}\n")
     } else {
         format!("{ALGO} {b64} {comment}\n")
+    }
+}
+
+/// One `sk-ssh-ed25519@openssh.com AAAA... comment` line (a security-key
+/// credential, for `.pub` / authorized_keys).
+pub fn encode_sk_public(key: &crate::crypto::sk::SkPublicKey, comment: &str) -> String {
+    let b64 = BASE64_STANDARD.encode(key.to_blob());
+    let algo = crate::crypto::sk::SK_ALGO;
+    if comment.is_empty() {
+        format!("{algo} {b64}\n")
+    } else {
+        format!("{algo} {b64} {comment}\n")
     }
 }
 
@@ -508,6 +637,34 @@ mod tests {
     fn garbage_rejected() {
         assert!(decode_private("not a key").is_err());
         assert!(decode_public("ecdsa-sha2-nistp256 AAAA...").is_err());
+    }
+
+    #[test]
+    fn sk_private_round_trips_plain_and_protected() {
+        use crate::crypto::sk::SoftwareKey;
+        let key = SoftwareKey::generate("ssh:");
+
+        // Unencrypted.
+        let text = encode_sk_private(&key, "yubi@shh", None).unwrap();
+        assert!(!needs_passphrase(&text).unwrap());
+        match decode_private_identity(&text, None).unwrap() {
+            (PrivateIdentity::SecurityKey(k), comment) => {
+                assert_eq!(k.public(), key.public());
+                assert_eq!(comment, "yubi@shh");
+            }
+            _ => panic!("expected a security key"),
+        }
+        // decode_private (Ed25519-only) rejects it clearly.
+        assert!(decode_private(&text).is_err());
+
+        // Passphrase-protected: right passphrase opens, wrong one fails.
+        let enc = encode_sk_private(&key, "c", Some("hunter2")).unwrap();
+        assert!(needs_passphrase(&enc).unwrap());
+        assert!(decode_private_identity(&enc, Some("wrong")).is_err());
+        match decode_private_identity(&enc, Some("hunter2")).unwrap().0 {
+            PrivateIdentity::SecurityKey(k) => assert_eq!(k.public(), key.public()),
+            _ => panic!("expected a security key"),
+        }
     }
 
     #[test]

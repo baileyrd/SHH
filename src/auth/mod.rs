@@ -11,7 +11,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::crypto::cert::{self, Certificate, CERT_ALGO, CERT_TYPE_USER};
 use crate::crypto::ed25519::{PrivateKey, PublicKey, ALGO};
-use crate::crypto::sk::SK_ALGO;
+use crate::crypto::sk::{SoftwareKey, SK_ALGO};
 use crate::crypto::userkey::UserKey;
 use crate::transport::Transport;
 use crate::wire::{msg, Reader, Writer};
@@ -41,10 +41,12 @@ fn signed_span(session_id: &[u8], user: &str, algo: &str, pubkey_blob: &[u8]) ->
 // ------------------------------------------------------------- client ---
 
 /// Where a credential's signature comes from: a private key in this
-/// process, or an agent that holds it for us.
+/// process, an agent that holds it for us, or a (software-emulated)
+/// security key that produces an assertion.
 enum SignWith<'a> {
     Key(&'a PrivateKey),
     Agent(&'a mut crate::agent::Client),
+    SecurityKey(&'a SoftwareKey),
 }
 
 /// Authenticate as `user` with `key`. If `cert` (a certificate blob whose
@@ -96,6 +98,23 @@ where
     run_auth(t, user, creds, SignWith::Agent(agent), on_banner).await
 }
 
+/// Authenticate as `user` with a security key: present its
+/// `sk-ssh-ed25519@openssh.com` credential and sign the challenge as an
+/// assertion. User presence is assumed already confirmed by the caller (the
+/// CLI prompts before calling), so the assertion carries the presence flag.
+pub async fn client_sk<S>(
+    t: &mut Transport<S>,
+    user: &str,
+    key: &SoftwareKey,
+    on_banner: impl FnMut(&str),
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let creds = vec![(SK_ALGO.to_owned(), key.public().to_blob())];
+    run_auth(t, user, creds, SignWith::SecurityKey(key), on_banner).await
+}
+
 /// The userauth conversation: offer each credential in turn, signature up
 /// front (the PK_OK probe buys nothing when signing is this cheap), until
 /// the server accepts one or the list runs out.
@@ -126,6 +145,7 @@ where
         let span = signed_span(t.session_id(), user, &algo, &blob);
         let sig = match &mut with {
             SignWith::Key(k) => k.sign(&span),
+            SignWith::SecurityKey(sk) => sk.sign(&span, true),
             SignWith::Agent(a) => match a.sign(&blob, &span).await {
                 Ok(sig) => sig,
                 Err(e) => {
@@ -629,7 +649,7 @@ mod tests {
     /// a software authenticator. `touch` models the user-presence flag.
     /// Returns the server's reply byte and the server-side auth result.
     async fn sk_authed(
-        mut dev: crate::crypto::sk::SoftAuthenticator,
+        dev: crate::crypto::sk::SoftwareKey,
         policy: Policy,
         user: &str,
         touch: bool,
@@ -670,8 +690,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_sk_authenticates_end_to_end() {
+        // The real client entry point (auth::client_sk) against auth::server.
+        let key = crate::crypto::sk::SoftwareKey::generate("ssh:");
+        let policy = Policy {
+            user: Some("river".into()),
+            keys: vec![UserKey::Sk(key.public())],
+            trusted_cas: vec![],
+            banner: None,
+        };
+        let (a, b) = duplex(1 << 20);
+        let host_key = PrivateKey::generate();
+        let client_side = async move {
+            let mut t =
+                Transport::client(a, ClientConfig::with_verifier(Box::new(|_| Ok(())))).await?;
+            client_sk(&mut t, "river", &key, |_| {}).await
+        };
+        let server_side = async move {
+            let mut t = Transport::server(b, ServerConfig::with_host_key(host_key)).await?;
+            server(&mut t, &policy).await
+        };
+        let (c, s) = tokio::join!(client_side, server_side);
+        c.unwrap();
+        assert_eq!(s.unwrap(), "river");
+    }
+
+    #[tokio::test]
     async fn security_key_authenticates() {
-        let dev = crate::crypto::sk::SoftAuthenticator::generate("ssh:");
+        let dev = crate::crypto::sk::SoftwareKey::generate("ssh:");
         let policy = Policy {
             user: Some("river".into()),
             keys: vec![UserKey::Sk(dev.public())],
@@ -687,7 +733,7 @@ mod tests {
     async fn security_key_without_touch_is_refused() {
         // A valid Ed25519 assertion, but the authenticator did not assert
         // user presence: the server must reject it.
-        let dev = crate::crypto::sk::SoftAuthenticator::generate("ssh:");
+        let dev = crate::crypto::sk::SoftwareKey::generate("ssh:");
         let policy = Policy {
             user: Some("river".into()),
             keys: vec![UserKey::Sk(dev.public())],
@@ -700,8 +746,8 @@ mod tests {
 
     #[tokio::test]
     async fn unlisted_security_key_is_refused() {
-        let dev = crate::crypto::sk::SoftAuthenticator::generate("ssh:");
-        let other = crate::crypto::sk::SoftAuthenticator::generate("ssh:");
+        let dev = crate::crypto::sk::SoftwareKey::generate("ssh:");
+        let other = crate::crypto::sk::SoftwareKey::generate("ssh:");
         let policy = Policy {
             user: Some("river".into()),
             keys: vec![UserKey::Sk(other.public())], // a different credential

@@ -144,6 +144,7 @@ shh/                 one library crate
 │                    encrypted packet stream, rekeying
 ├── src/auth/        userauth (publickey), local keys or via agent
 ├── src/agent/       SSH agent protocol: client, Ed25519 keyring server
+├── src/privsep.rs   host-key signer subprocess (privilege separation)
 ├── src/connect/     channels, session (exec/shell), flow control
 ├── src/bin/shh.rs   client
 ├── src/bin/shhd.rs  server
@@ -237,6 +238,21 @@ shh/                 one library crate
    signed then matches, so a key can be pinned to "any host under this host
    CA" rather than an enumerated key list. `shh-agent -H` fills those in
    from `@cert-authority` lines in known_hosts, exactly as `ssh-add -h`
-   does. Remaining: `sk-ssh-ed25519` FIDO2 keys and a sandboxed pre-auth
-   process (privilege *separation*, a further step beyond milestone 6's
-   privilege *drop*).
+   does.
+10. **Privilege separation — host-key isolation (done).** `shhd --privsep`
+    keeps the host private key out of the process that parses untrusted
+    network input. At startup — while still single-threaded, so `fork()`
+    is safe — the daemon forks a minimal **signer** subprocess that holds
+    the key and does nothing but answer "sign this exchange hash"; the
+    parent zeroizes its copy and, for every key exchange (initial and each
+    rekey), delegates the host-key signature to the signer over a
+    socketpair. A memory-disclosure or code-execution bug in the daemon's
+    pre-authentication parsing therefore can no longer exfiltrate the host
+    key. When root, the signer drops to an unprivileged account
+    (`--privsep-user`, default `nobody`), sets `no_new_privs`, and clamps
+    its resource limits — its whole job is a read/sign/write loop, so its
+    attack surface is almost nil. Remaining: `sk-ssh-ed25519` FIDO2 keys,
+    and the fuller monitor model where the untrusted pre-auth *parsing*
+    itself runs in a separate sandboxed unprivileged process (with a
+    post-auth per-user session handed off from it) — this milestone moves
+    the secret out of harm's way but still parses in the main daemon.

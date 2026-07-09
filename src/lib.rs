@@ -9,6 +9,8 @@ pub mod agent;
 pub mod auth;
 pub mod connect;
 pub mod crypto;
+#[cfg(unix)]
+pub mod privsep;
 pub mod transport;
 #[cfg(unix)]
 pub mod tty;

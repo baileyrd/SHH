@@ -533,16 +533,39 @@ pub fn known_hosts_cert_authorities(text: &str) -> Vec<PublicKey> {
 
 /// Match a known_hosts host pattern against a hostname, honoring `*`/`?`
 /// wildcards (comma-separated alternatives are the caller's business).
+///
+/// Iterative two-pointer matching (the same shape OpenSSH's own
+/// `match_pattern` uses), not naive recursive backtracking on `*`: a pattern
+/// with many wildcards against a long non-matching host is O(pattern · host)
+/// here, not exponential. Host patterns come from a local `known_hosts`
+/// file, so a crafted or attacker-appended line — including one consulted
+/// for agent destination-constraints — can no longer hang the process.
 fn host_pattern_matches(pattern: &str, host: &str) -> bool {
-    fn go(p: &[u8], h: &[u8]) -> bool {
-        match p.first() {
-            None => h.is_empty(),
-            Some(b'*') => go(&p[1..], h) || (!h.is_empty() && go(p, &h[1..])),
-            Some(b'?') => !h.is_empty() && go(&p[1..], &h[1..]),
-            Some(&c) => h.first() == Some(&c) && go(&p[1..], &h[1..]),
+    let p = label_host(pattern).as_bytes();
+    let h = host.as_bytes();
+
+    let (mut pi, mut hi) = (0usize, 0usize);
+    // The most recent `*` seen, and the host position matching resumed from
+    // last time we backtracked to it (advanced by one on each retry).
+    let mut star: Option<(usize, usize)> = None;
+
+    while hi < h.len() {
+        if pi < p.len() && (p[pi] == b'?' || p[pi] == h[hi]) {
+            pi += 1;
+            hi += 1;
+        } else if pi < p.len() && p[pi] == b'*' {
+            star = Some((pi, hi));
+            pi += 1;
+        } else if let Some((star_pi, star_hi)) = star {
+            let retry_from = star_hi + 1;
+            pi = star_pi + 1;
+            hi = retry_from;
+            star = Some((star_pi, retry_from));
+        } else {
+            return false;
         }
     }
-    go(label_host(pattern).as_bytes(), host.as_bytes())
+    p[pi..].iter().all(|&b| b == b'*')
 }
 
 /// Destination-constraint key entries for `host`: every plain host key
@@ -585,6 +608,55 @@ pub fn known_hosts_constraint_keys(text: &str, host: &str) -> Vec<(PublicKey, bo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_pattern_matching_semantics() {
+        assert!(host_pattern_matches("example.com", "example.com"));
+        assert!(!host_pattern_matches("example.com", "example.org"));
+
+        // `*` matches zero or more characters, anywhere in the pattern.
+        assert!(host_pattern_matches("*.example.com", "gw.example.com"));
+        assert!(host_pattern_matches("*.example.com", "a.b.example.com"));
+        assert!(!host_pattern_matches("*.example.com", "example.com"));
+        assert!(host_pattern_matches("*", "anything.at.all"));
+        assert!(host_pattern_matches("*", ""));
+        assert!(host_pattern_matches("host*", "host"));
+        assert!(host_pattern_matches("*a*b*c*", "xaxbxcx"));
+        assert!(!host_pattern_matches("*a*b*c*", "xbxax")); // wrong order
+
+        // `?` matches exactly one character.
+        assert!(host_pattern_matches("host?", "host1"));
+        assert!(!host_pattern_matches("host?", "host"));
+        assert!(!host_pattern_matches("host?", "host12"));
+
+        // `[host]:port` and bare `host:port` patterns match on the bare host.
+        assert!(host_pattern_matches("[gw]:2222", "gw"));
+        assert!(host_pattern_matches("gw:2222", "gw"));
+
+        // Empty host only matches an all-`*` (or empty) pattern.
+        assert!(!host_pattern_matches("a*", ""));
+        assert!(host_pattern_matches("", ""));
+        assert!(!host_pattern_matches("a", ""));
+    }
+
+    /// The matcher used to be naive recursive backtracking on `*`, which is
+    /// exponential for a pattern with many wildcards against a long
+    /// non-matching host — exactly the shape below. The iterative two-pointer
+    /// rewrite is O(pattern · host); this should return well under a second
+    /// even though the equivalent recursive call count would have been
+    /// astronomical.
+    #[test]
+    fn host_pattern_matching_does_not_blow_up_on_many_wildcards() {
+        let pattern = "*a".repeat(30) + "z"; // many stars, never matches
+        let host = "a".repeat(2000); // long, and never contains 'z'
+        let start = std::time::Instant::now();
+        assert!(!host_pattern_matches(&pattern, &host));
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "pattern matching took too long: {:?}",
+            start.elapsed()
+        );
+    }
 
     #[test]
     fn private_roundtrip() {

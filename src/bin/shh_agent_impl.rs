@@ -268,6 +268,14 @@ fn build_destinations(
                 Some((u, h)) => (u.to_string(), h.to_string()),
                 None => (String::new(), part.to_string()),
             };
+            if host.is_empty() {
+                // A malformed spec ("gw>>prod", a leading/trailing '>')
+                // yields an empty hop here. Reject explicitly rather than
+                // looking it up: an empty host would match a bare `*`
+                // wildcard line in known_hosts, silently building a
+                // constraint around a hop the operator never named.
+                return Err(format!("empty host in destination spec {spec:?}"));
+            }
             let entries = keyfile::known_hosts_constraint_keys(&text, &host);
             if entries.is_empty() {
                 return Err(format!(
@@ -404,4 +412,40 @@ async fn remove(client: &mut Client, files: Vec<PathBuf>, all: bool) -> Result<(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A malformed spec ("gw>>prod", a leading/trailing '>') must not
+    /// silently resolve an empty host against a `*` wildcard known_hosts
+    /// line -- reject it outright instead.
+    #[test]
+    fn build_destinations_rejects_empty_hop_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let known_hosts = dir.path().join("known_hosts");
+        // A wildcard @cert-authority line: exactly what an empty host would
+        // otherwise match against.
+        let ca = shh::crypto::ed25519::PrivateKey::generate();
+        std::fs::write(
+            &known_hosts,
+            format!("@cert-authority * {}\n", shh::crypto::keyfile::encode_public(&ca.public(), "")),
+        )
+        .unwrap();
+
+        for spec in ["gw>>prod", ">prod", "gw>"] {
+            let result = build_destinations(&[spec.to_string()], &known_hosts);
+            assert!(result.is_err(), "spec {spec:?} should be rejected");
+        }
+
+        // A well-formed spec against a real entry still works.
+        let host_key = shh::crypto::ed25519::PrivateKey::generate();
+        std::fs::write(
+            &known_hosts,
+            format!("gw {}\n", shh::crypto::keyfile::encode_public(&host_key.public(), "")),
+        )
+        .unwrap();
+        assert!(build_destinations(&["gw".to_string()], &known_hosts).unwrap().is_some());
+    }
 }

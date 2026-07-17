@@ -291,7 +291,22 @@ fn main() -> std::io::Result<()> {
     // --sandbox implies --privsep (the key must be out of the parser before
     // the parser goes unprivileged, or it would still be readable there).
     let privsep = args.privsep || args.sandbox;
-    if args.no_privilege_drop {
+    if args.no_privilege_drop && started_root {
+        // The riskiest combination this flag can produce: every
+        // authenticated key gets a full root session, with nothing at
+        // startup louder than a log line to notice it. --no-privilege-drop's
+        // own help text says "use only for single-user or test setups," but
+        // an operator can still reach for it in production (e.g. copying a
+        // test config forward) without registering that "the shhd account"
+        // means root here. eprintln! too: a warn! alone can be lost to log
+        // filtering/redirection in exactly the deployment where this matters
+        // most.
+        eprintln!(
+            "shhd: WARNING — running as root with --no-privilege-drop: \
+             every authenticated session will run as root"
+        );
+        tracing::warn!("privilege drop disabled while running as root — sessions run as root");
+    } else if args.no_privilege_drop {
         tracing::warn!("privilege drop disabled — sessions run as the shhd account");
     } else if !started_root && !args.sandbox {
         tracing::warn!("not running as root — sessions run as the shhd account (cannot drop)");
@@ -319,8 +334,15 @@ fn main() -> std::io::Result<()> {
     // on all untrusted parsing runs without privilege or the host key.
     if args.sandbox {
         shh::privsep::drop_daemon_privileges(&args.privsep_user)?;
-        tracing::info!(
-            "sandbox on: daemon dropped to {:?}; sessions run as that account",
+        // warn, not info: this is easy to read as "extra hardening on top of
+        // normal operation" when it actually removes per-user isolation --
+        // every authenticated principal's session becomes an OS-level
+        // sibling process under the same shared account, able to see and
+        // signal each other. Appropriate for a single-purpose server, a
+        // real regression for a multi-user login host.
+        tracing::warn!(
+            "sandbox on: daemon dropped to {:?}; ALL sessions share that one account \
+             (no per-user isolation) — do not use for a multi-user login host",
             args.privsep_user
         );
     }

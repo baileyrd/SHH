@@ -28,17 +28,30 @@ use shh::transport::{ClientConfig, ServerConfig, Transport};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::Runtime;
+use tokio::task::AbortHandle;
 
-const SIZES: &[usize] = &[1 << 20, 8 << 20]; // 1 MiB, 8 MiB
+// From just above a single MAX_CHUNK (64 KiB) up to a stress size (64 MiB),
+// so the curve shows whether per-packet/window overhead is a fixed cost that
+// amortizes away at scale or a per-byte cost that holds throughput flat.
+const SIZES: &[usize] = &[64 << 10, 256 << 10, 1 << 20, 8 << 20, 32 << 20, 64 << 20];
 
 /// A TCP "sink": reads until the writer half half-closes (EOF), then writes
 /// back one ack byte. This measures one-directional bulk-push throughput
 /// (the `scp`/`get` shape) plus a negligible confirmation round trip, rather
 /// than paying to encrypt an echoed copy back.
-async fn spawn_sink() -> std::net::SocketAddr {
+///
+/// Returns the accept loop's `AbortHandle` alongside the address: with tiny
+/// payloads criterion's warm-up picks thousands of iterations, and this task
+/// (like every task `open_tunnel` spawns) would otherwise never terminate —
+/// a `direct-tcpip` connection closing does not end the underlying mux
+/// `Connection` or a listener's accept loop. Left unaborted, the listener,
+/// its ephemeral port, and the duplex buffers pile up across iterations
+/// until the process runs out of file descriptors (this is exactly what
+/// produced spurious `ConnectionReset` failures before this fix).
+async fn spawn_sink() -> (std::net::SocketAddr, AbortHandle) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         loop {
             let Ok((mut s, _)) = listener.accept().await else { return };
             tokio::spawn(async move {
@@ -53,14 +66,33 @@ async fn spawn_sink() -> std::net::SocketAddr {
                 let _ = s.write_all(&[1u8]).await;
             });
         }
-    });
-    addr
+    })
+    .abort_handle();
+    (addr, handle)
+}
+
+/// Everything a benchmark iteration must tear down once it's done: the
+/// application socket to drive the transfer over, plus every background task
+/// `open_tunnel` spawned to carry it (both `Connection::run` loops and the
+/// local-forward accept loop) — none of which exit on their own just because
+/// the one `direct-tcpip` channel they carried has closed.
+struct Tunnel {
+    app: TcpStream,
+    tasks: Vec<AbortHandle>,
+}
+
+impl Drop for Tunnel {
+    fn drop(&mut self) {
+        for t in &self.tasks {
+            t.abort();
+        }
+    }
 }
 
 /// Build a fully handshaken client/server connection pair over an in-memory
 /// duplex pipe and wire up a local forward to `target`, returning a
 /// connected application socket ready to carry bulk data through it.
-async fn open_tunnel(target: std::net::SocketAddr) -> TcpStream {
+async fn open_tunnel(target: std::net::SocketAddr) -> Tunnel {
     let (a, b) = tokio::io::duplex(4 << 20);
     let host_key = PrivateKey::generate();
     let (client_t, server_t) = tokio::join!(
@@ -69,18 +101,24 @@ async fn open_tunnel(target: std::net::SocketAddr) -> TcpStream {
     );
     let (client_t, server_t) = (client_t.unwrap(), server_t.unwrap());
 
+    let mut tasks = Vec::with_capacity(3);
+
     let server_conn = Connection::new(server_t, Policy::AllowAll);
-    tokio::spawn(async move { server_conn.run(None).await });
+    tasks.push(tokio::spawn(async move { server_conn.run(None).await }).abort_handle());
 
     let client_conn = Connection::new(client_t, Policy::DenyAll);
     let handle = client_conn.handle();
-    tokio::spawn(async move { client_conn.run(None).await });
+    tasks.push(tokio::spawn(async move { client_conn.run(None).await }).abort_handle());
 
     let local = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let local_addr = local.local_addr().unwrap();
-    tokio::spawn(serve_local_forward(local, target.ip().to_string(), target.port(), handle));
+    tasks.push(
+        tokio::spawn(serve_local_forward(local, target.ip().to_string(), target.port(), handle))
+            .abort_handle(),
+    );
 
-    TcpStream::connect(local_addr).await.unwrap()
+    let app = TcpStream::connect(local_addr).await.unwrap();
+    Tunnel { app, tasks }
 }
 
 fn bench_bulk_push(c: &mut Criterion) {
@@ -100,15 +138,20 @@ fn bench_bulk_push(c: &mut Criterion) {
                 let payload = vec![0x5au8; size];
                 let mut total = Duration::ZERO;
                 for _ in 0..iters {
-                    let sink_addr = spawn_sink().await;
-                    let mut app = open_tunnel(sink_addr).await;
+                    let (sink_addr, sink_task) = spawn_sink().await;
+                    let mut tunnel = open_tunnel(sink_addr).await;
 
                     let start = Instant::now();
-                    app.write_all(&payload).await.unwrap();
-                    app.shutdown().await.unwrap();
+                    tunnel.app.write_all(&payload).await.unwrap();
+                    tunnel.app.shutdown().await.unwrap();
                     let mut ack = [0u8; 1];
-                    app.read_exact(&mut ack).await.unwrap();
+                    tunnel.app.read_exact(&mut ack).await.unwrap();
                     total += start.elapsed();
+
+                    // Untimed: reclaim this iteration's tasks, listeners, and
+                    // duplex buffers before the next one starts.
+                    drop(tunnel);
+                    sink_task.abort();
                 }
                 total
             });

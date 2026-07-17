@@ -78,7 +78,11 @@ impl HostSigner for MonitorSigner {
 
 impl MonitorSigner {
     fn request(&self, hash: &[u8]) -> std::io::Result<Vec<u8>> {
-        let mut sock = self.sock.lock().expect("signer socket poisoned");
+        // Survive a poisoned lock rather than cascading the panic to every
+        // future connection's handshake/rekey: a bad moment on one request
+        // must not take down host-key signing for the whole daemon (matches
+        // the same fix applied to the agent's keyring mutex).
+        let mut sock = self.sock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         write_frame(&mut *sock, hash)?;
         read_frame(&mut *sock)
     }

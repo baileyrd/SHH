@@ -69,6 +69,13 @@ pub(crate) enum Cmd {
         orig_host: String,
         orig_port: u16,
         stream: BoxedIo,
+        /// Held from the moment a socket is accepted until this command is
+        /// dequeued and processed (dropped implicitly at the end of the
+        /// `on_cmd` match arm). `cmd_tx` is unbounded, so without this an
+        /// acceptor that outpaces the loop — e.g. the loop stalled on a
+        /// slow peer — would queue accepted sockets without limit. This
+        /// permit is what makes acceptance actually back off instead.
+        _permit: tokio::sync::OwnedSemaphorePermit,
     },
     /// A client asks the server to listen and forward back (`tcpip-forward`).
     RemoteForward {
@@ -120,15 +127,25 @@ pub(crate) enum ToTask {
     RequestReply(bool),
 }
 
+/// Cap on `Cmd::OpenTunnel` commands accepted-but-not-yet-processed by the
+/// loop, shared by every acceptor on a connection (`-L`, `-R`, and agent
+/// forwarding). Bounds how many already-accepted sockets can pile up when
+/// the loop is slow to drain its (unbounded, for the rest of `Cmd`) queue.
+const MAX_PENDING_OPENS: usize = 64;
+
 /// A submission handle for opening channels from outside the loop.
 #[derive(Clone)]
 pub struct Handle {
     tx: mpsc::UnboundedSender<Cmd>,
+    open_admission: Arc<Semaphore>,
 }
 
 impl Handle {
     /// Open a direct-tcpip channel (`-L`) for an accepted local connection.
-    pub fn open_direct(
+    /// Waits for admission if `MAX_PENDING_OPENS` opens are already queued,
+    /// so a stalled loop applies backpressure to the accept loop rather than
+    /// letting accepted sockets pile up unboundedly.
+    pub async fn open_direct(
         &self,
         target_host: String,
         target_port: u16,
@@ -136,6 +153,9 @@ impl Handle {
         orig_port: u16,
         stream: TcpStream,
     ) {
+        let Ok(_permit) = self.open_admission.clone().acquire_owned().await else {
+            return; // the connection is gone; nothing to open onto
+        };
         let _ = self.tx.send(Cmd::OpenTunnel {
             channel_type: "direct-tcpip",
             addr: target_host,
@@ -143,12 +163,14 @@ impl Handle {
             orig_host,
             orig_port,
             stream: Box::new(stream),
+            _permit,
         });
     }
 
     /// Open a forwarded-tcpip channel (`-R`) for a connection accepted on a
-    /// server-side listener. `addr`/`port` are the listened address.
-    pub fn open_forwarded(
+    /// server-side listener. `addr`/`port` are the listened address. See
+    /// [`Handle::open_direct`] for the admission wait.
+    pub async fn open_forwarded(
         &self,
         addr: String,
         port: u16,
@@ -156,6 +178,9 @@ impl Handle {
         orig_port: u16,
         stream: TcpStream,
     ) {
+        let Ok(_permit) = self.open_admission.clone().acquire_owned().await else {
+            return;
+        };
         let _ = self.tx.send(Cmd::OpenTunnel {
             channel_type: "forwarded-tcpip",
             addr,
@@ -163,6 +188,7 @@ impl Handle {
             orig_host,
             orig_port,
             stream: Box::new(stream),
+            _permit,
         });
     }
 
@@ -267,6 +293,8 @@ pub struct Connection<S> {
     next_id: u32,
     cmd_tx: mpsc::UnboundedSender<Cmd>,
     cmd_rx: mpsc::UnboundedReceiver<Cmd>,
+    /// Admission control for `Cmd::OpenTunnel`; see [`MAX_PENDING_OPENS`].
+    open_admission: Arc<Semaphore>,
     done: bool,
 }
 
@@ -282,6 +310,10 @@ impl<S> Drop for Connection<S> {
         for (_, ch) in self.channels.drain() {
             ch.credit.close();
         }
+        // Wake any acceptor blocked waiting for open-admission so it stops
+        // accepting for a connection that no longer exists, rather than
+        // hanging until its next accepted socket is dropped by a timeout.
+        self.open_admission.close();
     }
 }
 
@@ -353,6 +385,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
             next_id: 0,
             cmd_tx,
             cmd_rx,
+            open_admission: Arc::new(Semaphore::new(MAX_PENDING_OPENS)),
             done: false,
         }
     }
@@ -411,6 +444,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
     pub fn handle(&self) -> Handle {
         Handle {
             tx: self.cmd_tx.clone(),
+            open_admission: self.open_admission.clone(),
         }
     }
 
@@ -977,6 +1011,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
                 orig_host,
                 orig_port,
                 stream,
+                _permit,
             } => {
                 let id = self.alloc_id();
                 self.pending.insert(id, Pending::Direct(stream));
@@ -994,6 +1029,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
                     w.u32(orig_port as u32);
                 }
                 self.t.send(&w.into_bytes()).await?;
+                // `_permit` drops here, releasing this command's admission
+                // slot now that it's been fully processed.
             }
             Cmd::RemoteForward {
                 bind,
@@ -1171,6 +1208,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
             remote_max,
             rx,
             self.cmd_tx.clone(),
+            self.open_admission.clone(),
             self.session_user.clone(),
             self.force_command.clone(),
             self.permit_agent,
@@ -1272,6 +1310,44 @@ mod tests {
             Transport::server(b, ServerConfig::with_host_key(host_key)),
         );
         (c.unwrap(), s.unwrap())
+    }
+
+    /// Draining every `open_admission` permit simulates `MAX_PENDING_OPENS`
+    /// `Cmd::OpenTunnel`s already queued and unprocessed; a further acceptor
+    /// must then wait rather than pile up an unbounded number of accepted
+    /// sockets. Dropping the `Connection` must wake that waiter (via
+    /// `Semaphore::close` in `Connection::drop`) instead of leaving it
+    /// blocked forever on a connection that no longer exists.
+    #[tokio::test]
+    async fn open_admission_blocks_then_unblocks_on_connection_drop() {
+        let (client_t, _server_t) = transport_pair().await;
+        let conn = Connection::new(client_t, Policy::DenyAll);
+
+        let mut held = Vec::with_capacity(MAX_PENDING_OPENS);
+        for _ in 0..MAX_PENDING_OPENS {
+            held.push(conn.open_admission.clone().try_acquire_owned().unwrap());
+        }
+        assert!(
+            conn.open_admission.clone().try_acquire_owned().is_err(),
+            "admission should be fully drained"
+        );
+
+        let admission = conn.open_admission.clone();
+        let waiter = tokio::spawn(async move { admission.acquire_owned().await });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!waiter.is_finished(), "waiter should still be blocked on admission");
+
+        // Deliberately keep `held` alive: the point is that closing the
+        // semaphore on connection teardown wakes the waiter even though no
+        // permit was actually freed.
+        drop(conn);
+
+        let outcome = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("waiter should unblock once the connection drops")
+            .unwrap();
+        assert!(outcome.is_err(), "acquire should fail: the semaphore is closed");
     }
 
     #[tokio::test]

@@ -195,13 +195,9 @@ pub async fn serve_local_forward(
     loop {
         let (sock, peer) = listener.accept().await?;
         sock.set_nodelay(true).ok();
-        handle.open_direct(
-            target_host.clone(),
-            target_port,
-            peer.ip().to_string(),
-            peer.port(),
-            sock,
-        );
+        handle
+            .open_direct(target_host.clone(), target_port, peer.ip().to_string(), peer.port(), sock)
+            .await;
     }
 }
 
@@ -261,7 +257,9 @@ pub async fn serve_remote_listener(
             break;
         };
         sock.set_nodelay(true).ok();
-        handle.open_forwarded(addr.clone(), port, peer.ip().to_string(), peer.port(), sock);
+        handle
+            .open_forwarded(addr.clone(), port, peer.ip().to_string(), peer.port(), sock)
+            .await;
     }
 }
 

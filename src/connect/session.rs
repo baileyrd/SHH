@@ -318,6 +318,7 @@ pub(crate) async fn session_server_task(
     remote_max: u32,
     mut to_task: mpsc::UnboundedReceiver<ToTask>,
     cmd_tx: mpsc::UnboundedSender<Cmd>,
+    open_admission: Arc<Semaphore>,
     user: Option<super::UserContext>,
     force_command: Option<String>,
     permit_agent: bool,
@@ -371,7 +372,8 @@ pub(crate) async fn session_server_task(
                     } else if agent_fwd.is_some() {
                         true // one socket per session; a repeat is harmless
                     } else {
-                        agent_fwd = start_agent_listener(&cmd_tx, user.as_ref());
+                        agent_fwd =
+                            start_agent_listener(&cmd_tx, open_admission.clone(), user.as_ref());
                         agent_fwd.is_some()
                     };
                     if want_reply {
@@ -664,6 +666,7 @@ impl Drop for AgentListener {
 #[cfg(unix)]
 fn start_agent_listener(
     cmd_tx: &mpsc::UnboundedSender<Cmd>,
+    open_admission: Arc<Semaphore>,
     user: Option<&super::UserContext>,
 ) -> Option<AgentListener> {
     use rand_core::{OsRng, RngCore};
@@ -729,6 +732,9 @@ fn start_agent_listener(
                     continue;
                 }
             }
+            let Ok(_permit) = open_admission.clone().acquire_owned().await else {
+                break; // the connection is gone
+            };
             let _ = cmd_tx.send(Cmd::OpenTunnel {
                 channel_type: AGENT_CHANNEL,
                 addr: String::new(),
@@ -736,6 +742,7 @@ fn start_agent_listener(
                 orig_host: String::new(),
                 orig_port: 0,
                 stream: Box::new(stream),
+                _permit,
             });
         }
     });

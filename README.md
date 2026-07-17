@@ -374,9 +374,39 @@ enforce the `force-command` and `source-address` critical options (and fail
 closed on any other). File transfer works: `shhd` serves the **SFTP v3**
 subsystem to the standard `sftp` client (running the file server as the
 logged-in user, like OpenSSH's `sftp-server`), and `shh-sftp` is a matching
-client that also drives OpenSSH's `sftp-server`. Not
-yet implemented: real-hardware FIDO2
-on the client (needs an external
+client that also drives OpenSSH's `sftp-server`. A desktop GUI (`gui/`) and
+a native Windows client build round out the client side. Not yet
+implemented: real-hardware FIDO2 on the client (needs an external
 authenticator helper) and the fuller privsep model that also sandboxes the
 pre-auth *parsing* in its own unprivileged process. Treat it as a working
-protocol implementation, not a hardened production daemon.
+protocol implementation, not an independently audited one.
+
+Several rounds of adversarial self-review have gone into the channel/window
+accounting, connection resource limits, agent socket and passphrase
+handling, and the GUI's host-storage IPC surface since the milestones above
+first landed — see [RELEASE_NOTES.md](RELEASE_NOTES.md) for the specifics
+and [SECURITY.md](SECURITY.md) if you find something that slipped through.
+
+## Development
+
+```console
+$ cargo test                                    # unit + integration tests
+$ cargo clippy --all-targets -- -D warnings
+$ cargo bench                                    # Criterion perf suites, see benches/README.md
+```
+
+CI runs the test/clippy matrix (Linux, macOS, Windows) plus a GUI build on
+every push; see [`.github/workflows/ci.yml`](.github/workflows/ci.yml). Wire
+parsers are additionally fuzzed under `cargo-fuzz` — see
+[fuzz/README.md](fuzz/README.md). See [CONTRIBUTING.md](CONTRIBUTING.md) for
+the full dev setup, including the GUI's Node/Tauri side.
+
+## Security
+
+See [SECURITY.md](SECURITY.md) for the threat model, what's in scope, and
+how to report a vulnerability privately.
+
+## License
+
+MIT OR Apache-2.0, at your option — see [LICENSE-MIT](LICENSE-MIT) and
+[LICENSE-APACHE](LICENSE-APACHE).

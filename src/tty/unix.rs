@@ -7,6 +7,28 @@ use std::os::fd::AsFd;
 
 use nix::sys::termios::{self, LocalFlags, SetArg, Termios};
 
+/// Read one line from `r` up to (and consuming) a `\n` or EOF, returning it
+/// with any trailing `\r` stripped. Accumulates raw bytes and decodes once
+/// at the end rather than casting each byte to `char` as it arrives: a
+/// multi-byte UTF-8 character (an accented letter, a non-Latin script) typed
+/// into a passphrase would otherwise be silently corrupted byte-by-byte,
+/// making a non-ASCII passphrase impossible to enter correctly.
+fn read_line_utf8(r: &mut impl Read) -> io::Result<String> {
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        match r.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) if byte[0] == b'\n' => break,
+            Ok(_) => line.push(byte[0]),
+            Err(e) => return Err(e),
+        }
+    }
+    String::from_utf8(line)
+        .map(|s| s.trim_end_matches('\r').to_string())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "input is not valid UTF-8"))
+}
+
 pub fn read_passphrase(prompt: &str) -> io::Result<String> {
     let mut tty = File::options().read(true).write(true).open("/dev/tty")?;
     let orig = termios::tcgetattr(tty.as_fd()).map_err(io::Error::from)?;
@@ -17,35 +39,16 @@ pub fn read_passphrase(prompt: &str) -> io::Result<String> {
 
     write!(tty, "{prompt}")?;
     tty.flush()?;
-    let mut line = String::new();
-    let mut byte = [0u8; 1];
-    let result = loop {
-        match tty.read(&mut byte) {
-            Ok(0) => break Ok(line),
-            Ok(_) if byte[0] == b'\n' => break Ok(line),
-            Ok(_) => line.push(byte[0] as char),
-            Err(e) => break Err(e),
-        }
-    };
+    let result = read_line_utf8(&mut tty);
     termios::tcsetattr(tty.as_fd(), SetArg::TCSANOW, &orig).map_err(io::Error::from)?;
-    result.map(|s| s.trim_end_matches('\r').to_string())
+    result
 }
 
 pub fn prompt_line(prompt: &str) -> io::Result<String> {
     let mut tty = File::options().read(true).write(true).open("/dev/tty")?;
     write!(tty, "{prompt}")?;
     tty.flush()?;
-    let mut line = String::new();
-    let mut byte = [0u8; 1];
-    loop {
-        match tty.read(&mut byte) {
-            Ok(0) => break,
-            Ok(_) if byte[0] == b'\n' => break,
-            Ok(_) => line.push(byte[0] as char),
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(line.trim_end_matches('\r').to_string())
+    read_line_utf8(&mut tty)
 }
 
 /// Puts stdin into raw mode; restores the original settings on drop.
@@ -88,4 +91,36 @@ pub fn winsize() -> Option<(u32, u32, u32, u32)> {
         ws.ws_xpixel as u32,
         ws.ws_ypixel as u32,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn read_line_utf8_handles_ascii_and_line_endings() {
+        assert_eq!(read_line_utf8(&mut Cursor::new(b"hunter2\n")).unwrap(), "hunter2");
+        assert_eq!(read_line_utf8(&mut Cursor::new(b"hunter2\r\n")).unwrap(), "hunter2");
+        // EOF with no trailing newline still returns what was read.
+        assert_eq!(read_line_utf8(&mut Cursor::new(b"no-newline")).unwrap(), "no-newline");
+        assert_eq!(read_line_utf8(&mut Cursor::new(b"\n")).unwrap(), "");
+    }
+
+    /// The bug this guards against: casting each raw byte to `char`
+    /// corrupts any multi-byte UTF-8 character instead of decoding it.
+    #[test]
+    fn read_line_utf8_preserves_multibyte_characters() {
+        let line = "pässwörd\u{1F511}\n"; // accented Latin + a 4-byte emoji
+        assert_eq!(read_line_utf8(&mut Cursor::new(line.as_bytes())).unwrap(), "pässwörd\u{1F511}");
+
+        let cjk = "パスワード\n";
+        assert_eq!(read_line_utf8(&mut Cursor::new(cjk.as_bytes())).unwrap(), "パスワード");
+    }
+
+    #[test]
+    fn read_line_utf8_rejects_invalid_utf8() {
+        // A lone continuation byte is never valid UTF-8 on its own.
+        assert!(read_line_utf8(&mut Cursor::new(&[0x80u8, b'\n'])).is_err());
+    }
 }

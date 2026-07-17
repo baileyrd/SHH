@@ -63,6 +63,12 @@ impl<'a> Reader<'a> {
         if s.is_empty() {
             return Ok(Vec::new());
         }
+        // RFC 4251 §6: each name in the list is a non-empty identifier. A
+        // leading/trailing/doubled comma ("," / "a,,b" / "a,") would
+        // otherwise silently produce an empty element.
+        if s.split(',').any(str::is_empty) {
+            return Err(WireError::BadNameList);
+        }
         Ok(s.split(',').map(str::to_owned).collect())
     }
 

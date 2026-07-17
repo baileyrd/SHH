@@ -85,15 +85,81 @@ pub fn list_hosts(state: tauri::State<crate::AppState>) -> Vec<Host> {
     state.hosts.list()
 }
 
-#[tauri::command]
-pub fn save_host(state: tauri::State<crate::AppState>, host: Host) -> Result<Host, String> {
+/// `hostname` ends up verbatim in a known_hosts line on first contact
+/// (`client::verify_host_key` -> `keyfile::known_hosts_line`); an embedded
+/// newline would let it inject an *extra* line under a name of the
+/// attacker's choosing, poisoning the pinned key for an unrelated host.
+/// Reject control characters in every field that's rendered into a file or a
+/// session, not just hostname, since the IPC boundary is callable directly
+/// (not just through the form the UI presents).
+fn validate_host(host: &Host) -> Result<(), String> {
     if host.name.trim().is_empty() || host.hostname.trim().is_empty() || host.user.trim().is_empty() {
         return Err("name, hostname, and user are required".into());
     }
+    let fields = [&host.name, &host.hostname, &host.user]
+        .into_iter()
+        .chain(host.identity.iter());
+    if fields.flat_map(|s| s.chars()).any(|c| c.is_control()) {
+        return Err("fields may not contain control characters".into());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn save_host(state: tauri::State<crate::AppState>, host: Host) -> Result<Host, String> {
+    validate_host(&host)?;
     state.hosts.upsert(host)
 }
 
 #[tauri::command]
 pub fn delete_host(state: tauri::State<crate::AppState>, id: String) -> Result<(), String> {
     state.hosts.delete(&id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn host(hostname: &str) -> Host {
+        Host {
+            id: "1".into(),
+            name: "box".into(),
+            hostname: hostname.into(),
+            port: 22,
+            user: "me".into(),
+            identity: None,
+        }
+    }
+
+    #[test]
+    fn validate_host_rejects_a_known_hosts_injection_attempt() {
+        // A newline in `hostname` would otherwise let a saved host inject an
+        // extra known_hosts line under an attacker-chosen name.
+        assert!(validate_host(&host("evil.example\nreal.example")).is_err());
+        assert!(validate_host(&host("evil.example\rreal.example")).is_err());
+        assert!(validate_host(&host("plain.example")).is_ok());
+    }
+
+    #[test]
+    fn validate_host_rejects_control_chars_in_any_field() {
+        let mut h = host("plain.example");
+        h.name = "box\0".into();
+        assert!(validate_host(&h).is_err());
+
+        let mut h = host("plain.example");
+        h.user = "me\x1b[31m".into();
+        assert!(validate_host(&h).is_err());
+
+        let mut h = host("plain.example");
+        h.identity = Some("/home/me/.shh/id\n".into());
+        assert!(validate_host(&h).is_err());
+    }
+
+    #[test]
+    fn validate_host_requires_non_empty_core_fields() {
+        assert!(validate_host(&host("")).is_err());
+        let mut h = host("plain.example");
+        h.name = "  ".into();
+        assert!(validate_host(&h).is_err());
+    }
 }

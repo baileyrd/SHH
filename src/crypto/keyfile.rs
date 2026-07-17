@@ -176,19 +176,23 @@ pub fn encode_sk_private(
 }
 
 /// Strip PEM armor and base64.
-fn unarmor(text: &str) -> Result<Vec<u8>> {
-    let body: String = text
-        .lines()
-        .map(str::trim)
-        .skip_while(|l| *l != PEM_BEGIN)
-        .skip(1)
-        .take_while(|l| *l != PEM_END)
-        .collect();
+fn unarmor(text: &str) -> Result<Zeroizing<Vec<u8>>> {
+    // The decoded bytes hold the private seed when the file is unencrypted, so
+    // both the base64 body and the decoded output are zeroized on drop.
+    let body: Zeroizing<String> = Zeroizing::new(
+        text.lines()
+            .map(str::trim)
+            .skip_while(|l| *l != PEM_BEGIN)
+            .skip(1)
+            .take_while(|l| *l != PEM_END)
+            .collect(),
+    );
     if body.is_empty() {
         return Err(bad("not an OPENSSH PRIVATE KEY file"));
     }
     BASE64_STANDARD
-        .decode(&body)
+        .decode(body.as_bytes())
+        .map(Zeroizing::new)
         .map_err(|e| bad(format!("base64: {e}")))
 }
 

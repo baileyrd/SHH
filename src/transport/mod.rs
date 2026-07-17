@@ -43,6 +43,10 @@ const REKEY_INTERVAL: Duration = Duration::from_secs(3600);
 /// Rekey long before a sequence counter can wrap (RFC 4253 §9 requires a
 /// rekey within 2^32 packets; we stay far under it).
 const REKEY_PACKETS: u32 = 1 << 28;
+/// Cap on application packets buffered while we wait for the peer's KEXINIT
+/// during a self-initiated rekey. A peer that never replies but keeps sending
+/// data would otherwise grow this queue unbounded (up to 256 KiB per entry).
+const MAX_REKEY_QUEUE: usize = 256;
 
 /// Callback deciding whether a server host key is trusted (the TOFU path,
 /// used when the server presents a bare key rather than a certificate).
@@ -237,6 +241,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Transport<S> {
             .map_err(|e| Error::HostKey(format!("host certificate: {e}")))?;
         if cert.cert_type != CERT_TYPE_HOST {
             return Err(Error::HostKey("presented a non-host certificate".into()));
+        }
+        // The negotiated algorithm was the plain ssh-ed25519 cert; a FIDO2
+        // security-key certificate must not masquerade as a host key under it
+        // (RFC 4253 §7.1: the host key must match the negotiated algorithm).
+        if cert.sk_application.is_some() {
+            return Err(Error::HostKey(
+                "security-key certificate presented as a host key".into(),
+            ));
         }
         if !self.host_cas.contains(&cert.ca_key) {
             return Err(Error::HostKey(format!(
@@ -517,8 +529,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Transport<S> {
                     return Err(Error::proto("kex message before peer KEXINIT"));
                 }
                 // In-flight application data the peer sent before it saw
-                // our KEXINIT. Deliver it after the rekey.
-                _ => self.queued.push_back(p),
+                // our KEXINIT. Deliver it after the rekey. Bounded so a peer
+                // that withholds its KEXINIT and streams data cannot grow
+                // this queue without limit (a memory DoS).
+                _ => {
+                    if self.queued.len() >= MAX_REKEY_QUEUE {
+                        return Err(Error::proto(
+                            "peer sent too much data without completing rekey",
+                        ));
+                    }
+                    self.queued.push_back(p);
+                }
             }
         };
         self.run_kex(&ours, ours_bytes, theirs_bytes).await
@@ -588,12 +609,31 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Transport<S> {
                     self.verify_host_cert(&k_s)?
                 } else {
                     let hk = PublicKey::from_blob(&k_s)?;
-                    (self
-                        .verifier
-                        .as_mut()
-                        .expect("client always has a verifier"))(&hk)?;
+                    // Only run the (possibly interactive, TOFU) verifier on the
+                    // first exchange. On rekey we enforce continuity below.
+                    if first_kex {
+                        (self
+                            .verifier
+                            .as_mut()
+                            .expect("client always has a verifier"))(&hk)?;
+                    }
                     hk
                 };
+
+                // Host-key continuity (RFC 4253 §9): a rekey must present the
+                // key the session was established with. Re-deciding trust — or
+                // firing a TOFU prompt — mid-session would let a server rotate
+                // to any other key the verifier happens to accept.
+                if !first_kex {
+                    match &self.peer_host_key {
+                        Some(prev) if *prev == host_key => {}
+                        _ => {
+                            return Err(Error::HostKey(
+                                "host key changed during rekey".into(),
+                            ))
+                        }
+                    }
+                }
 
                 let k = eph.finish(&q_s)?;
                 let h = exchange_hash(&v_c, &v_s, i_c, i_s, &k_s, &q_c, &q_s, &k);
@@ -690,12 +730,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Transport<S> {
         let mut r = Reader::new(payload);
         r.byte()?;
         let count = r.u32()?;
-        // Each extension is two strings; stop at the packet's actual end
-        // rather than trusting the count.
+        // Each extension is exactly two strings. Consume precisely `count` of
+        // them and then require the buffer to be empty: a count that disagrees
+        // with the body (over- or under-stated) is malformed, not tolerated —
+        // the same anti-smuggling rule the wire Reader documents.
         for _ in 0..count {
-            if r.remaining() == 0 {
-                break;
-            }
             let name = r.utf8()?.to_owned();
             let value = r.string()?.to_vec();
             if name == "server-sig-algs" {
@@ -704,6 +743,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Transport<S> {
                 self.server_sig_algs = Some(value.split(',').map(str::to_owned).collect());
             }
         }
+        r.finish()?;
         Ok(())
     }
 }

@@ -262,6 +262,12 @@ impl Policy {
             tracing::info!(key_id = %cert.key_id, %user, "certificate does not list this principal");
             return None;
         }
+        if cert.principals.is_empty() {
+            tracing::warn!(
+                key_id = %cert.key_id, %user,
+                "accepting a certificate with no principals: valid for ANY login name"
+            );
+        }
         if !cert.permits_source(peer) {
             tracing::info!(key_id = %cert.key_id, ?peer, "certificate source-address does not admit this client");
             return None;

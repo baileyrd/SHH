@@ -14,6 +14,7 @@
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 use crate::wire::{Reader, Writer};
 use crate::{Error, Result};
@@ -162,8 +163,8 @@ impl SoftwareKey {
         }
     }
 
-    pub fn seed(&self) -> [u8; 32] {
-        self.signing.to_bytes()
+    pub fn seed(&self) -> Zeroizing<[u8; 32]> {
+        Zeroizing::new(self.signing.to_bytes())
     }
 
     pub fn application(&self) -> &str {
@@ -225,7 +226,7 @@ mod tests {
     #[test]
     fn seed_round_trips() {
         let key = SoftwareKey::generate("ssh:");
-        let same = SoftwareKey::from_seed(key.seed(), key.application());
+        let same = SoftwareKey::from_seed(*key.seed(), key.application());
         assert_eq!(same.public(), key.public());
     }
 
@@ -256,7 +257,7 @@ mod tests {
         // not verify each other's assertions (the app is hashed into the
         // signed data).
         let a = SoftwareKey::generate("ssh:");
-        let b = SoftwareKey::from_seed(a.seed(), "ssh:other");
+        let b = SoftwareKey::from_seed(*a.seed(), "ssh:other");
         let sig = b.sign(b"m", true);
         assert!(a.public().verify(b"m", &sig).is_err());
     }

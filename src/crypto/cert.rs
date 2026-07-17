@@ -295,8 +295,11 @@ impl Certificate {
     }
 
     /// Is `now` (seconds since the Unix epoch) within the validity window?
+    /// `valid_before` is exclusive, matching OpenSSH (`valid_after <= now <
+    /// valid_before`), so a cert is not honored for the extra second at its
+    /// stated expiry.
     pub fn valid_at(&self, now: u64) -> bool {
-        now >= self.valid_after && now <= self.valid_before
+        now >= self.valid_after && now < self.valid_before
     }
 
     /// Does this cert authorize logging in as `principal`? An empty
@@ -520,8 +523,9 @@ mod tests {
         let (_ca, _user, blob) = user_cert(&["x"], 100, 200);
         let cert = Certificate::parse_and_verify(&blob).unwrap();
         assert!(!cert.valid_at(99));
-        assert!(cert.valid_at(100));
-        assert!(cert.valid_at(200));
+        assert!(cert.valid_at(100)); // valid_after is inclusive
+        assert!(cert.valid_at(199));
+        assert!(!cert.valid_at(200)); // valid_before is exclusive (OpenSSH)
         assert!(!cert.valid_at(201));
     }
 

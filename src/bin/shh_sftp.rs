@@ -79,6 +79,15 @@ fn basename(path: &str) -> &str {
     path.rsplit('/').next().filter(|s| !s.is_empty()).unwrap_or(path)
 }
 
+/// Replace control characters in a server-supplied string before printing it,
+/// so a malicious or compromised server cannot inject terminal escape
+/// sequences (title/clipboard writes, display spoofing) via crafted filenames.
+fn sanitize_terminal(s: &str) -> String {
+    s.chars()
+        .map(|c| if c == '\t' || (!c.is_control()) { c } else { '?' })
+        .collect()
+}
+
 /// The Unix mode bits to record for an uploaded file: the local file's own on
 /// Unix, a sensible default elsewhere (Windows has no Unix permission bits).
 #[cfg(unix)]
@@ -109,7 +118,7 @@ where
             let mut entries = client.list(&path).await.map_err(e)?;
             entries.sort_by(|a, b| a.name.cmp(&b.name));
             for ent in entries {
-                println!("{}", ent.long_name);
+                println!("{}", sanitize_terminal(&ent.long_name));
             }
         }
         Cmd::Get { remote, local } => {

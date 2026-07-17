@@ -165,7 +165,10 @@ fn dispatch(sess: &mut Session, typ: u8, id: u32, r: &mut Reader) -> Result<(u8,
         fxp::READ => {
             let handle = r.utf8()?;
             let offset = r.u64()?;
-            let len = r.u32()?.min(MAX_PACKET) as usize;
+            // Reserve headroom for the DATA frame's header (id + length +
+            // type byte) so the reply never exceeds MAX_PACKET, which a
+            // conformant peer — including our own read_packet — would reject.
+            let len = r.u32()?.min(MAX_PACKET - 1024) as usize;
             match sess.handles.get(handle) {
                 Some(Handle::File(f)) => {
                     let mut buf = vec![0u8; len];

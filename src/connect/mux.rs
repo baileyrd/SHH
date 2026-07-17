@@ -28,7 +28,7 @@ use super::forward::{self, Policy};
 use super::session::{self, SessionSpec};
 use super::{
     chan, data_packet, ext_data_packet, open_failure, simple, window_adjust, LOCAL_WINDOW,
-    MAX_CHUNK, WINDOW_REFILL,
+    MAX_CHUNK, WINDOW_MAX, WINDOW_REFILL,
 };
 use crate::transport::Transport;
 use crate::wire::{disconnect, msg, Reader, Writer};
@@ -275,6 +275,12 @@ impl<S> Drop for Connection<S> {
         // Stop any server-side remote-forward listeners with the connection.
         for (_, h) in self.listeners.drain() {
             h.abort();
+        }
+        // Wake any per-channel task blocked on send-window credit so it can
+        // observe teardown and unwind, instead of hanging on the socket /
+        // child process it owns.
+        for (_, ch) in self.channels.drain() {
+            ch.credit.close();
         }
     }
 }
@@ -667,16 +673,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         });
     }
 
-    /// Find the local target for a `forwarded-tcpip` open, matching the exact
-    /// (address, port) first and falling back to any forward on that port.
+    /// Find the local target for a `forwarded-tcpip` open. Matches the exact
+    /// (address, port) the client requested, then a wildcard bind on that
+    /// port. It deliberately does *not* fall back to an arbitrary forward on
+    /// the same port bound under a different address, which would let a server
+    /// steer a reverse connection to the wrong local target.
     fn lookup_remote(&self, addr: &str, port: u16) -> Option<(String, u16)> {
         if let Some(t) = self.remote_forwards.get(&(addr.to_string(), port)) {
             return Some(t.clone());
         }
-        self.remote_forwards
-            .iter()
-            .find(|((_, p), _)| *p == port)
-            .map(|(_, v)| v.clone())
+        for wild in ["", "0.0.0.0", "::", "*"] {
+            if let Some(t) = self.remote_forwards.get(&(wild.to_string(), port)) {
+                return Some(t.clone());
+            }
+        }
+        None
     }
 
     async fn reject_open(&mut self, peer: u32, reason: u32, desc: &str) -> Result<()> {
@@ -759,7 +770,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         let id = r.u32()?;
         let add = r.u32()?;
         if let Some(ch) = self.channels.get(&id) {
-            ch.credit.add_permits(add as usize);
+            // RFC 4254 caps the send window at 2^32-1. Clamp additions to that
+            // ceiling — and to what the semaphore itself can hold — so a peer
+            // cannot drive the tokio Semaphore past `Semaphore::MAX_PERMITS`,
+            // which would panic the process.
+            let ceiling = (WINDOW_MAX as usize).min(Semaphore::MAX_PERMITS);
+            let current = ch.credit.available_permits();
+            let headroom = ceiling.saturating_sub(current);
+            let grant = (add as usize).min(headroom);
+            if grant > 0 {
+                ch.credit.add_permits(grant);
+            }
         }
         Ok(())
     }
@@ -906,7 +927,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
             actual,
             self.handle(),
         ));
-        self.listeners.insert((addr, actual), task.abort_handle());
+        let handle = task.abort_handle();
+        // Index under the actual allocated port, and — for a port-0 request —
+        // also under the requested port so `cancel-tcpip-forward` keyed on the
+        // originally requested (bind, 0) still finds the listener.
+        if req_port != actual {
+            self.listeners.insert((addr.clone(), req_port), handle.clone());
+        }
+        self.listeners.insert((addr, actual), handle);
         Ok(())
     }
 
@@ -1095,7 +1123,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         is_session: bool,
         end_on_close: bool,
     ) -> (Arc<Semaphore>, u32, mpsc::UnboundedReceiver<ToTask>) {
-        let credit = Arc::new(Semaphore::new(peer_window as usize));
+        // Clamp the initial window to what the semaphore can hold; on a 32-bit
+        // target `Semaphore::MAX_PERMITS` (2^29) is below a u32 window, so a
+        // peer's CHANNEL_OPEN could otherwise advertise a value that panics.
+        let credit = Arc::new(Semaphore::new(
+            (peer_window as usize).min(Semaphore::MAX_PERMITS),
+        ));
         let (to_task_tx, to_task_rx) = mpsc::unbounded_channel();
         self.channels.insert(
             id,
@@ -1172,6 +1205,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         let terminal = match self.channels.get(&id) {
             Some(ch) if ch.sent_close && ch.peer_closed => {
                 let terminal = ch.end_on_close;
+                // Closing the semaphore wakes a task blocked in
+                // `acquire_many` on the peer's exhausted send window, so it
+                // returns `Err` and unwinds rather than leaking.
+                ch.credit.close();
                 self.channels.remove(&id);
                 terminal
             }

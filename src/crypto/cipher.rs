@@ -299,11 +299,15 @@ impl PacketCipher for GcmCipher {
     }
 
     fn open(&mut self, _seq: u32, first4: [u8; 4], body: &mut [u8]) -> Result<Vec<u8>> {
-        let nonce = self.bump();
+        // Decrypt with the current nonce and only advance the invocation
+        // counter once authentication succeeds, so a failed/forged packet
+        // leaves the receive IV untouched rather than desynced.
+        let nonce = self.iv;
         let (ct, tag) = body.split_at_mut(body.len() - TAG_LEN);
         self.cipher
             .decrypt_in_place_detached((&nonce).into(), &first4, ct, (&*tag).into())
             .map_err(|_| Error::Crypto("packet authentication failed"))?;
+        let _ = self.bump();
         unpad(ct)
     }
 }

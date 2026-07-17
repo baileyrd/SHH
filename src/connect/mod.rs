@@ -34,6 +34,9 @@ pub(crate) const LOCAL_WINDOW: u32 = 2 * 1024 * 1024;
 pub(crate) const MAX_CHUNK: u32 = 32 * 1024;
 /// Re-grant the window when the peer has consumed half of it.
 pub(crate) const WINDOW_REFILL: u32 = LOCAL_WINDOW / 2;
+/// RFC 4254 upper bound on a channel window; the send-credit semaphore is
+/// never grown past this so it cannot exceed `Semaphore::MAX_PERMITS`.
+pub(crate) const WINDOW_MAX: u32 = u32::MAX;
 
 pub(crate) const STDERR: u32 = 1; // SSH_EXTENDED_DATA_STDERR
 

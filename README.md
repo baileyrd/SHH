@@ -339,7 +339,7 @@ Verified against OpenSSH 9.6 in both directions (`ssh → shhd` and
 KEX active. OpenSSH ≥ 9.9 also negotiates the post-quantum
 `mlkem768x25519-sha256`; SHH↔SHH always uses it. Keys are standard
 `openssh-key-v1` files: `ssh-keygen` and `shh-keygen` output is mutually
-readable (unencrypted keys for now).
+readable, including passphrase-protected keys (bcrypt + AES-256-CTR).
 
 ## Status
 

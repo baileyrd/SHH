@@ -70,8 +70,12 @@ pub fn generate_identity(name: String, passphrase: Option<String>) -> Result<Ide
     }
 
     let key = PrivateKey::generate();
-    let passphrase = passphrase.filter(|p| !p.is_empty());
-    let encoded = keyfile::encode_private_protected(&key, "", passphrase.as_deref())
+    // Hold the passphrase in a zeroize-on-drop buffer so it does not linger in
+    // freed heap memory, matching the core crate's handling of key material.
+    let passphrase = passphrase
+        .filter(|p| !p.is_empty())
+        .map(zeroize::Zeroizing::new);
+    let encoded = keyfile::encode_private_protected(&key, "", passphrase.as_deref().map(|s| s.as_str()))
         .map_err(|e| e.to_string())?;
     let pub_line = keyfile::encode_public(&key.public(), "");
 

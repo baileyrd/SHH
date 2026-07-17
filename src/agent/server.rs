@@ -15,7 +15,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use zeroize::Zeroizing;
 
 use super::{num, read_frame, write_frame};
-use crate::crypto::cert::{Certificate, CERT_ALGO};
+use crate::crypto::cert::{now_secs as cert_now_secs, Certificate, CERT_ALGO, CERT_TYPE_HOST};
 use crate::crypto::ed25519::{PrivateKey, PublicKey, ALGO};
 use crate::wire::{Reader, Writer};
 use crate::Result;
@@ -56,7 +56,8 @@ struct Stored {
 struct Binding {
     host_key: Vec<u8>,
     session_id: Vec<u8>,
-    #[allow(dead_code)]
+    /// True if this hop forwarded the agent onward. A binding that did not
+    /// forward may only be the final hop of a proven path.
     is_forwarding: bool,
 }
 
@@ -98,7 +99,7 @@ impl Keyring {
     /// Answer one request frame on connection `conn`. Malformed input earns
     /// FAILURE, never a panic and never a half-applied mutation.
     pub fn handle(&self, conn: &mut ConnState, req: &[u8]) -> Vec<u8> {
-        let mut state = self.state.lock().expect("keyring lock poisoned");
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         state.purge_expired();
         let Some((&op, body)) = req.split_first() else {
             return failure();
@@ -138,7 +139,7 @@ impl Keyring {
 
     /// How many identities are currently held (expired ones excluded).
     pub fn len(&self) -> usize {
-        let mut state = self.state.lock().expect("keyring lock poisoned");
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         state.purge_expired();
         state.keys.len()
     }
@@ -176,6 +177,14 @@ impl ConnState {
         if self.bindings.iter().any(|b| b.session_id == session_id) {
             return None;
         }
+        // A non-forwarding binding is the endpoint of a path: once one is
+        // recorded, no further hop may be added on top of it. This is what
+        // makes an intermediate `is_forwarding` flag mean "traffic actually
+        // traversed this hop" — without it a client holding independent
+        // direct connections could forge a multi-hop path (OpenSSH's rule).
+        if self.bindings.last().is_some_and(|b| !b.is_forwarding) {
+            return None;
+        }
         self.bindings.push(Binding {
             host_key: host_blob.to_vec(),
             session_id: session_id.to_vec(),
@@ -191,9 +200,13 @@ fn hop_lists_key(hop: &Hop, blob: &[u8]) -> bool {
     let target = underlying_key(blob);
     hop.keys.iter().any(|(entry, is_ca)| {
         if *is_ca {
-            // The bound host presented a certificate signed by this CA.
+            // The bound host presented a *host* certificate signed by this CA
+            // and still inside its validity window. Without the type/validity
+            // check a leaked user certificate — or an expired host cert —
+            // signed by the same CA would count as "a host under this CA".
             Certificate::parse_and_verify(blob)
                 .ok()
+                .filter(|c| c.cert_type == CERT_TYPE_HOST && c.valid_at(cert_now_secs()))
                 .zip(underlying_key(entry))
                 .map(|(c, ca)| ca.0 == c.ca_key.0)
                 .unwrap_or(false)
@@ -446,29 +459,47 @@ where
     Ok(())
 }
 
-/// Bind the agent's Unix socket: parent directory 0700, socket 0600, and a
-/// stale socket file from a dead agent is replaced while a live one is
-/// respected.
+/// Bind the agent's Unix socket. Any directory this call *creates* is made
+/// 0700; a pre-existing parent (e.g. `/tmp`) is left untouched. The socket is
+/// created 0600 with no world-accessible window (umask forced to 0o177 across
+/// the bind), and a stale socket is replaced only when it is a socket owned by
+/// the current user — never an arbitrary file or another user's socket.
 #[cfg(unix)]
 pub async fn bind(path: &std::path::Path) -> Result<tokio::net::UnixListener> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-        std::fs::create_dir_all(dir)?;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-    }
-    if path.exists() {
-        match tokio::net::UnixStream::connect(path).await {
-            Ok(_) => {
-                return Err(crate::Error::Agent(format!(
-                    "an agent is already listening on {}",
-                    path.display()
-                )))
-            }
-            Err(_) => std::fs::remove_file(path)?,
+        if !dir.exists() {
+            // We are creating the directory, so it is ours to lock down. A
+            // directory that already existed keeps its own permissions.
+            std::fs::create_dir_all(dir)?;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
         }
     }
-    let listener = tokio::net::UnixListener::bind(path)?;
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        // Only touch a genuine leftover: a socket we own. Anything else
+        // (regular file, symlink, another user's socket) is left in place and
+        // the bind below fails loudly rather than silently clobbering it.
+        let ours = meta.file_type().is_socket()
+            && meta.uid() == unsafe { libc::getuid() };
+        if ours {
+            match tokio::net::UnixStream::connect(path).await {
+                Ok(_) => {
+                    return Err(crate::Error::Agent(format!(
+                        "an agent is already listening on {}",
+                        path.display()
+                    )))
+                }
+                Err(_) => std::fs::remove_file(path)?,
+            }
+        }
+    }
+    // Force a restrictive umask around bind so the socket is never briefly
+    // world/group accessible before the explicit chmod.
+    let prev_umask = unsafe { libc::umask(0o177) };
+    let bound = tokio::net::UnixListener::bind(path);
+    unsafe { libc::umask(prev_umask) };
+    let listener = bound?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     Ok(listener)
 }
@@ -805,10 +836,12 @@ mod tests {
         assert!(!constraints[1].from.keys.is_empty(), "second hop is not from origin");
     }
 
-    /// Bind `host` (with a fresh session id keyed by `seed`) on `c`.
-    async fn bind(c: &mut Client, host: &PrivateKey, seed: u8) {
+    /// Bind `host` (with a fresh session id keyed by `seed`) on `c`. A hop that
+    /// forwards the agent onward sets `forwarding`; only the final hop of a
+    /// path is non-forwarding (OpenSSH's rule, enforced in `session_bind`).
+    async fn bind(c: &mut Client, host: &PrivateKey, seed: u8, forwarding: bool) {
         let sid = [seed; 32];
-        c.session_bind(&host.public().to_blob(), &sid, &host.sign(&sid), false)
+        c.session_bind(&host.public().to_blob(), &sid, &host.sign(&sid), forwarding)
             .await
             .unwrap();
     }
@@ -833,32 +866,55 @@ mod tests {
 
         // The full chain A→B: permitted (this is the point of the path).
         let mut full = client_for(&kr);
-        bind(&mut full, &a, 1).await;
-        bind(&mut full, &b, 2).await;
+        bind(&mut full, &a, 1, true).await;
+        bind(&mut full, &b, 2, false).await;
         full.sign(&blob, b"d").await.unwrap();
 
         // At the first hop alone: still permitted (the key authenticates to A
         // to make the hop in the first place).
         let mut at_a = client_for(&kr);
-        bind(&mut at_a, &a, 3).await;
+        bind(&mut at_a, &a, 3, false).await;
         at_a.sign(&blob, b"d").await.unwrap();
 
         // Straight to B without going through A: refused.
         let mut skip = client_for(&kr);
-        bind(&mut skip, &b, 4).await;
+        bind(&mut skip, &b, 4, false).await;
         assert!(skip.sign(&blob, b"d").await.is_err());
 
         // A then a *different* second hop: refused.
         let mut wrong = client_for(&kr);
-        bind(&mut wrong, &a, 5).await;
-        bind(&mut wrong, &c, 6).await;
+        bind(&mut wrong, &a, 5, true).await;
+        bind(&mut wrong, &c, 6, false).await;
         assert!(wrong.sign(&blob, b"d").await.is_err());
 
         // The hops out of order (B then A): refused.
         let mut reversed = client_for(&kr);
-        bind(&mut reversed, &b, 7).await;
-        bind(&mut reversed, &a, 8).await;
+        bind(&mut reversed, &b, 7, true).await;
+        bind(&mut reversed, &a, 8, false).await;
         assert!(reversed.sign(&blob, b"d").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn non_forwarding_hop_cannot_be_followed_by_another() {
+        // A binding that did not forward the agent is an endpoint: OpenSSH
+        // refuses to record a further hop on top of it, so a client cannot
+        // forge a multi-hop path out of independent direct connections.
+        let (_adder, kr) = spawn_agent();
+        let a = PrivateKey::generate();
+        let b = PrivateKey::generate();
+        let mut c = client_for(&kr);
+
+        let sid_a = [1u8; 32];
+        // First hop is *not* forwarding.
+        c.session_bind(&a.public().to_blob(), &sid_a, &a.sign(&sid_a), false)
+            .await
+            .unwrap();
+        // A second bind on top of it must be rejected.
+        let sid_b = [2u8; 32];
+        assert!(c
+            .session_bind(&b.public().to_blob(), &sid_b, &b.sign(&sid_b), false)
+            .await
+            .is_err());
     }
 
     #[tokio::test]

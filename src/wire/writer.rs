@@ -40,7 +40,11 @@ impl Writer {
     }
 
     pub fn string(&mut self, v: &[u8]) -> &mut Self {
-        self.u32(v.len() as u32);
+        // An SSH string length is a u32. A buffer past that ceiling can only be
+        // a local programming error (network packets are capped far below it);
+        // fail loudly rather than wrap the length and emit a corrupt encoding.
+        let len = u32::try_from(v.len()).expect("wire string exceeds u32 length");
+        self.u32(len);
         self.buf.extend_from_slice(v);
         self
     }
@@ -68,7 +72,8 @@ impl Writer {
             return self.u32(0);
         }
         let sign = (v[0] & 0x80 != 0) as u32;
-        self.u32(v.len() as u32 + sign);
+        let len = u32::try_from(v.len()).expect("wire mpint exceeds u32 length");
+        self.u32(len + sign);
         if sign == 1 {
             self.buf.push(0);
         }

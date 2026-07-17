@@ -56,6 +56,12 @@ struct Args {
     #[arg(short = 'H', long = "host")]
     host: bool,
 
+    /// Mint a user certificate with an empty principal list, valid for *any*
+    /// login name. Off by default: an all-users credential should be a
+    /// deliberate choice, not the result of forgetting `-n`.
+    #[arg(long = "allow-any-principal")]
+    allow_any_principal: bool,
+
     /// Certificate validity in days from now.
     #[arg(long = "days", default_value_t = 365)]
     days: u64,
@@ -81,10 +87,9 @@ fn choose_passphrase(flag: Option<String>) -> std::io::Result<Option<String>> {
     if !Path::new("/dev/tty").exists() {
         return Ok(None);
     }
-    let first = match shh::tty::read_passphrase("Enter passphrase (empty for none): ") {
-        Ok(p) => p,
-        Err(_) => return Ok(None),
-    };
+    // A terminal exists (checked above), so a read error here is a real
+    // failure — propagate it instead of silently writing an unencrypted key.
+    let first = shh::tty::read_passphrase("Enter passphrase (empty for none): ")?;
     if first.is_empty() {
         return Ok(None);
     }
@@ -139,6 +144,13 @@ fn sign_certificate(args: &Args, ca_path: &Path) -> std::io::Result<()> {
         .collect();
     if args.host && principals.is_empty() {
         eprintln!("shh-keygen: a host certificate needs at least one hostname (-n)");
+        std::process::exit(1);
+    }
+    if !args.host && principals.is_empty() && !args.allow_any_principal {
+        eprintln!(
+            "shh-keygen: a user certificate needs at least one principal (-n); \
+             pass --allow-any-principal to mint an any-user certificate on purpose"
+        );
         std::process::exit(1);
     }
     let now = cert::now_secs();

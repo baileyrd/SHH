@@ -25,7 +25,12 @@ jobs:
       - name: Build
         run: cargo build --all-targets
       - name: Test
-        run: cargo test --all-targets
+        # Deliberately not --all-targets: that would include the criterion
+        # benches, and `cargo test` executes a harness=false bench binary's
+        # real main() (a full multi-sample measurement run) rather than
+        # skipping it. `cargo build --all-targets` above already compile-checks
+        # them; running the actual benchmarks belongs to `cargo bench`, by hand.
+        run: cargo test
 
   lint:
     name: clippy

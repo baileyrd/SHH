@@ -59,7 +59,18 @@ pub fn list_identities() -> Vec<IdentityInfo> {
 #[tauri::command]
 pub fn generate_identity(name: String, passphrase: Option<String>) -> Result<IdentityInfo, String> {
     let name = name.trim();
-    if name.is_empty() || name.contains('/') || name.contains('\\') {
+    // Reject `.`/`..` explicitly rather than relying on the `path.exists()`
+    // check below to incidentally catch them: `..` resolves outside
+    // `shh_home()` (to its parent, i.e. the user's home directory), and
+    // that check only happens to block it today because the parent
+    // directory itself exists -- a coincidence a future refactor of that
+    // check could silently break.
+    if name.is_empty()
+        || name.contains('/')
+        || name.contains('\\')
+        || name == "."
+        || name == ".."
+    {
         return Err("invalid file name".into());
     }
     let dir = shh_home();
@@ -103,4 +114,17 @@ pub fn generate_identity(name: String, passphrase: Option<String>) -> Result<Ide
         name: name.to_string(),
         fingerprint: key.public().fingerprint(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generate_identity_rejects_dot_and_dotdot() {
+        assert!(generate_identity(".".into(), None).is_err());
+        assert!(generate_identity("..".into(), None).is_err());
+        assert!(generate_identity("/etc/passwd".into(), None).is_err());
+        assert!(generate_identity("a/../../etc".into(), None).is_err());
+    }
 }

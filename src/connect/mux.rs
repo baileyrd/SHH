@@ -256,6 +256,18 @@ enum PendingGlobal {
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 const KEEPALIVE_MAX_MISSED: u32 = 3;
 
+/// Ceiling on a single outbound TCP connect for a `direct-tcpip`/
+/// `forwarded-tcpip` open. Without it, a peer directing us at a
+/// black-holed address ties up a connect task (and its pending channel
+/// slot) for the OS's SYN-retry ceiling, often well over a minute.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Cap on channels (pending + established) an authenticated peer may have
+/// open on one connection at a time, so a peer opening channels faster than
+/// they're serviced (e.g. many direct-tcpip opens to unreachable targets)
+/// can't exhaust file descriptors or memory without bound.
+const MAX_CHANNELS: usize = 256;
+
 /// The connection loop.
 pub struct Connection<S> {
     t: Transport<S>,
@@ -557,6 +569,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         let window = r.u32()?;
         let max = r.u32()?;
 
+        if self.channels.len() + self.pending.len() >= MAX_CHANNELS {
+            tracing::info!(%kind, "channel open refused: at MAX_CHANNELS");
+            return self
+                .reject_open(sender, open_failure::ADMINISTRATIVELY_PROHIBITED, "too many open channels")
+                .await;
+        }
+
         match kind.as_str() {
             // Serving sessions means child processes and ptys — Unix
             // machinery. A Windows build acts only as a client, so an
@@ -652,11 +671,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
     }
 
     /// Connect out to `host:port` in a task (so a slow SYN can't stall the
-    /// loop), reporting the result back as [`Cmd::Connected`].
+    /// loop), reporting the result back as [`Cmd::Connected`]. Bounded by
+    /// [`CONNECT_TIMEOUT`]: without it, a peer directing us at a black-holed
+    /// address ties up this task (and the channel slot it's pending on) for
+    /// the OS's SYN-retry ceiling, often well over a minute.
     fn spawn_connect(&self, peer_id: u32, peer_window: u32, peer_max: u32, host: String, port: u16) {
         let cmd_tx = self.cmd_tx.clone();
         tokio::spawn(async move {
-            let stream = TcpStream::connect((host.as_str(), port)).await;
+            let stream = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect((host.as_str(), port))).await {
+                Ok(result) => result,
+                Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timed out")),
+            };
             if let Ok(s) = &stream {
                 s.set_nodelay(true).ok();
             }
@@ -1348,6 +1373,106 @@ mod tests {
             .expect("waiter should unblock once the connection drops")
             .unwrap();
         assert!(outcome.is_err(), "acquire should fail: the semaphore is closed");
+    }
+
+    /// A peer opening channels faster than they're serviced (e.g. many
+    /// direct-tcpip opens to unreachable targets) must eventually be refused
+    /// rather than let `pending`/`channels` grow without bound.
+    #[tokio::test]
+    async fn channel_open_refused_past_max_channels() {
+        let (client_t, mut server_t) = transport_pair().await;
+        let mut conn = Connection::new(client_t, Policy::AllowAll);
+
+        // Fill to the cap with cheap dummy pending entries.
+        for i in 0..MAX_CHANNELS {
+            let (_keep, filler) = tokio::io::duplex(1);
+            conn.pending.insert(i as u32, Pending::Direct(Box::new(filler)));
+        }
+
+        let mut w = Writer::new();
+        w.byte(msg::CHANNEL_OPEN);
+        w.utf8("direct-tcpip");
+        w.u32(9999);
+        w.u32(LOCAL_WINDOW);
+        w.u32(MAX_CHUNK);
+        w.utf8("127.0.0.1");
+        w.u32(1);
+        w.utf8("orig");
+        w.u32(1);
+        conn.on_channel_open(&w.into_bytes()).await.unwrap();
+
+        let reply = server_t.recv().await.unwrap();
+        assert_eq!(reply[0], msg::CHANNEL_OPEN_FAILURE, "should refuse past MAX_CHANNELS");
+    }
+
+    /// A peer's CHANNEL_WINDOW_ADJUST is attacker-controlled; a naive
+    /// `add_permits` would let repeated near-`u32::MAX` adjusts drive the
+    /// tokio `Semaphore` past `Semaphore::MAX_PERMITS`, which panics the
+    /// process. The clamp in `on_window_adjust` must hold under repeated
+    /// oversized grants, not just a single one.
+    #[tokio::test]
+    async fn window_adjust_never_exceeds_semaphore_max_permits() {
+        let (client_t, _server_t) = transport_pair().await;
+        let mut conn = Connection::new(client_t, Policy::DenyAll);
+        let (credit, _, _rx) = conn.insert_chan(1, 100, 0, false, false);
+
+        for _ in 0..4 {
+            let mut w = Writer::new();
+            w.byte(msg::CHANNEL_WINDOW_ADJUST);
+            w.u32(1);
+            w.u32(u32::MAX);
+            conn.on_window_adjust(&w.into_bytes()).unwrap();
+            assert!(credit.available_permits() <= Semaphore::MAX_PERMITS);
+        }
+    }
+
+    /// The per-channel send-credit `Semaphore` must be closed once its
+    /// channel is fully closed (both directions), not just when the whole
+    /// connection drops: a task blocked in `acquire_many` on an exhausted
+    /// window must wake and unwind instead of leaking its socket/child
+    /// process on a channel that's gone but the connection lives on.
+    #[tokio::test]
+    async fn channel_close_wakes_a_task_blocked_on_exhausted_credit() {
+        let (client_t, _server_t) = transport_pair().await;
+        let mut conn = Connection::new(client_t, Policy::DenyAll);
+        let (credit, _, _rx) = conn.insert_chan(1, 100, 0, false, false); // zero window
+
+        let waiter_credit = credit.clone();
+        let waiter = tokio::spawn(async move { waiter_credit.acquire_many(1).await.map(|_| ()) });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!waiter.is_finished(), "waiter should be blocked: the window is exhausted");
+
+        // Mark the channel fully closed on both sides so close_if_done
+        // actually removes it -- exercising the same path a real
+        // CHANNEL_CLOSE exchange takes.
+        conn.channels.get_mut(&1).unwrap().sent_close = true;
+        conn.channels.get_mut(&1).unwrap().peer_closed = true;
+        conn.close_if_done(1).await.unwrap();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("waiter should unblock once the channel closes")
+            .unwrap();
+        assert!(outcome.is_err(), "acquire should fail: the credit semaphore is closed");
+    }
+
+    /// Isolates the exact timeout-wrapping pattern `spawn_connect` uses (a
+    /// connect that never resolves must still report failure rather than
+    /// tying up its task and channel slot forever) from real network timing:
+    /// a black-holed address isn't a reliable test target in every
+    /// environment (some route everything, including reserved ranges, in
+    /// milliseconds). A future that never completes on its own stands in for
+    /// a stalled connect; Tokio's paused-clock `advance` fires the timeout
+    /// without waiting the real `CONNECT_TIMEOUT`.
+    #[tokio::test(start_paused = true)]
+    async fn connect_timeout_wrapping_fires_on_a_stalled_connect() {
+        let task = tokio::spawn(async {
+            tokio::time::timeout(CONNECT_TIMEOUT, std::future::pending::<std::io::Result<()>>()).await
+        });
+        tokio::time::advance(CONNECT_TIMEOUT + Duration::from_secs(1)).await;
+        let result = task.await.unwrap();
+        assert!(result.is_err(), "timeout must fire when the connect never resolves");
     }
 
     #[tokio::test]

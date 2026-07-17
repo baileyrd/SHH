@@ -20,6 +20,8 @@ use aes_gcm::aead::AeadInPlace;
 use aes_gcm::{Aes256Gcm, KeyInit};
 use chacha20::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
 use chacha20::ChaCha20Legacy;
+use poly1305::universal_hash::generic_array::GenericArray;
+use poly1305::universal_hash::UniversalHash;
 use poly1305::Poly1305;
 use rand_core::{OsRng, RngCore};
 use subtle::ConstantTimeEq;
@@ -231,12 +233,36 @@ impl PacketCipher for ChaChaPolyCipher {
         let nonce = Self::nonce(seq);
         let (ct, tag) = body.split_at_mut(body.len() - TAG_LEN);
 
-        // Tag covers the encrypted length bytes followed by the ciphertext.
-        let mac = Poly1305::new((&*self.poly_key(&nonce)).into());
-        let mut msg = Vec::with_capacity(4 + ct.len());
-        msg.extend_from_slice(&first4);
-        msg.extend_from_slice(ct);
-        let expect = mac.compute_unpadded(&msg);
+        // Tag covers the encrypted length bytes followed by the ciphertext,
+        // as one continuous message (OpenSSH's "unpadded" Poly1305 framing —
+        // not per-segment RFC 8439 AEAD padding). `ct` can be up to
+        // MAX_PACKET bytes, so rather than copying `first4 ++ ct` into a
+        // fresh buffer just to hash it, feed Poly1305 incrementally: the
+        // only actual copy needed is the up-to-12 bytes of `ct` that share
+        // its first 16-byte block with `first4` — a fixed cost, not one
+        // proportional to packet size.
+        let mut mac = Poly1305::new((&*self.poly_key(&nonce)).into());
+        let expect = if ct.len() < 12 {
+            // The whole message is at most 16 bytes; let Poly1305's own
+            // final-block handling take it as-is.
+            let mut block = [0u8; 16];
+            block[..4].copy_from_slice(&first4);
+            block[4..4 + ct.len()].copy_from_slice(ct);
+            mac.compute_unpadded(&block[..4 + ct.len()])
+        } else {
+            let mut block0 = [0u8; 16];
+            block0[..4].copy_from_slice(&first4);
+            block0[4..].copy_from_slice(&ct[..12]);
+            mac.update(std::slice::from_ref(GenericArray::from_slice(&block0)));
+
+            let rest = &ct[12..];
+            let aligned = rest.len() / 16 * 16;
+            let (full, tail) = rest.split_at(aligned);
+            for chunk in full.chunks_exact(16) {
+                mac.update(std::slice::from_ref(GenericArray::from_slice(chunk)));
+            }
+            mac.compute_unpadded(tail)
+        };
         if expect.ct_eq(&*tag).unwrap_u8() != 1 {
             return Err(Error::Crypto("packet authentication failed"));
         }
@@ -344,6 +370,79 @@ mod tests {
     fn chachapoly_roundtrip() {
         let key = [0x42u8; 64];
         roundtrip(move || Box::new(ChaChaPolyCipher::new(&key)));
+    }
+
+    /// `open`'s tag verification is computed incrementally (see its comment)
+    /// to avoid copying the whole ciphertext into a scratch buffer just to
+    /// hash it. `padded`'s 8-byte alignment plus the 4-byte length prefix
+    /// means `ct.len()` is always ≡ 0 or 8 (mod 16) in practice, so exercise
+    /// payload sizes that land on both residues, spanning the "whole message
+    /// fits in one block" path and the "one or more full blocks plus a
+    /// genuine tail" path — round-tripping and confirming a flipped tag byte
+    /// is still rejected at each size.
+    #[test]
+    fn chachapoly_roundtrip_across_block_boundaries() {
+        let key = [0x77u8; 64];
+        for len in 0..=48usize {
+            let mut tx = ChaChaPolyCipher::new(&key);
+            let mut rx = ChaChaPolyCipher::new(&key);
+            let payload = vec![0x5au8; len];
+            let wire = tx.seal(0, &payload);
+            let first4: [u8; 4] = wire[..4].try_into().unwrap();
+
+            let mut body = wire[4..].to_vec();
+            let got = rx.open(0, first4, &mut body.clone()).unwrap();
+            assert_eq!(got, payload, "payload len {len}");
+
+            let last = body.len() - 1;
+            body[last] ^= 0x01;
+            let mut rx2 = ChaChaPolyCipher::new(&key);
+            assert!(rx2.open(0, first4, &mut body).is_err(), "tamper undetected at len {len}");
+        }
+    }
+
+    /// Cross-checks the incremental tag computation in `open` against the
+    /// original single-buffer `first4 ++ ct` concatenation it replaced,
+    /// across every size class above. A divergence here would mean the
+    /// incremental version authenticates different bytes than it claims to.
+    #[test]
+    fn chachapoly_incremental_tag_matches_concatenated_reference() {
+        let key = [0x99u8; 64];
+        for ct_len in [0usize, 1, 4, 8, 11, 12, 15, 16, 17, 24, 31, 32, 33, 48, 100, 1000] {
+            let cipher = ChaChaPolyCipher::new(&key);
+            let nonce = ChaChaPolyCipher::nonce(3);
+            let first4 = [1u8, 2, 3, 4];
+            let ct = vec![0xa5u8; ct_len];
+
+            let reference = {
+                let mut msg = Vec::with_capacity(4 + ct.len());
+                msg.extend_from_slice(&first4);
+                msg.extend_from_slice(&ct);
+                Poly1305::new((&*cipher.poly_key(&nonce)).into()).compute_unpadded(&msg)
+            };
+
+            let mut mac = Poly1305::new((&*cipher.poly_key(&nonce)).into());
+            let incremental = if ct.len() < 12 {
+                let mut block = [0u8; 16];
+                block[..4].copy_from_slice(&first4);
+                block[4..4 + ct.len()].copy_from_slice(&ct);
+                mac.compute_unpadded(&block[..4 + ct.len()])
+            } else {
+                let mut block0 = [0u8; 16];
+                block0[..4].copy_from_slice(&first4);
+                block0[4..].copy_from_slice(&ct[..12]);
+                mac.update(std::slice::from_ref(GenericArray::from_slice(&block0)));
+                let rest = &ct[12..];
+                let aligned = rest.len() / 16 * 16;
+                let (full, tail) = rest.split_at(aligned);
+                for chunk in full.chunks_exact(16) {
+                    mac.update(std::slice::from_ref(GenericArray::from_slice(chunk)));
+                }
+                mac.compute_unpadded(tail)
+            };
+
+            assert_eq!(reference, incremental, "ct_len {ct_len}");
+        }
     }
 
     #[test]

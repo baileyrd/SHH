@@ -12,7 +12,7 @@ use std::sync::Mutex;
 use ed25519_dalek::SigningKey;
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncWrite};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use super::{num, read_frame, write_frame};
 use crate::crypto::cert::{now_secs as cert_now_secs, Certificate, CERT_ALGO, CERT_TYPE_HOST};
@@ -433,9 +433,32 @@ impl State {
         let pass = r.string().ok()?;
         r.finish().ok()?;
         let held = self.lock.as_ref()?;
-        // Constant-time comparison: a lock passphrase is a secret even if
-        // the store behind it is only fingerprints away.
-        if held.len() != pass.len() || held.ct_eq(pass).unwrap_u8() != 1 {
+
+        // Compare fixed-size buffers rather than short-circuiting on a
+        // length mismatch first: `held.len() != pass.len()` returning
+        // before `ct_eq` ever runs leaks the true held passphrase's length
+        // to a local attacker measuring response timing across guesses of
+        // different lengths, undercutting the "constant-time" comparison
+        // that follows it. An over-cap guess still fails fast -- a real
+        // passphrase is never that long, and the cap only reveals "too
+        // long", not an exact length.
+        const MAX_LEN: usize = 256;
+        if held.len() > MAX_LEN || pass.len() > MAX_LEN {
+            return None;
+        }
+        let mut held_buf = [0u8; MAX_LEN];
+        let mut pass_buf = [0u8; MAX_LEN];
+        held_buf[..held.len()].copy_from_slice(held);
+        pass_buf[..pass.len()].copy_from_slice(pass);
+        // Zero-padding alone isn't sufficient (a value with an embedded null
+        // could otherwise collide with a shorter prefix of it), so the
+        // length check is still required for correctness -- just computed
+        // unconditionally rather than gating the comparison.
+        let len_matches = held.len() == pass.len();
+        let buf_matches = held_buf.ct_eq(&pass_buf).unwrap_u8() == 1;
+        held_buf.zeroize();
+        pass_buf.zeroize();
+        if !(len_matches && buf_matches) {
             return None;
         }
         self.lock = None;
@@ -609,6 +632,31 @@ mod tests {
         c.unlock(b"open sesame").await.unwrap();
         assert_eq!(c.identities().await.unwrap().len(), 1);
         c.sign(&blob, b"m").await.unwrap();
+    }
+
+    /// `unset_lock` compares fixed-size zero-padded buffers rather than
+    /// short-circuiting on a length mismatch (to avoid leaking the held
+    /// passphrase's length via timing). Zero-padding alone would be an
+    /// incorrect equality check on its own -- a guess with the real
+    /// passphrase's bytes plus a trailing embedded null could otherwise
+    /// collide with it once padded -- so correctness here specifically
+    /// covers the cases padding could get wrong, plus the same-length
+    /// wrong-guess and over-cap cases the length short-circuit used to
+    /// handle for free.
+    #[tokio::test]
+    async fn unlock_rejects_same_length_and_padding_edge_cases() {
+        let (mut c, _kr) = spawn_agent();
+        c.lock(b"correct-horse").await.unwrap(); // 13 bytes
+
+        // Same length as the real passphrase, wrong content.
+        assert!(c.unlock(b"correct-hors3").await.is_err());
+        // The real passphrase's bytes plus a trailing embedded null: zero
+        // padding alone must not make this collide with the shorter secret.
+        assert!(c.unlock(b"correct-horse\0").await.is_err());
+        // Past the internal fixed-buffer cap: must fail cleanly, not panic.
+        assert!(c.unlock(&vec![b'x'; 1000]).await.is_err());
+
+        c.unlock(b"correct-horse").await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]

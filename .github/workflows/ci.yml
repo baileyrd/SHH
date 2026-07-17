@@ -23,14 +23,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build
-        run: cargo build --all-targets
+        run: cargo build --all-targets --locked
       - name: Test
         # Deliberately not --all-targets: that would include the criterion
         # benches, and `cargo test` executes a harness=false bench binary's
         # real main() (a full multi-sample measurement run) rather than
         # skipping it. `cargo build --all-targets` above already compile-checks
         # them; running the actual benchmarks belongs to `cargo bench`, by hand.
-        run: cargo test
+        run: cargo test --locked
 
   lint:
     name: clippy
@@ -42,7 +42,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
 
   gui:
     name: gui check
@@ -53,6 +53,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: gui/src-tauri
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: gui/package-lock.json
       - name: Install Tauri system dependencies
         run: |
           sudo apt-get update
@@ -60,7 +65,12 @@ jobs:
             libayatana-appindicator3-dev librsvg2-dev
       - name: cargo check (src-tauri)
         working-directory: gui/src-tauri
-        run: cargo check
+        run: cargo check --locked
+      - name: typecheck + build frontend
+        working-directory: gui
+        run: |
+          npm ci
+          npm run build
 
   fuzz:
     name: fuzz smoke

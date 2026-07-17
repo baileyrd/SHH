@@ -161,7 +161,29 @@ we enforce it.
   pathological byte fragmentation — a `Dribble` adapter that hands over one
   byte per poll, plus a metered-input test that freezes `recv_raw`
   mid-packet and drops it to prove the incremental reader is cancel-safe and
-  never desyncs.
+  never desyncs. Concurrency- and timing-sensitive fixes (channel-window
+  accounting, admission control, connect timeouts) get a test that exercises
+  the actual failure mode — a task genuinely blocked, a semaphore genuinely
+  drained — not just the happy path; several use Tokio's virtual clock so
+  they're deterministic instead of racing real wall-clock time or (as with
+  outbound network timeouts) an outbound-routing setup that varies by
+  environment.
+- **Performance.** `benches/` holds two Criterion suites: raw AEAD
+  `seal`/`open` throughput per cipher, and end-to-end bulk-transfer
+  throughput through the full client/server stack over an in-memory pipe
+  (isolating the implementation's own CPU-bound overhead — allocation,
+  packet framing, window bookkeeping — from real network conditions). See
+  `benches/README.md`. Not run as part of `cargo test` (a `harness = false`
+  Criterion binary run under `cargo test` executes a full measurement pass
+  rather than being skipped) — run by hand with `cargo bench`.
+- **Hardening.** CHANNEL_WINDOW_ADJUST and the initial channel window are
+  clamped to what the send-credit semaphore can hold, so a peer can't panic
+  the process with an oversized value; a rekey must present the same host
+  key the session was established with, so a TOFU verifier never re-fires
+  mid-session; outbound connects and the accept-time admission queue for
+  new channels are both bounded, so a stalled peer or a flood of opens to
+  unreachable targets can't grow memory or file-descriptor usage without
+  limit.
 
 ## Crate layout
 
@@ -181,6 +203,7 @@ shh/                 one library crate
 ├── src/bin/shh-sftp file-transfer client
 ├── src/bin/shhd.rs  server
 ├── tests/           integration + parser-robustness tests (`cargo test`)
+├── benches/         Criterion benchmarks (`cargo bench`)
 └── fuzz/            cargo-fuzz targets for the peer-controlled parsers
 ```
 

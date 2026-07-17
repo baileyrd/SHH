@@ -60,6 +60,18 @@ fn x25519_shared(secret: EphemeralSecret, peer: &[u8]) -> Result<Zeroizing<[u8; 
     Ok(Zeroizing::new(shared.to_bytes()))
 }
 
+/// Copy the ML-KEM-768 shared secret into a fixed 32-byte buffer. Currently
+/// guaranteed to be exactly 32 bytes by the `ml-kem` crate's own types for
+/// `MlKem768`, so `copy_from_slice` cannot panic today -- this exists so a
+/// future dependency change that altered that invariant would surface as a
+/// clean `Error::Crypto`, not a panic on a local (not wire-parsed) value.
+fn mlkem_shared_secret(raw: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
+    let arr: [u8; 32] = raw
+        .try_into()
+        .map_err(|_| Error::Crypto("ML-KEM shared secret has unexpected length"))?;
+    Ok(Zeroizing::new(arr))
+}
+
 fn encode_mpint(bytes: &[u8]) -> Zeroizing<Vec<u8>> {
     let mut w = Writer::new();
     w.mpint(bytes);
@@ -136,8 +148,7 @@ impl ClientKex {
                     .expect("hybrid client always has a decapsulation key")
                     .decapsulate(&ct)
                     .map_err(|_| Error::Crypto("ML-KEM decapsulation failed"))?;
-                let mut mlkem_ss = Zeroizing::new([0u8; 32]);
-                mlkem_ss.copy_from_slice(&raw);
+                let mlkem_ss = mlkem_shared_secret(&raw)?;
                 let x_ss = x25519_shared(self.x_secret, x_pub)?;
                 Ok(encode_string(&hybrid_secret(&mlkem_ss[..], &x_ss[..])))
             }
@@ -166,8 +177,7 @@ pub fn server_exchange(algo: Algorithm, q_c: &[u8]) -> Result<(Vec<u8>, Zeroizin
             let (ct, raw) = ek
                 .encapsulate(&mut OsRng)
                 .map_err(|_| Error::Crypto("ML-KEM encapsulation failed"))?;
-            let mut mlkem_ss = Zeroizing::new([0u8; 32]);
-            mlkem_ss.copy_from_slice(&raw);
+            let mlkem_ss = mlkem_shared_secret(&raw)?;
             let x_ss = x25519_shared(x_secret, x_pub)?;
             let mut q_s = ct.to_vec();
             q_s.extend_from_slice(x_public.as_bytes());

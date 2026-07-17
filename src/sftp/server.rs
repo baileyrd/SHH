@@ -292,6 +292,13 @@ fn open_file(
     pflags: u32,
     attrs: &Attrs,
 ) -> Result<(u8, Vec<u8>), Fail> {
+    // Check the handle cap before opening: OPEN can create or truncate a
+    // file (CREAT/TRUNC), so refusing only at `insert()` -- after the
+    // syscall already ran -- would let a refused request still mutate the
+    // filesystem. Mirrors the same check OPENDIR does before read_dir.
+    if sess.handles.len() >= MAX_HANDLES {
+        return Ok(status_reply(id, status::FAILURE, "too many open handles"));
+    }
     let mut opts = OpenOptions::new();
     opts.read(pflags & open::READ != 0);
     if pflags & open::WRITE != 0 {
@@ -619,5 +626,26 @@ mod tests {
         let some_id = sess.handles.keys().next().cloned().unwrap();
         sess.handles.remove(&some_id);
         assert!(sess.insert(Handle::Dir { entries: Vec::new(), next: 0 }).is_some());
+    }
+
+    /// OPEN can create or truncate a file (CREAT/TRUNC). A refusal past
+    /// MAX_HANDLES must happen *before* that syscall runs, not after --
+    /// otherwise a refused request still mutates the filesystem.
+    #[test]
+    fn open_at_max_handles_does_not_create_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sess = Session::new();
+        for _ in 0..MAX_HANDLES {
+            assert!(sess.insert(Handle::Dir { entries: Vec::new(), next: 0 }).is_some());
+        }
+
+        let path = dir.path().join("never-created");
+        let attrs = Attrs { size: None, uid_gid: None, permissions: None, times: None };
+        let result = open_file(&mut sess, 1, path.to_str().unwrap(), open::CREAT | open::WRITE, &attrs);
+        let Ok((typ, _)) = result else {
+            panic!("open_file should return a status reply, not an error");
+        };
+        assert_eq!(typ, fxp::STATUS);
+        assert!(!path.exists(), "OPEN refused past MAX_HANDLES must not create the file");
     }
 }

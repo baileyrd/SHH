@@ -68,6 +68,8 @@ pub enum WireError {
     BadUtf8,
     #[error("invalid boolean byte")]
     BadBool,
+    #[error("name-list contains an empty name")]
+    BadNameList,
     #[error("trailing garbage: {0} bytes left after message")]
     TrailingBytes(usize),
 }
@@ -148,5 +150,19 @@ mod tests {
         let buf = w.into_bytes();
         let mut r = Reader::new(&buf);
         assert_eq!(r.name_list().unwrap(), Vec::<String>::new());
+    }
+
+    /// RFC 4251 §6: each name in a name-list is a non-empty identifier.
+    /// A leading/trailing/doubled comma would otherwise silently produce an
+    /// empty element that a naive split-on-comma wouldn't catch.
+    #[test]
+    fn name_list_rejects_empty_elements() {
+        for malformed in [",", "a,", ",a", "a,,b", ","] {
+            let mut w = Writer::new();
+            w.utf8(malformed);
+            let buf = w.into_bytes();
+            let mut r = Reader::new(&buf);
+            assert_eq!(r.name_list(), Err(WireError::BadNameList), "{malformed:?}");
+        }
     }
 }

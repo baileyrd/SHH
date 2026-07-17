@@ -178,9 +178,20 @@ fn harden(drop_to: Option<&str>) {
                 Some(u) => {
                     let gid = nix::unistd::Gid::from_raw(u.gid);
                     let uid = nix::unistd::Uid::from_raw(u.uid);
-                    let dropped = nix::unistd::setgid(gid)
-                        .and_then(|_| nix::unistd::setuid(uid))
-                        .is_ok();
+                    // gid, then supplementary groups, then uid -- the same
+                    // order drop_daemon_privileges uses. Without initgroups
+                    // here, the signer keeps root's supplementary groups
+                    // (e.g. `disk`, `wheel`) after "dropping" privileges,
+                    // undermining the isolation this function exists for.
+                    let dropped = std::ffi::CString::new(u.name.as_str())
+                        .ok()
+                        .and_then(|cname| {
+                            nix::unistd::setgid(gid)
+                                .and_then(|_| nix::unistd::initgroups(&cname, gid))
+                                .and_then(|_| nix::unistd::setuid(uid))
+                                .ok()
+                        })
+                        .is_some();
                     if dropped {
                         // If we can regain root, the drop was ineffective.
                         if nix::unistd::setuid(nix::unistd::Uid::from_raw(0)).is_ok() {

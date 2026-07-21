@@ -1,9 +1,9 @@
 # Release notes
 
-SHH has no tagged releases yet (it's still `0.1.0` in `Cargo.toml`), but the
-project moved through four clearly distinct phases of work. This groups
-that history the way a changelog would once it starts cutting versions —
-newest first — so it's possible to see what landed when without reading
+SHH's first tagged release is `v0.1.0` (matching `Cargo.toml`), cut from the
+entry below dated 2026-07-21. Everything before that tag is grouped into
+the four clearly distinct phases the project moved through pre-release,
+newest first, so it's possible to see what landed when without reading
 through dozens of PR descriptions.
 
 Every entry below is real work verified against the repository history;
@@ -13,7 +13,7 @@ what's described here.
 
 ---
 
-## Local key publishing and CI health — 2026-07-21
+## v0.1.0 — Local key publishing and CI health — 2026-07-21
 
 `shh-id`, a small addition that closes a real gap in the "how do keys move
 between my devices" story, plus a project-process pass: CI had been red on

@@ -802,7 +802,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         tracing::info!(channel = ours, "channel open refused: {desc}");
         // Dropping a pending session's oneshot lets the client learn it
         // failed; dropping a pending forward closes the local connection.
-        self.pending.remove(&ours);
+        // A refused *terminal* session (`end_connection_on_close`, e.g.
+        // `client_session`'s one-shot wrapper) never gets a `Chan` entry, so
+        // `close_if_done` can never see it and end the loop — without this,
+        // a server that refuses the only session this connection exists for
+        // leaves `run()` parked forever waiting on a peer that has nothing
+        // left to say either.
+        if let Some(Pending::Session(spec)) = self.pending.remove(&ours) {
+            if spec.end_connection_on_close {
+                self.done = true;
+            }
+        }
         Ok(())
     }
 
@@ -1477,6 +1487,49 @@ mod tests {
             msg::CHANNEL_OPEN_FAILURE,
             "should refuse while connects are in flight, not just once they resolve"
         );
+    }
+
+    /// A refused *terminal* session (`end_connection_on_close`, as
+    /// `client_session`'s one-shot wrapper requests) must end the
+    /// connection loop, not leave it parked forever: a refused open never
+    /// gets a `Chan` entry, so `close_if_done` — the only other path that
+    /// sets `done` for a terminal channel — can never see it. Without this,
+    /// a peer that refuses the only session a connection exists for (e.g. a
+    /// Windows-built server, which serves no sessions at all) leaves both
+    /// ends of `run()` parked forever with nothing left to say.
+    #[tokio::test]
+    async fn refused_terminal_session_ends_the_connection() {
+        let (client_t, _server_t) = transport_pair().await;
+        let mut conn = Connection::new(client_t, Policy::DenyAll);
+
+        let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
+        conn.pending.insert(
+            7,
+            Pending::Session(Box::new(SessionSpec {
+                command: None,
+                subsystem: None,
+                pty: None,
+                resize: None,
+                stdin: Box::new(tokio::io::empty()),
+                stdout: Box::new(tokio::io::sink()),
+                stderr: Box::new(tokio::io::sink()),
+                exit: exit_tx,
+                forward_agent: false,
+                end_connection_on_close: true,
+            })),
+        );
+        assert!(!conn.done);
+
+        let mut w = Writer::new();
+        w.byte(msg::CHANNEL_OPEN_FAILURE);
+        w.u32(7);
+        w.u32(open_failure::UNKNOWN_CHANNEL_TYPE);
+        w.utf8("sessions are not served on this platform");
+        w.utf8("");
+        conn.on_open_failure(&w.into_bytes()).unwrap();
+
+        assert!(conn.done, "a refused terminal session must end the connection loop");
+        assert!(exit_rx.await.is_err(), "the exit oneshot must be dropped, not left dangling");
     }
 
     /// MAX_CHANNELS must also bound our own outgoing opens (local -L/-R

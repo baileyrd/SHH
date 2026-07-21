@@ -2548,6 +2548,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
+name = "platform"
+version = "0.8.0"
+source = "git+https://github.com/baileyrd/rustils?rev=5251808971c2e89164d4461c5cf1f45095f60dd3#5251808971c2e89164d4461c5cf1f45095f60dd3"
+dependencies = [
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "platform-linux"
+version = "0.8.0"
+source = "git+https://github.com/baileyrd/rustils?rev=5251808971c2e89164d4461c5cf1f45095f60dd3#5251808971c2e89164d4461c5cf1f45095f60dd3"
+dependencies = [
+ "libc",
+ "platform",
+]
+
+[[package]]
 name = "plist"
 version = "1.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3160,6 +3177,8 @@ dependencies = [
  "libc",
  "ml-kem",
  "nix",
+ "platform",
+ "platform-linux",
  "poly1305",
  "rand_core",
  "sha2",

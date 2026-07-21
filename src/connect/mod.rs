@@ -483,7 +483,11 @@ mod tests {
         s.unwrap();
         let (status, out) = c.unwrap();
         let text = String::from_utf8_lossy(&out);
-        assert!(text.contains("/dev/pts/"), "no pty in output: {text}");
+        // Linux devpts names ptys `/dev/pts/N`; BSD/macOS uses `/dev/ttysNNN`.
+        assert!(
+            text.contains("/dev/pts/") || text.contains("/dev/tty"),
+            "no pty in output: {text}"
+        );
         assert!(text.contains("TERM=vt100"), "TERM not set: {text}");
         assert!(text.contains("43 132"), "winsize not applied: {text}");
         assert_eq!(status.code, Some(0));

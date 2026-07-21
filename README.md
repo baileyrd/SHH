@@ -269,6 +269,37 @@ terminal (or use `--accept-new`), and a changed key is a hard error.
 Keys may be passphrase-protected (`shh-keygen -N`, prompted otherwise);
 the format matches `ssh-keygen` (bcrypt + AES-256-CTR).
 
+### SSH ID (local, self-hosted key publishing)
+
+`shh-id` is a local alternative to hosted "SSH passkey" services like
+sshid.io: instead of a cloud vault at `https://sshid.io/<handle>`, your
+public keys live under a directory you control, and `shh-id serve` publishes
+them at `GET /<handle>` from wherever you choose to run it — your laptop,
+your LAN, or your own VPS.
+
+```console
+# on each device, add its public key under a handle
+$ shh-id add me ~/.shh/id_ed25519.pub --name laptop
+$ shh-id add me ~/.shh/id_ed25519.pub --name phone   # (copied from the phone)
+
+# sync the directory (~/.shh/id by default) across devices however you like
+# — Syncthing, a private git repo, a network share — then serve it:
+$ shh-id serve --dir ~/.shh/id --listen 0.0.0.0:8422
+
+# provision a server exactly like the hosted service:
+$ curl http://your-host:8422/me >> ~/.ssh/authorized_keys
+```
+
+There's no account system and nothing secret in play — `shh-id` only ever
+reads, writes, and serves public keys, the same trust boundary as `python -m
+http.server` over a directory of `authorized_keys` snippets. `shh-id list`
+shows what's registered (by handle, or one handle's devices with
+fingerprints) and `shh-id export <handle>` prints the same text `serve`
+would, for scripting without running a server. A malformed or half-synced
+`.pub` file is skipped with a warning rather than taking the whole handle
+down, and handle names are validated against path traversal before ever
+touching the filesystem.
+
 ### Port forwarding
 
 Local (`-L`) forwarding tunnels a local port to a target reachable from the

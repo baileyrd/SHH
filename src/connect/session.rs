@@ -808,14 +808,14 @@ fn spawn_child(
                 if libc::setsid() < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
-                if libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
+                if libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
             }
             if let Some((uid, gid, name)) = &drop {
                 nix::unistd::setgid(*gid).map_err(std::io::Error::from)?;
                 if let Some(name) = name {
-                    nix::unistd::initgroups(name, *gid).map_err(std::io::Error::from)?;
+                    super::initgroups(name, *gid).map_err(std::io::Error::from)?;
                 }
                 nix::unistd::setuid(*uid).map_err(std::io::Error::from)?;
             }

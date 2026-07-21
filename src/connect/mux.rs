@@ -1670,8 +1670,10 @@ mod tests {
     }
 
     /// A shareable stdout sink for session tests.
+    #[cfg(unix)]
     #[derive(Clone, Default)]
     struct VecSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    #[cfg(unix)]
     impl AsyncWrite for VecSink {
         fn poll_write(
             self: std::pin::Pin<&mut Self>,
@@ -1710,6 +1712,9 @@ mod tests {
         panic!("session never printed its line");
     }
 
+    // Runs a real POSIX shell command (`head -c 5`) through the session
+    // server, which is `#[cfg(unix)]` — Windows serves no sessions at all.
+    #[cfg(unix)]
     #[tokio::test]
     async fn session_and_forward_share_one_connection() {
         use super::super::session::SessionSpec;

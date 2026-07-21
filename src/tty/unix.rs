@@ -1,11 +1,22 @@
 //! Unix terminal backend: `/dev/tty` + termios. Everything talks to
 //! `/dev/tty` or stdin directly so piped stdio stays clean.
+//!
+//! `winsize()` and `RawMode` both operate on stdin, matching rustils'
+//! `platform::term::Terminal` contract exactly, so they converge onto it
+//! (`platform_linux::LinuxTerminal`; issue #43). `read_passphrase()`'s
+//! echo toggle stays on raw termios: it deliberately targets `/dev/tty`
+//! rather than stdin so the prompt still works when stdin is piped, and
+//! `Terminal::set_echo` only operates on the three standard streams (no
+//! arbitrary-fd/`/dev/tty` variant) — converging it would silently break
+//! passphrase prompts under redirected stdin.
 
 use std::fs::File;
 use std::io::{self, IsTerminal, Read, Write};
 use std::os::fd::AsFd;
 
-use nix::sys::termios::{self, LocalFlags, SetArg, Termios};
+use nix::sys::termios::{self, LocalFlags, SetArg};
+use platform::term::Terminal as _;
+use platform_linux::LinuxTerminal;
 
 /// Read one line from `r` up to (and consuming) a `\n` or EOF, returning it
 /// with any trailing `\r` stripped. Accumulates raw bytes and decodes once
@@ -51,46 +62,41 @@ pub fn prompt_line(prompt: &str) -> io::Result<String> {
     read_line_utf8(&mut tty)
 }
 
-/// Puts stdin into raw mode; restores the original settings on drop.
-pub struct RawMode {
-    orig: Termios,
-}
+/// Puts stdin into raw mode via [`platform_linux::LinuxTerminal`];
+/// restores the original settings on drop.
+pub struct RawMode(LinuxTerminal);
 
 impl RawMode {
     pub fn enable() -> io::Result<Option<RawMode>> {
-        let stdin = io::stdin();
-        if !stdin.is_terminal() {
+        if !io::stdin().is_terminal() {
             return Ok(None);
         }
-        let orig = termios::tcgetattr(stdin.as_fd()).map_err(io::Error::from)?;
-        let mut raw = orig.clone();
-        termios::cfmakeraw(&mut raw);
-        termios::tcsetattr(stdin.as_fd(), SetArg::TCSANOW, &raw).map_err(io::Error::from)?;
-        Ok(Some(RawMode { orig }))
+        let mut term = LinuxTerminal::new();
+        term.enter_raw().map_err(io::Error::other)?;
+        Ok(Some(RawMode(term)))
     }
 }
 
 impl Drop for RawMode {
     fn drop(&mut self) {
-        let _ = termios::tcsetattr(io::stdin().as_fd(), SetArg::TCSANOW, &self.orig);
+        let _ = self.0.leave_raw();
     }
 }
 
+/// (cols, rows, xpixels, ypixels) of the local terminal, if input is one.
+/// Pixel dimensions are always 0: `Terminal::window_size()` reports only
+/// character-cell rows/cols (most terminals report 0 for `TIOCGWINSZ`'s
+/// pixel fields too, and the SSH pty-req/window-change pixel fields are
+/// advisory).
 pub fn winsize() -> Option<(u32, u32, u32, u32)> {
     if !io::stdin().is_terminal() {
         return None;
     }
-    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-    let rc = unsafe { libc::ioctl(libc::STDIN_FILENO, libc::TIOCGWINSZ, &mut ws) };
-    if rc != 0 || ws.ws_col == 0 {
+    let ws = LinuxTerminal::new().window_size().ok()?;
+    if ws.cols == 0 {
         return None;
     }
-    Some((
-        ws.ws_col as u32,
-        ws.ws_row as u32,
-        ws.ws_xpixel as u32,
-        ws.ws_ypixel as u32,
-    ))
+    Some((ws.cols as u32, ws.rows as u32, 0, 0))
 }
 
 #[cfg(test)]

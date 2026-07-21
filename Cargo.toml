@@ -39,6 +39,11 @@ clap = { version = "4", features = ["derive"] }
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["term", "process", "fs", "signal", "user", "hostname"] }
 libc = "0.2"
+# tty/unix.rs's winsize()/RawMode converge onto rustils' platform::term::Terminal
+# (issue #43); pinned rev, bumped deliberately (see platform-linux's own
+# rusty_libc pin for the same convention).
+platform = { git = "https://github.com/baileyrd/rustils", rev = "5251808971c2e89164d4461c5cf1f45095f60dd3" }
+platform-linux = { git = "https://github.com/baileyrd/rustils", rev = "5251808971c2e89164d4461c5cf1f45095f60dd3" }
 
 # console control for the Windows client (raw mode, echo-off, size)
 [target.'cfg(windows)'.dependencies]

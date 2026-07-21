@@ -1,11 +1,26 @@
 //! Unix terminal backend: `/dev/tty` + termios. Everything talks to
 //! `/dev/tty` or stdin directly so piped stdio stays clean.
+//!
+//! On Linux, `winsize()` and `RawMode` operate on stdin, matching rustils'
+//! `platform::term::Terminal` contract exactly, so they converge onto it
+//! (`platform_linux::LinuxTerminal`; issue #43). rustils has no macOS/BSD
+//! backend yet, so other Unix targets keep the hand-rolled nix/libc
+//! termios+ioctl implementation below. `read_passphrase()`'s echo toggle
+//! stays on raw termios everywhere: it deliberately targets `/dev/tty`
+//! rather than stdin so the prompt still works when stdin is piped, and
+//! `Terminal::set_echo` only operates on the three standard streams (no
+//! arbitrary-fd/`/dev/tty` variant) — converging it would silently break
+//! passphrase prompts under redirected stdin.
 
 use std::fs::File;
 use std::io::{self, IsTerminal, Read, Write};
 use std::os::fd::AsFd;
 
-use nix::sys::termios::{self, LocalFlags, SetArg, Termios};
+use nix::sys::termios::{self, LocalFlags, SetArg};
+#[cfg(target_os = "linux")]
+use platform::term::Terminal as _;
+#[cfg(target_os = "linux")]
+use platform_linux::LinuxTerminal;
 
 /// Read one line from `r` up to (and consuming) a `\n` or EOF, returning it
 /// with any trailing `\r` stripped. Accumulates raw bytes and decodes once
@@ -51,11 +66,56 @@ pub fn prompt_line(prompt: &str) -> io::Result<String> {
     read_line_utf8(&mut tty)
 }
 
-/// Puts stdin into raw mode; restores the original settings on drop.
-pub struct RawMode {
-    orig: Termios,
+/// Puts stdin into raw mode via [`platform_linux::LinuxTerminal`];
+/// restores the original settings on drop.
+#[cfg(target_os = "linux")]
+pub struct RawMode(LinuxTerminal);
+
+#[cfg(target_os = "linux")]
+impl RawMode {
+    pub fn enable() -> io::Result<Option<RawMode>> {
+        if !io::stdin().is_terminal() {
+            return Ok(None);
+        }
+        let mut term = LinuxTerminal::new();
+        term.enter_raw().map_err(io::Error::other)?;
+        Ok(Some(RawMode(term)))
+    }
 }
 
+#[cfg(target_os = "linux")]
+impl Drop for RawMode {
+    fn drop(&mut self) {
+        let _ = self.0.leave_raw();
+    }
+}
+
+/// (cols, rows, xpixels, ypixels) of the local terminal, if input is one.
+/// Pixel dimensions are always 0: `Terminal::window_size()` reports only
+/// character-cell rows/cols (most terminals report 0 for `TIOCGWINSZ`'s
+/// pixel fields too, and the SSH pty-req/window-change pixel fields are
+/// advisory).
+#[cfg(target_os = "linux")]
+pub fn winsize() -> Option<(u32, u32, u32, u32)> {
+    if !io::stdin().is_terminal() {
+        return None;
+    }
+    let ws = LinuxTerminal::new().window_size().ok()?;
+    if ws.cols == 0 {
+        return None;
+    }
+    Some((ws.cols as u32, ws.rows as u32, 0, 0))
+}
+
+/// Puts stdin into raw mode; restores the original settings on drop.
+/// rustils has no macOS/BSD `Terminal` backend yet, so these targets keep
+/// the hand-rolled termios implementation (see module docs).
+#[cfg(not(target_os = "linux"))]
+pub struct RawMode {
+    orig: termios::Termios,
+}
+
+#[cfg(not(target_os = "linux"))]
 impl RawMode {
     pub fn enable() -> io::Result<Option<RawMode>> {
         let stdin = io::stdin();
@@ -70,12 +130,14 @@ impl RawMode {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 impl Drop for RawMode {
     fn drop(&mut self) {
         let _ = termios::tcsetattr(io::stdin().as_fd(), SetArg::TCSANOW, &self.orig);
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 pub fn winsize() -> Option<(u32, u32, u32, u32)> {
     if !io::stdin().is_terminal() {
         return None;

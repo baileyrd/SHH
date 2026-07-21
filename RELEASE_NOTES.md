@@ -1,15 +1,63 @@
 # Release notes
 
-SHH has no tagged releases yet (it's still `0.1.0` in `Cargo.toml`), but the
-project moved through three clearly distinct phases of work. This groups
-that history the way a changelog would once it starts cutting versions —
-newest first — so it's possible to see what landed when without reading 37
-PR descriptions.
+SHH's first tagged release is `v0.1.0` (matching `Cargo.toml`), cut from the
+entry below dated 2026-07-21. Everything before that tag is grouped into
+the four clearly distinct phases the project moved through pre-release,
+newest first, so it's possible to see what landed when without reading
+through dozens of PR descriptions.
 
 Every entry below is real work verified against the repository history;
 nothing here is aspirational. See [DESIGN.md](DESIGN.md) for the rationale
 behind each protocol decision and [README.md](README.md) for how to use
 what's described here.
+
+---
+
+## v0.1.0 — Local key publishing and CI health — 2026-07-21
+
+`shh-id`, a small addition that closes a real gap in the "how do keys move
+between my devices" story, plus a project-process pass: CI had been red on
+every push for several days from issues unrelated to any one feature, and
+fixing them surfaced a real connection-lifecycle bug that had simply never
+been exercised before.
+
+### New: shh-id
+
+- **`shh-id`**: a local, self-hosted alternative to hosted "SSH passkey"
+  services like sshid.io. Public keys for a handle live under a directory
+  the user syncs across their own devices (Syncthing, a private git repo,
+  a network share, ...) rather than a cloud vault; `shh-id serve` publishes
+  them at `GET /<handle>` from wherever it's run, so `curl
+  http://host:port/<handle> >> authorized_keys` works exactly like the
+  hosted service did. `add`/`list`/`export` round out the CLI, and a
+  malformed or half-synced `.pub` file is skipped with a warning rather
+  than served or taking the whole handle down.
+
+### Fixes
+
+- **Connection hang on a refused terminal session.** A client session
+  meant to end the whole connection when it closes (`client_session`'s
+  one-shot wrapper) never did if the server refused the channel open
+  outright: the refusal only dropped the pending entry, never signaled the
+  loop to stop, and `close_if_done` — the only other path that ends a
+  terminal connection — needs a channel entry a refused open never gets.
+  Both ends of the connection would then park forever with nothing left to
+  send. Not platform-specific in the code, just previously unreachable:
+  every test that exercises a session runs client and server in the same
+  process, and this path only fires when a peer serves no sessions at all
+  (Windows CI, see below) — which nothing had ever hit before now.
+
+### Project process
+
+- **CI actually runs on Windows and macOS now.** Four issues had made every
+  push to `main` fail for several days, none related to any one feature: a
+  clippy lint newly enforced by a toolchain bump, Linux-only libc calls
+  (`prctl`, `initgroups`, an `rlimit` resource type) used unconditionally
+  in `privsep.rs`/`session.rs`, Unix-only test code that had never been
+  gated for Windows, and the GUI check running `cargo check` before the
+  frontend build it depends on. Fixed all four, plus properly `#[cfg(unix)]`
+  gating the POSIX-shell session tests the connection-hang fix above
+  exposed for the first time.
 
 ---
 

@@ -16,13 +16,12 @@
 //! Alignment for the AEAD ciphers is over the *encrypted* portion only;
 //! the length field does not participate (RFC 5647 / OpenSSH PROTOCOL).
 
-use aes_gcm::aead::AeadInPlace;
+use aes_gcm::aead::AeadInOut;
 use aes_gcm::{Aes256Gcm, KeyInit};
 use chacha20::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
 use chacha20::ChaCha20Legacy;
-use poly1305::universal_hash::generic_array::GenericArray;
 use poly1305::universal_hash::UniversalHash;
-use poly1305::Poly1305;
+use poly1305::{Block, Poly1305};
 use rand_core::{OsRng, RngCore};
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
@@ -191,7 +190,7 @@ impl ChaChaPolyCipher {
     /// Poly1305 key: block 0 of the main-key keystream.
     fn poly_key(&self, nonce: &[u8; 8]) -> Zeroizing<[u8; 32]> {
         let mut key = Zeroizing::new([0u8; 32]);
-        let mut c = ChaCha20Legacy::new(self.k_main[..].into(), nonce.into());
+        let mut c = ChaCha20Legacy::new((&*self.k_main).into(), nonce.into());
         c.apply_keystream(&mut key[..]);
         key
     }
@@ -204,10 +203,10 @@ impl PacketCipher for ChaChaPolyCipher {
 
         let mut out = Vec::with_capacity(4 + block.len() + TAG_LEN);
         out.extend_from_slice(&(block.len() as u32).to_be_bytes());
-        ChaCha20Legacy::new(self.k_len[..].into(), (&nonce).into())
+        ChaCha20Legacy::new((&*self.k_len).into(), (&nonce).into())
             .apply_keystream(&mut out[..4]);
 
-        let mut main = ChaCha20Legacy::new(self.k_main[..].into(), (&nonce).into());
+        let mut main = ChaCha20Legacy::new((&*self.k_main).into(), (&nonce).into());
         main.seek(64u64); // keystream block 1; block 0 is the poly1305 key
         main.apply_keystream(&mut block);
         out.extend_from_slice(&block);
@@ -220,7 +219,7 @@ impl PacketCipher for ChaChaPolyCipher {
 
     fn packet_length(&self, seq: u32, mut first4: [u8; 4]) -> Result<usize> {
         let nonce = Self::nonce(seq);
-        ChaCha20Legacy::new(self.k_len[..].into(), (&nonce).into())
+        ChaCha20Legacy::new((&*self.k_len).into(), (&nonce).into())
             .apply_keystream(&mut first4);
         check_length(u32::from_be_bytes(first4) as usize, 8)
     }
@@ -253,13 +252,15 @@ impl PacketCipher for ChaChaPolyCipher {
             let mut block0 = [0u8; 16];
             block0[..4].copy_from_slice(&first4);
             block0[4..].copy_from_slice(&ct[..12]);
-            mac.update(std::slice::from_ref(GenericArray::from_slice(&block0)));
+            let block0: Block = block0.into();
+            mac.update(std::slice::from_ref(&block0));
 
             let rest = &ct[12..];
             let aligned = rest.len() / 16 * 16;
             let (full, tail) = rest.split_at(aligned);
             for chunk in full.chunks_exact(16) {
-                mac.update(std::slice::from_ref(GenericArray::from_slice(chunk)));
+                let block: &Block = chunk.try_into().expect("chunks_exact(16) yields 16 bytes");
+                mac.update(std::slice::from_ref(block));
             }
             mac.compute_unpadded(tail)
         };
@@ -267,7 +268,7 @@ impl PacketCipher for ChaChaPolyCipher {
             return Err(Error::Crypto("packet authentication failed"));
         }
 
-        let mut main = ChaCha20Legacy::new(self.k_main[..].into(), (&nonce).into());
+        let mut main = ChaCha20Legacy::new((&*self.k_main).into(), (&nonce).into());
         main.seek(64u64);
         main.apply_keystream(ct);
         unpad(ct)
@@ -285,9 +286,8 @@ pub struct GcmCipher {
 
 impl GcmCipher {
     pub fn new(key: &[u8], iv: &[u8]) -> Self {
-        assert_eq!(key.len(), 32, "aes256-gcm wants a 32-byte key");
         GcmCipher {
-            cipher: Aes256Gcm::new(key.into()),
+            cipher: Aes256Gcm::new(key.try_into().expect("aes256-gcm wants a 32-byte key")),
             iv: iv.try_into().expect("aes256-gcm wants a 12-byte IV"),
         }
     }
@@ -307,7 +307,7 @@ impl PacketCipher for GcmCipher {
         let nonce = self.bump();
         let tag = self
             .cipher
-            .encrypt_in_place_detached((&nonce).into(), &len_be, &mut block)
+            .encrypt_inout_detached((&nonce).into(), &len_be, (&mut block[..]).into())
             .expect("gcm encryption is infallible for in-range sizes");
         let mut out = Vec::with_capacity(4 + block.len() + TAG_LEN);
         out.extend_from_slice(&len_be);
@@ -330,8 +330,9 @@ impl PacketCipher for GcmCipher {
         // leaves the receive IV untouched rather than desynced.
         let nonce = self.iv;
         let (ct, tag) = body.split_at_mut(body.len() - TAG_LEN);
+        let tag: &_ = (&*tag).try_into().expect("split_at_mut left exactly TAG_LEN tag bytes");
         self.cipher
-            .decrypt_in_place_detached((&nonce).into(), &first4, ct, (&*tag).into())
+            .decrypt_inout_detached((&nonce).into(), &first4, (&mut *ct).into(), tag)
             .map_err(|_| Error::Crypto("packet authentication failed"))?;
         let _ = self.bump();
         unpad(ct)
@@ -431,12 +432,14 @@ mod tests {
                 let mut block0 = [0u8; 16];
                 block0[..4].copy_from_slice(&first4);
                 block0[4..].copy_from_slice(&ct[..12]);
-                mac.update(std::slice::from_ref(GenericArray::from_slice(&block0)));
+                let block0: Block = block0.into();
+                mac.update(std::slice::from_ref(&block0));
                 let rest = &ct[12..];
                 let aligned = rest.len() / 16 * 16;
                 let (full, tail) = rest.split_at(aligned);
                 for chunk in full.chunks_exact(16) {
-                    mac.update(std::slice::from_ref(GenericArray::from_slice(chunk)));
+                    let block: &Block = chunk.try_into().expect("chunks_exact(16) yields 16 bytes");
+                    mac.update(std::slice::from_ref(block));
                 }
                 mac.compute_unpadded(tail)
             };

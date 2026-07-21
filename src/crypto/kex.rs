@@ -13,9 +13,8 @@
 //! hybrid (the hybrid secret is uniform hash output, so the mpint dance of
 //! RFC 4253 is dropped — matching the deployed spec).
 
-use ml_kem::kem::{Decapsulate, Encapsulate};
-use ml_kem::{Encoded, EncodedSizeUser, KemCore, MlKem768};
-use rand_core::OsRng;
+use getrandom::{rand_core::UnwrapErr, SysRng};
+use ml_kem::{Decapsulate, Encapsulate, Kem, KeyExport, MlKem768, TryKeyInit};
 use sha2::{Digest, Sha256};
 use x25519_dalek::{EphemeralSecret, PublicKey as XPublic};
 use zeroize::Zeroizing;
@@ -27,8 +26,15 @@ pub const MLKEM768_EK_LEN: usize = 1184;
 pub const MLKEM768_CT_LEN: usize = 1088;
 pub const X25519_LEN: usize = 32;
 
-type MlKemDk = <MlKem768 as KemCore>::DecapsulationKey;
-type MlKemEk = <MlKem768 as KemCore>::EncapsulationKey;
+type MlKemDk = <MlKem768 as Kem>::DecapsulationKey;
+type MlKemEk = <MlKem768 as Kem>::EncapsulationKey;
+
+/// A fresh handle onto the OS CSPRNG, matching the `rand_core` version the
+/// `ml-kem`/`x25519-dalek`/`ed25519-dalek` trio now wants (`CryptoRng`, not
+/// our own `rand_core` 0.6 dependency's trait of the same name).
+fn csprng() -> UnwrapErr<SysRng> {
+    UnwrapErr(SysRng)
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Algorithm {
@@ -103,7 +109,7 @@ pub struct ClientKex {
 
 impl ClientKex {
     pub fn generate(algo: Algorithm) -> Self {
-        let x_secret = EphemeralSecret::random_from_rng(OsRng);
+        let x_secret = EphemeralSecret::random_from_rng(&mut csprng());
         let x_public = XPublic::from(&x_secret);
         match algo {
             Algorithm::Curve25519Sha256 => ClientKex {
@@ -113,8 +119,8 @@ impl ClientKex {
                 public: x_public.as_bytes().to_vec(),
             },
             Algorithm::MlKem768X25519Sha256 => {
-                let (dk, ek) = MlKem768::generate(&mut OsRng);
-                let mut public = ek.as_bytes().to_vec();
+                let (dk, ek) = MlKem768::generate_keypair_from_rng(&mut csprng());
+                let mut public = ek.to_bytes().to_vec();
                 public.extend_from_slice(x_public.as_bytes());
                 ClientKex {
                     algo,
@@ -146,8 +152,7 @@ impl ClientKex {
                 let raw = self
                     .mlkem_dk
                     .expect("hybrid client always has a decapsulation key")
-                    .decapsulate(&ct)
-                    .map_err(|_| Error::Crypto("ML-KEM decapsulation failed"))?;
+                    .decapsulate(&ct);
                 let mlkem_ss = mlkem_shared_secret(&raw)?;
                 let x_ss = x25519_shared(self.x_secret, x_pub)?;
                 Ok(encode_string(&hybrid_secret(&mlkem_ss[..], &x_ss[..])))
@@ -159,7 +164,7 @@ impl ClientKex {
 /// Server half: one shot. Takes the client's `Q_C`, returns `Q_S` and the
 /// encoded shared secret.
 pub fn server_exchange(algo: Algorithm, q_c: &[u8]) -> Result<(Vec<u8>, Zeroizing<Vec<u8>>)> {
-    let x_secret = EphemeralSecret::random_from_rng(OsRng);
+    let x_secret = EphemeralSecret::random_from_rng(&mut csprng());
     let x_public = XPublic::from(&x_secret);
     match algo {
         Algorithm::Curve25519Sha256 => {
@@ -171,12 +176,9 @@ pub fn server_exchange(algo: Algorithm, q_c: &[u8]) -> Result<(Vec<u8>, Zeroizin
                 return Err(Error::Crypto("hybrid KEX init has wrong length"));
             }
             let (ek_bytes, x_pub) = q_c.split_at(MLKEM768_EK_LEN);
-            let encoded = Encoded::<MlKemEk>::try_from(ek_bytes)
+            let ek = MlKemEk::new_from_slice(ek_bytes)
                 .map_err(|_| Error::Crypto("bad ML-KEM encapsulation key"))?;
-            let ek = MlKemEk::from_bytes(&encoded);
-            let (ct, raw) = ek
-                .encapsulate(&mut OsRng)
-                .map_err(|_| Error::Crypto("ML-KEM encapsulation failed"))?;
+            let (ct, raw) = ek.encapsulate_with_rng(&mut csprng());
             let mlkem_ss = mlkem_shared_secret(&raw)?;
             let x_ss = x25519_shared(x_secret, x_pub)?;
             let mut q_s = ct.to_vec();

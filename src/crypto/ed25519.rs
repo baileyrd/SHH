@@ -1,7 +1,7 @@
 //! Ed25519 keys and signatures with their SSH wire encodings (RFC 8709).
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use rand_core::OsRng;
+use getrandom::{rand_core::UnwrapErr, SysRng};
 
 use crate::wire::{Reader, Writer};
 use crate::{Error, Result};
@@ -72,7 +72,7 @@ pub struct PrivateKey(pub SigningKey);
 
 impl PrivateKey {
     pub fn generate() -> Self {
-        PrivateKey(SigningKey::generate(&mut OsRng))
+        PrivateKey(SigningKey::generate(&mut UnwrapErr(SysRng)))
     }
 
     pub fn public(&self) -> PublicKey {

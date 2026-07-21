@@ -1123,6 +1123,7 @@ dependencies = [
  "criterion",
  "ctr",
  "ed25519-dalek",
+ "getrandom 0.4.3",
  "libc",
  "ml-kem",
  "nix",

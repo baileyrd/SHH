@@ -42,9 +42,12 @@ clap = { version = "4", features = ["derive"] }
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", features = ["term", "process", "fs", "signal", "user", "hostname"] }
 libc = "0.2"
+
 # tty/unix.rs's winsize()/RawMode converge onto rustils' platform::term::Terminal
-# (issue #43); pinned rev, bumped deliberately (see platform-linux's own
-# rusty_libc pin for the same convention).
+# on Linux (issue #43); rustils has no macOS/BSD backend yet, so those targets
+# keep the hand-rolled termios path. Pinned rev, bumped deliberately (see
+# platform-linux's own rusty_libc pin for the same convention).
+[target.'cfg(target_os = "linux")'.dependencies]
 platform = { git = "https://github.com/baileyrd/rustils", rev = "5251808971c2e89164d4461c5cf1f45095f60dd3" }
 platform-linux = { git = "https://github.com/baileyrd/rustils", rev = "5251808971c2e89164d4461c5cf1f45095f60dd3" }
 

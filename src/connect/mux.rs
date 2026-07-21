@@ -262,10 +262,11 @@ const KEEPALIVE_MAX_MISSED: u32 = 3;
 /// slot) for the OS's SYN-retry ceiling, often well over a minute.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Cap on channels (pending + established) an authenticated peer may have
-/// open on one connection at a time, so a peer opening channels faster than
-/// they're serviced (e.g. many direct-tcpip opens to unreachable targets)
-/// can't exhaust file descriptors or memory without bound.
+/// Cap on channels (pending + established + in-flight connects, see
+/// `pending_connects`) an authenticated peer may have open on one
+/// connection at a time, so a peer opening channels faster than they're
+/// serviced (e.g. many direct-tcpip opens to unreachable targets) can't
+/// exhaust file descriptors or memory without bound.
 const MAX_CHANNELS: usize = 256;
 
 /// The connection loop.
@@ -307,6 +308,13 @@ pub struct Connection<S> {
     cmd_rx: mpsc::UnboundedReceiver<Cmd>,
     /// Admission control for `Cmd::OpenTunnel`; see [`MAX_PENDING_OPENS`].
     open_admission: Arc<Semaphore>,
+    /// `direct-tcpip`/`forwarded-tcpip`/agent connects spawned but not yet
+    /// resolved to a `Cmd::Connected`. Counted toward `MAX_CHANNELS`
+    /// alongside `channels`/`pending`: without this, a peer's open is
+    /// invisible to that cap for as long as `spawn_connect` takes to
+    /// resolve (up to `CONNECT_TIMEOUT`), letting it spawn unbounded
+    /// concurrent connect attempts by opening faster than any one resolves.
+    pending_connects: usize,
     done: bool,
 }
 
@@ -398,6 +406,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
             cmd_tx,
             cmd_rx,
             open_admission: Arc::new(Semaphore::new(MAX_PENDING_OPENS)),
+            pending_connects: 0,
             done: false,
         }
     }
@@ -569,7 +578,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         let window = r.u32()?;
         let max = r.u32()?;
 
-        if self.channels.len() + self.pending.len() >= MAX_CHANNELS {
+        if self.channels.len() + self.pending.len() + self.pending_connects >= MAX_CHANNELS {
             tracing::info!(%kind, "channel open refused: at MAX_CHANNELS");
             return self
                 .reject_open(sender, open_failure::ADMINISTRATIVELY_PROHIBITED, "too many open channels")
@@ -675,7 +684,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
     /// [`CONNECT_TIMEOUT`]: without it, a peer directing us at a black-holed
     /// address ties up this task (and the channel slot it's pending on) for
     /// the OS's SYN-retry ceiling, often well over a minute.
-    fn spawn_connect(&self, peer_id: u32, peer_window: u32, peer_max: u32, host: String, port: u16) {
+    ///
+    /// Counts toward `MAX_CHANNELS` via `pending_connects` from the moment
+    /// this is called until `Cmd::Connected` resolves it (in `on_cmd`):
+    /// without that, an open is invisible to the cap for the entire time its
+    /// connect is in flight, letting a peer spawn unbounded concurrent
+    /// attempts by opening faster than any one resolves.
+    fn spawn_connect(&mut self, peer_id: u32, peer_window: u32, peer_max: u32, host: String, port: u16) {
+        self.pending_connects += 1;
         let cmd_tx = self.cmd_tx.clone();
         tokio::spawn(async move {
             let stream = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect((host.as_str(), port))).await {
@@ -694,16 +710,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         });
     }
 
-    /// Connect to the local agent socket for an accepted agent channel.
+    /// Connect to the local agent socket for an accepted agent channel. See
+    /// [`Connection::spawn_connect`] for the `pending_connects` accounting.
     #[cfg(unix)]
     fn spawn_connect_agent(
-        &self,
+        &mut self,
         peer_id: u32,
         peer_window: u32,
         peer_max: u32,
         path: std::path::PathBuf,
         bind: Option<AgentBind>,
     ) {
+        self.pending_connects += 1;
         let cmd_tx = self.cmd_tx.clone();
         tokio::spawn(async move {
             let stream = match tokio::net::UnixStream::connect(&path).await {
@@ -784,7 +802,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
         tracing::info!(channel = ours, "channel open refused: {desc}");
         // Dropping a pending session's oneshot lets the client learn it
         // failed; dropping a pending forward closes the local connection.
-        self.pending.remove(&ours);
+        // A refused *terminal* session (`end_connection_on_close`, e.g.
+        // `client_session`'s one-shot wrapper) never gets a `Chan` entry, so
+        // `close_if_done` can never see it and end the loop — without this,
+        // a server that refuses the only session this connection exists for
+        // leaves `run()` parked forever waiting on a peer that has nothing
+        // left to say either.
+        if let Some(Pending::Session(spec)) = self.pending.remove(&ours) {
+            if spec.end_connection_on_close {
+                self.done = true;
+            }
+        }
         Ok(())
     }
 
@@ -886,14 +914,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
                     data,
                 });
             }
-            Some(ch) => {
-                // A forwarded stream grants no requests.
-                if want_reply {
-                    let peer = ch.peer_id;
-                    self.t.send(&simple(msg::CHANNEL_FAILURE, peer)).await?;
-                }
+            // A forwarded stream grants no requests.
+            Some(ch) if want_reply => {
+                let peer = ch.peer_id;
+                self.t.send(&simple(msg::CHANNEL_FAILURE, peer)).await?;
             }
-            None => {}
+            Some(_) | None => {}
         }
         Ok(())
     }
@@ -1038,6 +1064,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
                 stream,
                 _permit,
             } => {
+                // Mirrors the MAX_CHANNELS check in on_channel_open, applied
+                // here to our own outgoing opens: without it, this side could
+                // grow `pending` past the cap purely from local accept-loop
+                // traffic while a slow peer sits on its replies. Dropping
+                // `stream` (by falling out of scope) closes the accepted
+                // socket, the same fail-safe the peer-initiated path takes.
+                if self.channels.len() + self.pending.len() + self.pending_connects >= MAX_CHANNELS {
+                    tracing::info!(%channel_type, "local channel open dropped: at MAX_CHANNELS");
+                    return Ok(());
+                }
                 let id = self.alloc_id();
                 self.pending.insert(id, Pending::Direct(stream));
                 let mut w = Writer::new();
@@ -1077,6 +1113,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
                 self.t.send(&w.into_bytes()).await?;
             }
             Cmd::OpenSession(spec) => {
+                // Dropping `spec` here (falling out of scope) drops its
+                // `exit` oneshot sender, which the caller (client_session /
+                // client_subsystem) already treats as "session ended
+                // without an exit status" -- a clean, already-handled error.
+                if self.channels.len() + self.pending.len() + self.pending_connects >= MAX_CHANNELS {
+                    tracing::info!("local session open dropped: at MAX_CHANNELS");
+                    return Ok(());
+                }
                 let id = self.alloc_id();
                 self.pending.insert(id, Pending::Session(spec));
                 let mut w = Writer::new();
@@ -1092,25 +1136,30 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
                 peer_window,
                 peer_max,
                 stream,
-            } => match stream {
-                Ok(sock) => {
-                    let id = self.alloc_id();
-                    let mut w = chan(msg::CHANNEL_OPEN_CONFIRMATION, peer_id);
-                    w.u32(id);
-                    w.u32(LOCAL_WINDOW);
-                    w.u32(MAX_CHUNK);
-                    self.t.send(&w.into_bytes()).await?;
-                    self.spawn_forward(id, peer_id, peer_window, peer_max, sock);
+            } => {
+                // Resolves the reservation `spawn_connect`/`spawn_connect_agent`
+                // made against MAX_CHANNELS, whichever way the connect went.
+                self.pending_connects = self.pending_connects.saturating_sub(1);
+                match stream {
+                    Ok(sock) => {
+                        let id = self.alloc_id();
+                        let mut w = chan(msg::CHANNEL_OPEN_CONFIRMATION, peer_id);
+                        w.u32(id);
+                        w.u32(LOCAL_WINDOW);
+                        w.u32(MAX_CHUNK);
+                        self.t.send(&w.into_bytes()).await?;
+                        self.spawn_forward(id, peer_id, peer_window, peer_max, sock);
+                    }
+                    Err(e) => {
+                        self.reject_open(
+                            peer_id,
+                            open_failure::CONNECT_FAILED,
+                            &format!("connect failed: {e}"),
+                        )
+                        .await?;
+                    }
                 }
-                Err(e) => {
-                    self.reject_open(
-                        peer_id,
-                        open_failure::CONNECT_FAILED,
-                        &format!("connect failed: {e}"),
-                    )
-                    .await?;
-                }
-            },
+            }
             Cmd::Data { id, bytes } => {
                 if let Some(ch) = self.channels.get(&id) {
                     let peer = ch.peer_id;
@@ -1405,6 +1454,114 @@ mod tests {
         assert_eq!(reply[0], msg::CHANNEL_OPEN_FAILURE, "should refuse past MAX_CHANNELS");
     }
 
+    /// `spawn_connect`'s connect is asynchronous and can take up to
+    /// `CONNECT_TIMEOUT` to resolve. Without `pending_connects`, an in-flight
+    /// connect was invisible to `MAX_CHANNELS` for that whole window, letting
+    /// a peer spawn unboundedly many concurrent connects by opening faster
+    /// than any one resolved -- `self.channels`/`self.pending` only gain an
+    /// entry once `Cmd::Connected` arrives. Simulate many in-flight connects
+    /// directly (driving real ones and racing their timing isn't reliable in
+    /// every environment; see `connect_timeout_wrapping_fires_on_a_stalled_connect`)
+    /// and confirm a further open is refused before any of them resolve.
+    #[tokio::test]
+    async fn channel_open_refused_while_many_connects_are_in_flight() {
+        let (client_t, mut server_t) = transport_pair().await;
+        let mut conn = Connection::new(client_t, Policy::AllowAll);
+        conn.pending_connects = MAX_CHANNELS;
+
+        let mut w = Writer::new();
+        w.byte(msg::CHANNEL_OPEN);
+        w.utf8("direct-tcpip");
+        w.u32(9999);
+        w.u32(LOCAL_WINDOW);
+        w.u32(MAX_CHUNK);
+        w.utf8("127.0.0.1");
+        w.u32(1);
+        w.utf8("orig");
+        w.u32(1);
+        conn.on_channel_open(&w.into_bytes()).await.unwrap();
+
+        let reply = server_t.recv().await.unwrap();
+        assert_eq!(
+            reply[0],
+            msg::CHANNEL_OPEN_FAILURE,
+            "should refuse while connects are in flight, not just once they resolve"
+        );
+    }
+
+    /// A refused *terminal* session (`end_connection_on_close`, as
+    /// `client_session`'s one-shot wrapper requests) must end the
+    /// connection loop, not leave it parked forever: a refused open never
+    /// gets a `Chan` entry, so `close_if_done` — the only other path that
+    /// sets `done` for a terminal channel — can never see it. Without this,
+    /// a peer that refuses the only session a connection exists for (e.g. a
+    /// Windows-built server, which serves no sessions at all) leaves both
+    /// ends of `run()` parked forever with nothing left to say.
+    #[tokio::test]
+    async fn refused_terminal_session_ends_the_connection() {
+        let (client_t, _server_t) = transport_pair().await;
+        let mut conn = Connection::new(client_t, Policy::DenyAll);
+
+        let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
+        conn.pending.insert(
+            7,
+            Pending::Session(Box::new(SessionSpec {
+                command: None,
+                subsystem: None,
+                pty: None,
+                resize: None,
+                stdin: Box::new(tokio::io::empty()),
+                stdout: Box::new(tokio::io::sink()),
+                stderr: Box::new(tokio::io::sink()),
+                exit: exit_tx,
+                forward_agent: false,
+                end_connection_on_close: true,
+            })),
+        );
+        assert!(!conn.done);
+
+        let mut w = Writer::new();
+        w.byte(msg::CHANNEL_OPEN_FAILURE);
+        w.u32(7);
+        w.u32(open_failure::UNKNOWN_CHANNEL_TYPE);
+        w.utf8("sessions are not served on this platform");
+        w.utf8("");
+        conn.on_open_failure(&w.into_bytes()).unwrap();
+
+        assert!(conn.done, "a refused terminal session must end the connection loop");
+        assert!(exit_rx.await.is_err(), "the exit oneshot must be dropped, not left dangling");
+    }
+
+    /// MAX_CHANNELS must also bound our own outgoing opens (local -L/-R
+    /// accept-loop traffic, or a session request), not just peer-initiated
+    /// ones -- otherwise this side could grow `pending` past the cap purely
+    /// from local traffic while a slow peer sits on its replies.
+    #[tokio::test]
+    async fn local_open_dropped_past_max_channels() {
+        let (client_t, _server_t) = transport_pair().await;
+        let mut conn = Connection::new(client_t, Policy::DenyAll);
+        conn.pending_connects = MAX_CHANNELS;
+
+        let permit = conn.open_admission.clone().try_acquire_owned().unwrap();
+        let (_keep, filler) = tokio::io::duplex(1);
+        conn.on_cmd(Cmd::OpenTunnel {
+            channel_type: "direct-tcpip",
+            addr: "x".into(),
+            port: 1,
+            orig_host: "y".into(),
+            orig_port: 1,
+            stream: Box::new(filler),
+            _permit: permit,
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            conn.pending.is_empty(),
+            "should not insert a pending entry for a local open past MAX_CHANNELS"
+        );
+    }
+
     /// A peer's CHANNEL_WINDOW_ADJUST is attacker-controlled; a naive
     /// `add_permits` would let repeated near-`u32::MAX` adjusts drive the
     /// tokio `Semaphore` past `Semaphore::MAX_PERMITS`, which panics the
@@ -1513,8 +1670,10 @@ mod tests {
     }
 
     /// A shareable stdout sink for session tests.
+    #[cfg(unix)]
     #[derive(Clone, Default)]
     struct VecSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    #[cfg(unix)]
     impl AsyncWrite for VecSink {
         fn poll_write(
             self: std::pin::Pin<&mut Self>,
@@ -1539,6 +1698,7 @@ mod tests {
     }
 
     /// Wait for the session to print a full line, then return it.
+    #[cfg(unix)]
     async fn wait_for_line(out: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>) -> String {
         for _ in 0..500 {
             {
@@ -1552,6 +1712,9 @@ mod tests {
         panic!("session never printed its line");
     }
 
+    // Runs a real POSIX shell command (`head -c 5`) through the session
+    // server, which is `#[cfg(unix)]` — Windows serves no sessions at all.
+    #[cfg(unix)]
     #[tokio::test]
     async fn session_and_forward_share_one_connection() {
         use super::super::session::SessionSpec;
@@ -1727,6 +1890,12 @@ mod tests {
     }
 
     // ------------------------------------------------- agent forwarding ---
+    // Unix-socket agent relaying (`agent::Client::connect` and the shell
+    // commands the sessions below run) has no Windows equivalent — see the
+    // agent forwarding follow-up in README.md.
+    #[cfg(unix)]
+    mod agent_forwarding {
+    use super::*;
 
     /// A keyring behind a real Unix socket, standing in for the user's
     /// local agent. Returns the socket path (the tempdir rides along so it
@@ -1756,8 +1925,8 @@ mod tests {
     async fn session_reporting_agent_sock(
         handle: &Handle,
         forward_agent: bool,
-    ) -> (String, tokio::sync::oneshot::Receiver<super::super::ExitStatus>) {
-        use super::super::session::SessionSpec;
+    ) -> (String, tokio::sync::oneshot::Receiver<crate::connect::ExitStatus>) {
+        use crate::connect::session::SessionSpec;
         let out = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
         handle.open_session(SessionSpec {
@@ -1975,4 +2144,5 @@ mod tests {
         client.abort();
         server.abort();
     }
+    } // mod agent_forwarding
 }

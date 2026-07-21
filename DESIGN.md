@@ -396,3 +396,30 @@ against a native Linux `shhd`.
     `sshd`. The dial-and-auth flow shared by `shh` and `shh-sftp` now lives in
     `src/client.rs`, and a client opens any subsystem channel through
     `connect::client_subsystem`.
+14. **Desktop GUI and a native Windows client (done).** A Tauri +
+    xterm.js host manager (`gui/`) built on this same library crate —
+    saved hosts, generated/listed identities, one pty session per tab —
+    sharing `~/.shh` with the CLI binaries. Alongside it, the client
+    binaries (`shh`, `shh-sftp`, `shh-keygen`) gained a native Windows
+    console backend (raw mode, no-echo passphrase entry, window size) behind
+    the same `tty` facade Unix uses, cross-built and verified under Wine
+    against a native Linux `shhd`. `shhd --sandbox` also landed here:
+    beyond `--privsep`'s host-key isolation, it drops the *whole* daemon to
+    an unprivileged account once the port is bound and the signer forked,
+    at the cost of running every session as that one account rather than
+    per authenticated user — see the privilege-separation milestone above.
+15. **Adversarial self-review (ongoing).** Repeated rounds of targeted
+    review across the whole tree, each fix backed by a test that exercises
+    the actual failure mode rather than just the happy path. Highlights:
+    channel window/admission accounting hardened against a peer that opens
+    channels or grants window credit faster than they're serviced (bounded
+    connects, a `MAX_CHANNELS` cap, a `Semaphore`-close on teardown so a
+    blocked task unblocks instead of leaking); the agent's lock passphrase
+    and destination-constraint checks tightened (constant-time comparison
+    that doesn't leak length via timing, a length cap enforced on both the
+    lock and unlock paths so the two can never disagree); the GUI's saved-host
+    storage hardened against control-character/known_hosts injection, on
+    both the save path and on load from disk; and project process
+    formalized (`SECURITY.md`, `CONTRIBUTING.md`, CI across three OSes plus
+    a GUI build, Dependabot). See [RELEASE_NOTES.md](RELEASE_NOTES.md) for
+    the detailed, dated history.

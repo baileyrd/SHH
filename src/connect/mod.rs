@@ -85,6 +85,28 @@ impl UserContext {
     }
 }
 
+/// `initgroups(3)`: set the caller's supplementary group list from `name`'s
+/// membership, seeded with `gid` as the base group. `nix` only wraps the
+/// libc call on Linux — it declines apple targets because their `basegroup`
+/// parameter is a narrower `c_int` rather than a `Gid` — so on macOS we bind
+/// the same libc function directly instead of leaving a "dropped-privilege"
+/// process holding root's supplementary groups (the vulnerability this call
+/// exists to close).
+#[cfg(target_os = "linux")]
+pub(crate) fn initgroups(name: &std::ffi::CStr, gid: nix::unistd::Gid) -> nix::Result<()> {
+    nix::unistd::initgroups(name, gid)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+pub(crate) fn initgroups(name: &std::ffi::CStr, gid: nix::unistd::Gid) -> nix::Result<()> {
+    let rc = unsafe { libc::initgroups(name.as_ptr(), gid.as_raw() as libc::c_int) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(nix::errno::Errno::last())
+    }
+}
+
 /// Ask the server for a pseudo-terminal with these dimensions.
 #[derive(Clone)]
 pub struct PtyRequest {
@@ -255,6 +277,26 @@ where
 
 #[cfg(test)]
 mod tests {
+    // Every test here needs the Unix-only session server (see
+    // unix_shell_sessions below); on other platforms this module is empty.
+    #[cfg(unix)]
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn user_context_resolves_known_and_unknown() {
+        let root = UserContext::for_user("root").expect("root always exists");
+        assert_eq!(root.uid, 0);
+        assert_eq!(root.name, "root");
+        assert!(root.home.as_os_str().len() > 1);
+        assert!(UserContext::for_user("no-such-user-9c1f2b").is_none());
+    }
+
+    // These tests run real POSIX shell commands (`printf`, `tr`, `kill -9`,
+    // `tty`/`stty`) through the session server, which is `#[cfg(unix)]` —
+    // Windows serves no sessions at all (see mux.rs's channel-open handler).
+    #[cfg(unix)]
+    mod unix_shell_sessions {
     use super::*;
     use crate::auth;
     use crate::crypto::ed25519::PrivateKey;
@@ -291,15 +333,6 @@ mod tests {
         ) -> Poll<std::io::Result<()>> {
             Poll::Ready(Ok(()))
         }
-    }
-
-    #[test]
-    fn user_context_resolves_known_and_unknown() {
-        let root = UserContext::for_user("root").expect("root always exists");
-        assert_eq!(root.uid, 0);
-        assert_eq!(root.name, "root");
-        assert!(root.home.as_os_str().len() > 1);
-        assert!(UserContext::for_user("no-such-user-9c1f2b").is_none());
     }
 
     async fn run(command: &str, stdin: &'static [u8]) -> (ExitStatus, Vec<u8>, Vec<u8>) {
@@ -460,9 +493,14 @@ mod tests {
         s.unwrap();
         let (status, out) = c.unwrap();
         let text = String::from_utf8_lossy(&out);
-        assert!(text.contains("/dev/pts/"), "no pty in output: {text}");
+        // Linux devpts names ptys `/dev/pts/N`; BSD/macOS uses `/dev/ttysNNN`.
+        assert!(
+            text.contains("/dev/pts/") || text.contains("/dev/tty"),
+            "no pty in output: {text}"
+        );
         assert!(text.contains("TERM=vt100"), "TERM not set: {text}");
         assert!(text.contains("43 132"), "winsize not applied: {text}");
         assert_eq!(status.code, Some(0));
     }
+    } // mod unix_shell_sessions
 }

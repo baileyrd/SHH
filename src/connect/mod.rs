@@ -85,6 +85,28 @@ impl UserContext {
     }
 }
 
+/// `initgroups(3)`: set the caller's supplementary group list from `name`'s
+/// membership, seeded with `gid` as the base group. `nix` only wraps the
+/// libc call on Linux — it declines apple targets because their `basegroup`
+/// parameter is a narrower `c_int` rather than a `Gid` — so on macOS we bind
+/// the same libc function directly instead of leaving a "dropped-privilege"
+/// process holding root's supplementary groups (the vulnerability this call
+/// exists to close).
+#[cfg(target_os = "linux")]
+pub(crate) fn initgroups(name: &std::ffi::CStr, gid: nix::unistd::Gid) -> nix::Result<()> {
+    nix::unistd::initgroups(name, gid)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+pub(crate) fn initgroups(name: &std::ffi::CStr, gid: nix::unistd::Gid) -> nix::Result<()> {
+    let rc = unsafe { libc::initgroups(name.as_ptr(), gid.as_raw() as libc::c_int) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(nix::errno::Errno::last())
+    }
+}
+
 /// Ask the server for a pseudo-terminal with these dimensions.
 #[derive(Clone)]
 pub struct PtyRequest {
@@ -293,6 +315,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn user_context_resolves_known_and_unknown() {
         let root = UserContext::for_user("root").expect("root always exists");

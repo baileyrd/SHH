@@ -904,14 +904,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
                     data,
                 });
             }
-            Some(ch) => {
-                // A forwarded stream grants no requests.
-                if want_reply {
-                    let peer = ch.peer_id;
-                    self.t.send(&simple(msg::CHANNEL_FAILURE, peer)).await?;
-                }
+            // A forwarded stream grants no requests.
+            Some(ch) if want_reply => {
+                let peer = ch.peer_id;
+                self.t.send(&simple(msg::CHANNEL_FAILURE, peer)).await?;
             }
-            None => {}
+            Some(_) | None => {}
         }
         Ok(())
     }
@@ -1645,6 +1643,7 @@ mod tests {
     }
 
     /// Wait for the session to print a full line, then return it.
+    #[cfg(unix)]
     async fn wait_for_line(out: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>) -> String {
         for _ in 0..500 {
             {
@@ -1833,6 +1832,12 @@ mod tests {
     }
 
     // ------------------------------------------------- agent forwarding ---
+    // Unix-socket agent relaying (`agent::Client::connect` and the shell
+    // commands the sessions below run) has no Windows equivalent — see the
+    // agent forwarding follow-up in README.md.
+    #[cfg(unix)]
+    mod agent_forwarding {
+    use super::*;
 
     /// A keyring behind a real Unix socket, standing in for the user's
     /// local agent. Returns the socket path (the tempdir rides along so it
@@ -1862,8 +1867,8 @@ mod tests {
     async fn session_reporting_agent_sock(
         handle: &Handle,
         forward_agent: bool,
-    ) -> (String, tokio::sync::oneshot::Receiver<super::super::ExitStatus>) {
-        use super::super::session::SessionSpec;
+    ) -> (String, tokio::sync::oneshot::Receiver<crate::connect::ExitStatus>) {
+        use crate::connect::session::SessionSpec;
         let out = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let (exit_tx, exit_rx) = tokio::sync::oneshot::channel();
         handle.open_session(SessionSpec {
@@ -2081,4 +2086,5 @@ mod tests {
         client.abort();
         server.abort();
     }
+    } // mod agent_forwarding
 }

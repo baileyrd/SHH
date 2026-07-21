@@ -150,7 +150,9 @@ pub struct SoftwareKey {
 impl SoftwareKey {
     pub fn generate(application: &str) -> Self {
         SoftwareKey {
-            signing: ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng),
+            signing: ed25519_dalek::SigningKey::generate(&mut getrandom::rand_core::UnwrapErr(
+                getrandom::SysRng,
+            )),
             application: application.to_owned(),
         }
     }

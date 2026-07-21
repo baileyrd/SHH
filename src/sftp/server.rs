@@ -396,16 +396,15 @@ fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {
 
 #[cfg(unix)]
 fn set_times(path: &Path, file: Option<&File>, atime: u32, mtime: u32) -> std::io::Result<()> {
+    use nix::fcntl::AT_FDCWD;
     use nix::sys::stat::{utimensat, UtimensatFlags};
     use nix::sys::time::TimeSpec;
+    use std::os::fd::AsFd;
     let atime = TimeSpec::new(atime as i64, 0);
     let mtime = TimeSpec::new(mtime as i64, 0);
     match file {
-        Some(f) => {
-            use std::os::unix::io::AsRawFd;
-            nix::sys::stat::futimens(f.as_raw_fd(), &atime, &mtime).map_err(std::io::Error::from)
-        }
-        None => utimensat(None, path, &atime, &mtime, UtimensatFlags::FollowSymlink)
+        Some(f) => nix::sys::stat::futimens(f.as_fd(), &atime, &mtime).map_err(std::io::Error::from),
+        None => utimensat(AT_FDCWD, path, &atime, &mtime, UtimensatFlags::FollowSymlink)
             .map_err(std::io::Error::from),
     }
 }

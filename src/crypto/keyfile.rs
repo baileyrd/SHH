@@ -98,7 +98,11 @@ fn armor_key(
             OsRng.fill_bytes(&mut salt);
             let km = kdf_material(pass, &salt, BCRYPT_ROUNDS)?;
             let mut inner = build_inner(16);
-            Aes256Ctr::new(km[..32].into(), km[32..].into()).apply_keystream(&mut inner);
+            Aes256Ctr::new(
+                km[..32].try_into().expect("kdf_material produced a 32-byte key"),
+                km[32..].try_into().expect("kdf_material produced a 16-byte iv"),
+            )
+            .apply_keystream(&mut inner);
 
             w.utf8("aes256-ctr");
             w.utf8("bcrypt");
@@ -269,7 +273,11 @@ fn open_inner(text: &str, passphrase: Option<&str>) -> Result<Zeroizing<Vec<u8>>
             return Err(bad(format!("unreasonable bcrypt rounds {rounds}")));
         }
         let km = kdf_material(pass, &salt, rounds)?;
-        Aes256Ctr::new(km[..32].into(), km[32..].into()).apply_keystream(&mut inner);
+        Aes256Ctr::new(
+            km[..32].try_into().expect("kdf_material produced a 32-byte key"),
+            km[32..].try_into().expect("kdf_material produced a 16-byte iv"),
+        )
+        .apply_keystream(&mut inner);
     }
 
     // Validate the check-int pair up front so a wrong passphrase is caught

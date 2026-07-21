@@ -24,6 +24,13 @@ use crate::Result;
 const EXT_SESSION_BIND: &str = "session-bind@openssh.com";
 const EXT_RESTRICT_DESTINATION: &str = "restrict-destination-v00@openssh.com";
 
+/// Ceiling on a lock passphrase, shared by `set_lock` and `unset_lock`: far
+/// more than any real passphrase needs, but fixed so their buffer-based
+/// comparison has a bound. Must be enforced on both ends -- a passphrase
+/// accepted by `set_lock` past this cap could never be matched again by
+/// `unset_lock`, permanently bricking unlock for that lock.
+const LOCK_MAX_LEN: usize = 256;
+
 /// One end of a destination-constraint hop: the host keys (or CA keys) that
 /// identify a host. A hop with no keys is the local origin. Enforcement is by
 /// key — matching OpenSSH, which passes a NULL user at sign time — so the
@@ -424,6 +431,14 @@ impl State {
         if self.lock.is_some() {
             return None; // handle() already gates this; belt and braces
         }
+        // unset_lock refuses to compare a held passphrase longer than
+        // LOCK_MAX_LEN. Rejecting an over-cap passphrase *here* means that
+        // case can never arise -- accepting it here would otherwise brick
+        // unlock permanently: every future attempt, even with the exact
+        // right passphrase, would hit unset_lock's own cap check and fail.
+        if pass.len() > LOCK_MAX_LEN {
+            return None;
+        }
         self.lock = Some(Zeroizing::new(pass));
         Some(success())
     }
@@ -441,8 +456,10 @@ impl State {
         // different lengths, undercutting the "constant-time" comparison
         // that follows it. An over-cap guess still fails fast -- a real
         // passphrase is never that long, and the cap only reveals "too
-        // long", not an exact length.
-        const MAX_LEN: usize = 256;
+        // long", not an exact length. `held` is never over the cap itself
+        // (set_lock rejects it at lock time), so this branch only ever
+        // trips on an over-long guess.
+        const MAX_LEN: usize = LOCK_MAX_LEN;
         if held.len() > MAX_LEN || pass.len() > MAX_LEN {
             return None;
         }
@@ -657,6 +674,29 @@ mod tests {
         assert!(c.unlock(&vec![b'x'; 1000]).await.is_err());
 
         c.unlock(b"correct-horse").await.unwrap();
+    }
+
+    /// `unset_lock`'s fixed-buffer comparison rejects anything held past
+    /// `LOCK_MAX_LEN`. If `set_lock` didn't enforce the same cap, a client
+    /// locking with an over-cap passphrase would brick unlock permanently --
+    /// no future attempt, not even the exact right one, could ever match.
+    #[tokio::test]
+    async fn lock_with_an_overlong_passphrase_is_refused_not_bricked() {
+        let (mut c, _kr) = spawn_agent();
+        assert!(c.lock(&vec![b'x'; LOCK_MAX_LEN + 1]).await.is_err());
+
+        // The agent must still be genuinely unlocked (lock never took), not
+        // stuck locked-with-an-unreachable-passphrase.
+        let key = PrivateKey::generate();
+        c.add(&key, None, "k", None).await.unwrap();
+        assert_eq!(c.identities().await.unwrap().len(), 1);
+
+        // A passphrase right at the cap still works end to end.
+        let at_cap = vec![b'y'; LOCK_MAX_LEN];
+        c.lock(&at_cap).await.unwrap();
+        assert!(c.identities().await.unwrap().is_empty());
+        c.unlock(&at_cap).await.unwrap();
+        assert_eq!(c.identities().await.unwrap().len(), 1);
     }
 
     #[tokio::test(start_paused = true)]

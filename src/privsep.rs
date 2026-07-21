@@ -168,6 +168,9 @@ fn serve(host_key: PrivateKey, mut sock: UnixStream) {
 /// the daemon side) still holds.
 fn harden(drop_to: Option<&str>) {
     // No child of the signer may ever regain privilege via setuid binaries.
+    // Linux-only: no BSD/macOS primitive grants the same guarantee, so the
+    // isolation there rests on the credential drop below alone.
+    #[cfg(target_os = "linux")]
     unsafe {
         libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
     }
@@ -178,9 +181,20 @@ fn harden(drop_to: Option<&str>) {
                 Some(u) => {
                     let gid = nix::unistd::Gid::from_raw(u.gid);
                     let uid = nix::unistd::Uid::from_raw(u.uid);
-                    let dropped = nix::unistd::setgid(gid)
-                        .and_then(|_| nix::unistd::setuid(uid))
-                        .is_ok();
+                    // gid, then supplementary groups, then uid -- the same
+                    // order drop_daemon_privileges uses. Without initgroups
+                    // here, the signer keeps root's supplementary groups
+                    // (e.g. `disk`, `wheel`) after "dropping" privileges,
+                    // undermining the isolation this function exists for.
+                    let dropped = std::ffi::CString::new(u.name.as_str())
+                        .ok()
+                        .and_then(|cname| {
+                            nix::unistd::setgid(gid)
+                                .and_then(|_| crate::connect::initgroups(&cname, gid))
+                                .and_then(|_| nix::unistd::setuid(uid))
+                                .ok()
+                        })
+                        .is_some();
                     if dropped {
                         // If we can regain root, the drop was ineffective.
                         if nix::unistd::setuid(nix::unistd::Uid::from_raw(0)).is_ok() {
@@ -215,6 +229,8 @@ fn harden(drop_to: Option<&str>) {
 pub fn drop_daemon_privileges(user: &str) -> std::io::Result<()> {
     // Refuse new privileges for us and every descendant — also stops a
     // compromised session from re-escalating through a setuid binary.
+    // Linux-only; see the note in `harden`.
+    #[cfg(target_os = "linux")]
     unsafe {
         libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
     }
@@ -232,7 +248,7 @@ pub fn drop_daemon_privileges(user: &str) -> std::io::Result<()> {
         .map_err(|_| std::io::Error::other("sandbox user name has an interior NUL"))?;
 
     nix::unistd::setgid(gid).map_err(std::io::Error::from)?;
-    nix::unistd::initgroups(&cname, gid).map_err(std::io::Error::from)?;
+    crate::connect::initgroups(&cname, gid).map_err(std::io::Error::from)?;
     nix::unistd::setuid(uid).map_err(std::io::Error::from)?;
 
     // If we can regain root, the drop was ineffective — refuse to continue.
@@ -244,7 +260,14 @@ pub fn drop_daemon_privileges(user: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-fn set_limit(resource: libc::__rlimit_resource_t, value: u64) {
+// The `setrlimit` resource-id type is `__rlimit_resource_t` on Linux but a
+// plain `c_int` on BSD/macOS — there is no portable name for it in libc.
+#[cfg(target_os = "linux")]
+type RlimitResource = libc::__rlimit_resource_t;
+#[cfg(all(unix, not(target_os = "linux")))]
+type RlimitResource = libc::c_int;
+
+fn set_limit(resource: RlimitResource, value: u64) {
     let rl = libc::rlimit {
         rlim_cur: value,
         rlim_max: value,

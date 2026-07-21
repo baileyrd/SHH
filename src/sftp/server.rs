@@ -20,6 +20,12 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use super::{fxp, open, status, Attrs, MAX_PACKET};
 use crate::wire::{Reader, Writer};
 
+/// Cap on open handles (files and directory listings) a session may hold at
+/// once. Without it, a client that never sends CLOSE can grow the process's
+/// open-fd count (each `Handle::File` holds a real fd) or its heap usage
+/// (each `Handle::Dir` buffers every entry up front) without bound.
+const MAX_HANDLES: usize = 256;
+
 /// An open handle the server tracks between requests.
 enum Handle {
     File(File),
@@ -41,11 +47,16 @@ impl Session {
         }
     }
 
-    fn insert(&mut self, h: Handle) -> String {
+    /// `None` past [`MAX_HANDLES`] -- the caller must reply with a failure
+    /// status rather than a handle in that case.
+    fn insert(&mut self, h: Handle) -> Option<String> {
+        if self.handles.len() >= MAX_HANDLES {
+            return None;
+        }
         let id = self.next_handle.to_string();
         self.next_handle += 1;
         self.handles.insert(id.clone(), h);
-        id
+        Some(id)
     }
 }
 
@@ -197,12 +208,20 @@ fn dispatch(sess: &mut Session, typ: u8, id: u32, r: &mut Reader) -> Result<(u8,
         }
         fxp::OPENDIR => {
             let path = r.utf8()?.to_owned();
+            // Check the handle cap before doing the read_dir work: no point
+            // buffering a directory's entries for a request we're going to
+            // refuse anyway.
+            if sess.handles.len() >= MAX_HANDLES {
+                return Ok(status_reply(id, status::FAILURE, "too many open handles"));
+            }
             let mut entries = Vec::new();
             for ent in std::fs::read_dir(&path)? {
                 entries.push(ent?.path());
             }
-            let handle = sess.insert(Handle::Dir { entries, next: 0 });
-            Ok(handle_reply(id, &handle))
+            match sess.insert(Handle::Dir { entries, next: 0 }) {
+                Some(handle) => Ok(handle_reply(id, &handle)),
+                None => Ok(status_reply(id, status::FAILURE, "too many open handles")),
+            }
         }
         fxp::READDIR => {
             let handle = r.utf8()?.to_owned();
@@ -273,6 +292,13 @@ fn open_file(
     pflags: u32,
     attrs: &Attrs,
 ) -> Result<(u8, Vec<u8>), Fail> {
+    // Check the handle cap before opening: OPEN can create or truncate a
+    // file (CREAT/TRUNC), so refusing only at `insert()` -- after the
+    // syscall already ran -- would let a refused request still mutate the
+    // filesystem. Mirrors the same check OPENDIR does before read_dir.
+    if sess.handles.len() >= MAX_HANDLES {
+        return Ok(status_reply(id, status::FAILURE, "too many open handles"));
+    }
     let mut opts = OpenOptions::new();
     opts.read(pflags & open::READ != 0);
     if pflags & open::WRITE != 0 {
@@ -294,8 +320,10 @@ fn open_file(
     let mode = attrs.permissions.unwrap_or(0o644) & 0o7777;
     opts.mode(mode);
     let file = opts.open(path)?;
-    let handle = sess.insert(Handle::File(file));
-    Ok(handle_reply(id, &handle))
+    match sess.insert(Handle::File(file)) {
+        Some(handle) => Ok(handle_reply(id, &handle)),
+        None => Ok(status_reply(id, status::FAILURE, "too many open handles")),
+    }
 }
 
 fn read_dir(sess: &mut Session, id: u32, handle: &str) -> Result<(u8, Vec<u8>), Fail> {
@@ -578,5 +606,46 @@ mod tests {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         // 2021-01-01 is 18628 days after the epoch.
         assert_eq!(civil_from_days(18628), (2021, 1, 1));
+    }
+
+    /// A client that never sends CLOSE must not be able to grow the
+    /// session's open-handle count without bound (each `Handle::File` holds
+    /// a real fd; each `Handle::Dir` buffers a whole directory listing).
+    #[test]
+    fn session_insert_refuses_past_max_handles() {
+        let mut sess = Session::new();
+        for _ in 0..MAX_HANDLES {
+            assert!(sess.insert(Handle::Dir { entries: Vec::new(), next: 0 }).is_some());
+        }
+        assert!(
+            sess.insert(Handle::Dir { entries: Vec::new(), next: 0 }).is_none(),
+            "should refuse past MAX_HANDLES"
+        );
+
+        // Closing one frees a slot for the next insert.
+        let some_id = sess.handles.keys().next().cloned().unwrap();
+        sess.handles.remove(&some_id);
+        assert!(sess.insert(Handle::Dir { entries: Vec::new(), next: 0 }).is_some());
+    }
+
+    /// OPEN can create or truncate a file (CREAT/TRUNC). A refusal past
+    /// MAX_HANDLES must happen *before* that syscall runs, not after --
+    /// otherwise a refused request still mutates the filesystem.
+    #[test]
+    fn open_at_max_handles_does_not_create_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sess = Session::new();
+        for _ in 0..MAX_HANDLES {
+            assert!(sess.insert(Handle::Dir { entries: Vec::new(), next: 0 }).is_some());
+        }
+
+        let path = dir.path().join("never-created");
+        let attrs = Attrs { size: None, uid_gid: None, permissions: None, times: None };
+        let result = open_file(&mut sess, 1, path.to_str().unwrap(), open::CREAT | open::WRITE, &attrs);
+        let Ok((typ, _)) = result else {
+            panic!("open_file should return a status reply, not an error");
+        };
+        assert_eq!(typ, fxp::STATUS);
+        assert!(!path.exists(), "OPEN refused past MAX_HANDLES must not create the file");
     }
 }

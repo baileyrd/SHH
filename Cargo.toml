@@ -38,6 +38,9 @@ ctr = "0.10"
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 
+rusty_wire = { path = "../rusty_wire" }
+rusty_ansder = { path = "../rusty_ansder" }
+
 # pty / terminal / process control (server + unix client bits)
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", features = ["term", "process", "fs", "signal", "user", "hostname"] }

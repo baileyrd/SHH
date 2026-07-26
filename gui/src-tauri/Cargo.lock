@@ -2953,6 +2953,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
+name = "rusty_ansder"
+version = "0.1.0"
+dependencies = [
+ "rusty_wire",
+]
+
+[[package]]
+name = "rusty_wire"
+version = "0.1.0"
+
+[[package]]
 name = "same-file"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3267,6 +3278,8 @@ dependencies = [
  "platform-linux",
  "poly1305",
  "rand_core 0.6.4",
+ "rusty_ansder",
+ "rusty_wire",
  "sha2 0.11.0",
  "subtle",
  "thiserror 2.0.18",

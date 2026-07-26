@@ -40,6 +40,9 @@ clap = { version = "4", features = ["derive"] }
 
 rusty_wire = { path = "../rusty_wire" }
 rusty_ansder = { path = "../rusty_ansder" }
+rusty_tokio = { path = "../rusty_tokio" }
+rusty_crypto = { path = "../rusty_crypto" }
+rusty_std = { path = "../rusty_std" }
 
 # pty / terminal / process control (server + unix client bits)
 [target.'cfg(unix)'.dependencies]

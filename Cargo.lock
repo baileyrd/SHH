@@ -1051,24 +1051,31 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 name = "rusty_ansder"
 version = "0.1.0"
 dependencies = [
+ "rusty_json",
+ "rusty_regx",
+ "rusty_simd",
+ "rusty_std",
  "rusty_wire",
 ]
 
 [[package]]
-name = "rusty_crypto"
+name = "rusty_json"
 version = "0.1.0"
 dependencies = [
- "rusty_crypto_key",
- "rusty_wire",
+ "serde",
 ]
-
-[[package]]
-name = "rusty_crypto_key"
-version = "0.1.0"
 
 [[package]]
 name = "rusty_libc"
 version = "0.0.1"
+
+[[package]]
+name = "rusty_regx"
+version = "0.5.0"
+
+[[package]]
+name = "rusty_simd"
+version = "0.1.0"
 
 [[package]]
 name = "rusty_std"
@@ -1221,7 +1228,6 @@ dependencies = [
  "poly1305",
  "rand_core 0.6.4",
  "rusty_ansder",
- "rusty_crypto",
  "rusty_std",
  "rusty_tokio",
  "rusty_wire",
